@@ -82,7 +82,10 @@ async function main() {
       showStats([
         ['Seed', initStats.seed],
         ['Initial particles', initStats.particles],
-        ['Initial bonds', initStats.bonds],
+        ['Bonds per particle', initStats.bondsPerParticle.toFixed(2)],
+        ['Continental fraction', initStats.continentalFraction.toFixed(2)],
+        ['Damaged bonds (>0.5)', initStats.damagedBondFraction.toFixed(2)],
+        ['Worst initial overlap', `${(100 * initStats.relaxResidual).toFixed(1)}% of contact`],
         ['Setup time', `${initStats.ms.toFixed(0)} ms`],
         ['Steps', sim.steps],
         ['Simulated time', `${(sim.steps * dtMyr).toFixed(2)} Myr`],
