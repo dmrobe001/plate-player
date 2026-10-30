@@ -40,7 +40,10 @@ export const SIM_PARAMS = [
   ['thermal_expansion_coeff', 'f32', 3e-5], // 1/K
   ['ambient_ocean_temp', 'f32', 278.0],
   ['mantle_temp', 'f32', 1600.0],
-  ['sea_level', 'f32', -2.5],           // km, in the same datum as particle elevation
+  // Sea level in the same datum as particle elevation (the top of an
+  // uncompensated mantle surface). 3.5 km puts cold 7 km oceanic crust about
+  // 4 km below sea level and 35 km continental crust about 1.7 km above it.
+  ['sea_level', 'f32', 3.5],
 ];
 
 export function simParamsWGSL() {

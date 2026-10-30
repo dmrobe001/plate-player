@@ -53,8 +53,8 @@ export class Renderer {
     });
     this.pipelines = {
       mantle: pipeline('vs_mantle', 'fs_mantle', 'triangle-list'),
-      points: pipeline('vs_point', 'fs_point', 'point-list'),
-      lines: pipeline('vs_line', 'fs_line', 'line-list'),
+      discs: pipeline('vs_disc', 'fs_disc', 'triangle-list'),
+      bonds: pipeline('vs_bond', 'fs_bond', 'triangle-list'),
     };
   }
 
@@ -102,10 +102,13 @@ export class Renderer {
       pass.setIndexBuffer(this.indexBuffer, 'uint32');
       pass.drawIndexed(this.indexCount);
     }
-    pass.setPipeline(this.pipelines.points);
-    pass.draw(CAPACITY.maxParticles);
-    pass.setPipeline(this.pipelines.lines);
-    pass.draw(CAPACITY.maxConstraints * 2);
+    // One instanced quad per particle; two quads (line + tick) per bond.
+    pass.setPipeline(this.pipelines.discs);
+    pass.draw(6, CAPACITY.maxParticles);
+    if (view.showNormal || view.showShear) {
+      pass.setPipeline(this.pipelines.bonds);
+      pass.draw(12, CAPACITY.maxConstraints);
+    }
     pass.end();
   }
 }

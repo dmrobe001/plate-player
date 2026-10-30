@@ -77,3 +77,20 @@ button:hover { border-color: var(--accent); }
   border: 1px solid rgba(248, 113, 113, 0.5);
   border-radius: 4px;
 }
+
+.legend { margin-top: 10px; color: var(--muted); font-size: 11px; }
+.colorbar {
+  height: 10px;
+  border-radius: 2px;
+  /* approximates elevation_color() in crust.wgsl over -6 .. +4.5 km */
+  background: linear-gradient(to right,
+    rgb(8, 20, 71) 0%, rgb(46, 92, 150) 30%, rgb(115, 184, 224) 57.1%,
+    rgb(51, 128, 56) 57.2%, rgb(168, 168, 92) 71.4%,
+    rgb(128, 92, 61) 85.7%, rgb(242, 242, 247) 100%);
+}
+.colorbar-labels { display: flex; justify-content: space-between; }
+.key { margin-top: 4px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.swatch { display: inline-block; width: 18px; height: 4px; margin-left: 6px; border: 1px solid var(--border); }
+.swatch.compression { background: #000; }
+.swatch.tension { background: #fff; }
+.swatch.shear { width: 4px; height: 12px; background: #000; }

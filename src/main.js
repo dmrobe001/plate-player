@@ -49,6 +49,12 @@ async function main() {
   $('regenerate').addEventListener('click', regenerate);
   regenerate();
 
+  // Log slider: 10^value MPa (1 .. 1000 MPa, default ~150 MPa = yield stress).
+  const stressRef = () => 10 ** Number($('stressRef').value);
+  const showStressRef = () => { $('stressRefOut').textContent = `${stressRef().toFixed(0)} MPa`; };
+  $('stressRef').addEventListener('input', showStressRef);
+  showStressRef();
+
   let lastStatsUpdate = 0;
   function frame(now) {
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -65,6 +71,9 @@ async function main() {
       viewProj: camera.viewProjection(w / h),
       lightDir: camera.lightDirection(),
       showMantle: $('showMantle').checked,
+      showNormal: $('showNormal').checked,
+      showShear: $('showShear').checked,
+      stressRefMPa: stressRef(),
     });
     device.queue.submit([encoder.finish()]);
 

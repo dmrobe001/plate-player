@@ -24,6 +24,20 @@
         <label class="row"><input id="pause" type="checkbox"> Pause</label>
         <label class="row"><input id="spin" type="checkbox"> Auto-spin globe</label>
         <label class="row"><input id="showMantle" type="checkbox" checked> Show mantle</label>
+        <label class="row"><input id="showNormal" type="checkbox" checked> Normal stress lines</label>
+        <label class="row"><input id="showShear" type="checkbox" checked> Shear stress ticks</label>
+        <label class="row" title="Stress at which a line is one apothem wide">Line scale
+          <input id="stressRef" type="range" min="0" max="3" step="0.05" value="2.18">
+          <output id="stressRefOut"></output>
+        </label>
+      </div>
+
+      <div class="legend">
+        <div class="colorbar"></div>
+        <div class="colorbar-labels"><span>&minus;6 km</span><span>sea level</span><span>+4.5 km</span></div>
+        <div class="key"><span class="swatch compression"></span>compression
+          <span class="swatch tension"></span>tension
+          <span class="swatch shear"></span>shear</div>
       </div>
 
       <dl id="stats" class="stats"></dl>
