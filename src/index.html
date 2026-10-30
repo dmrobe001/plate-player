@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Plate Player</title>
+  <!-- @inline styles.css -->
+</head>
+<body>
+  <canvas id="gpuCanvas"></canvas>
+
+  <aside class="panel">
+    <details open>
+      <summary>
+        <span class="title">Plate Player</span>
+        <span class="subtitle">particle plate tectonics</span>
+      </summary>
+
+      <div class="controls">
+        <label class="row">Seed
+          <input id="seed" type="number" min="0" step="1" value="1">
+          <button id="regenerate" type="button">Regenerate</button>
+        </label>
+        <label class="row"><input id="pause" type="checkbox"> Pause</label>
+        <label class="row"><input id="spin" type="checkbox"> Auto-spin globe</label>
+        <label class="row"><input id="showMantle" type="checkbox" checked> Show mantle</label>
+      </div>
+
+      <dl id="stats" class="stats"></dl>
+      <div id="errors" class="errors"></div>
+    </details>
+  </aside>
+
+  <!-- @inline main.js -->
+</body>
+</html>
