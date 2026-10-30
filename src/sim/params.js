@@ -2,7 +2,7 @@
 //
 // The order of this list *is* the memory layout; the WGSL struct is generated
 // from it (see simParamsWGSL), so add, remove, or reorder entries freely.
-// Values of `null` are filled in at runtime from buffer capacities.
+// Values of `null` are filled in at runtime (capacities, derived step sizes).
 //
 // Units: lengths on the unit sphere unless marked _km; time in Myr (million
 // years); temperatures in K; densities in kg/m^3; energies in kJ/mol.
@@ -11,14 +11,15 @@ export const SIM_PARAMS = [
   // --- mantle: Swift-Hohenberg pattern on the icosphere ---
   ['mantle_rayleigh', 'f32', 0.2],      // control parameter r: growth rate of the convection pattern
   ['mantle_wavenumber', 'f32', 4.0],    // preferred wavenumber k0 of the pattern
-  ['dt_mantle', 'f32', 0.000005],       // explicit-Euler step for psi (pattern time, not Myr)
+  ['mantle_time_per_myr', 'f32', 0.015625], // pattern-time units per Myr (= 50 steps of 5e-6 per 0.016 Myr, as in Phase 5)
+  ['dt_mantle', 'f32', null],           // explicit-Euler substep for psi; derived from a stability bound (simulation.js)
   ['laplacian_weight', 'f32', 45.0],    // 1/h^2-like scale of the graph Laplacian
   ['blanket_forcing', 'f32', 0.4],      // how strongly crust heat (thermal blanket) forces psi
   ['num_nodes', 'u32', null],
 
   // --- crust: position-based dynamics ---
   ['dt_crust_myr', 'f32', 0.016],
-  ['drag_coeff_myr_inv', 'f32', 50.0],  // relaxation rate of crust velocity toward mantle velocity
+  ['drag_coeff_myr_inv', 'f32', 50.0],  // relaxation rate of crust velocity toward mantle velocity (integrated exactly)
   ['crust_youngs_modulus_gpa', 'f32', 2.0], // used only to convert strain to stress (diagnostics, yielding)
   ['yield_stress_mpa', 'f32', 150.0],
   ['cm_yr_to_sim_vel', 'f32', 10.0 / 6371.0], // 1 cm/yr = 10 km/Myr; / Earth radius -> rad/Myr
@@ -26,6 +27,9 @@ export const SIM_PARAMS = [
   ['base_apothem', 'f32', 0.0175],      // reference particle apothem
   ['split_area_factor', 'f32', 3.0],    // particle splits when area > factor * base hexagon area
   ['subduction_overlap', 'f32', 0.012], // overlap depth that triggers subduction
+  ['divergence_threshold', 'f32', 1.5], // -lap(psi) above which crust grows in area
+  ['area_growth_coeff', 'f32', 0.005],  // area growth per Myr per unit divergence (unit-sphere area)
+  ['max_area_growth_rate', 'f32', 0.00625], // cap on area growth, unit-sphere area per Myr
   ['max_particles', 'u32', null],
   ['max_constraints', 'u32', null],
   ['hash_grid_dim', 'u32', null],
@@ -40,6 +44,9 @@ export const SIM_PARAMS = [
   ['thermal_expansion_coeff', 'f32', 3e-5], // 1/K
   ['ambient_ocean_temp', 'f32', 278.0],
   ['mantle_temp', 'f32', 1600.0],
+  ['surface_cooling_rate', 'f32', 0.05],  // 1/Myr, relaxation of surface crust to ocean temperature
+  ['slab_heating_rate', 'f32', 2.5],      // 1/Myr, relaxation of slab to mantle temperature
+  ['slab_assimilation_km_per_k', 'f32', 0.1], // slab thickness lost per kelvin of heating
   // Sea level in the same datum as particle elevation (the top of an
   // uncompensated mantle surface). 3.5 km puts cold 7 km oceanic crust about
   // 4 km below sea level and 35 km continental crust about 1.7 km above it.

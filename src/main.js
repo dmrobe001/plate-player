@@ -1,13 +1,17 @@
 // Entry point: set up WebGPU, build the initial state, and run the
-// simulate-then-draw loop once per animation frame.
+// simulate-then-draw loop once per animation frame, recording as configured.
+//
+// `window.plate` exposes the same operations for scripted use (tests, the
+// browser console); see test/gpu.test.mjs.
 
 import { initDevice } from './gpu/device.js';
 import { createIcosphere } from './geometry/icosphere.js';
-import { generateInitialState } from './init/initial-state.js';
+import { generateInitialState, INIT_DEFAULTS } from './init/initial-state.js';
 import { Simulation } from './sim/simulation.js';
-import { simParamDefault } from './sim/params.js';
 import { Renderer } from './render/renderer.js';
 import { OrbitCamera } from './render/camera.js';
+import { Recorder, snapshotFromZip } from './record/recorder.js';
+import { BUILD_INFO } from './build-info.js';
 
 const MANTLE_SUBDIVISIONS = 3; // 642 mantle nodes
 
@@ -26,6 +30,15 @@ function showStats(entries) {
   ]));
 }
 
+function download(bytes, filename) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'application/zip' }));
+  const a = Object.assign(document.createElement('a'), { href: url, download: filename });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
 async function main() {
   const canvas = $('gpuCanvas');
   const { device, context, format } = await initDevice(canvas, reportError);
@@ -33,27 +46,118 @@ async function main() {
   const sim = new Simulation(device, icosphere, reportError);
   const renderer = new Renderer(device, context, format, sim, reportError);
   const camera = new OrbitCamera(canvas);
-  const dtMyr = simParamDefault('dt_crust_myr');
+  const recorder = new Recorder(sim);
 
-  const urlSeed = Number.parseInt(new URLSearchParams(location.search).get('seed'), 10);
+  const query = new URLSearchParams(location.search);
+  const urlSeed = Number.parseInt(query.get('seed'), 10);
   if (Number.isFinite(urlSeed)) $('seed').value = urlSeed;
+  if (query.has('paused')) $('pause').checked = true;
+
+  // The simulation advances only when nothing asynchronous (a readback for
+  // recording, a restore) is in flight, so every record is taken at an exact step.
+  let busy = Promise.resolve();
+  let isBusy = false;
+  const exclusive = (fn) => {
+    busy = busy.then(async () => {
+      isBusy = true;
+      try { return await fn(); } finally { isBusy = false; }
+    });
+    return busy;
+  };
 
   let initStats = {};
-  function regenerate() {
-    const seed = Number.parseInt($('seed').value, 10) || 0;
-    const t0 = performance.now();
-    const state = generateInitialState(icosphere.vertices.length, { seed });
-    sim.load(state);
-    initStats = { ...state.stats, seed, ms: performance.now() - t0 };
+  // The inputs update the recorder when edited; scripts may set
+  // recorder.options directly.
+  const syncRecorderOptions = () => {
+    recorder.options.fieldIntervalMyr = Math.max(0, Number($('fieldInterval').value) || 0);
+    recorder.options.snapshotIntervalMyr = Math.max(0, Number($('snapshotInterval').value) || 0);
+  };
+  $('fieldInterval').addEventListener('change', syncRecorderOptions);
+  $('snapshotInterval').addEventListener('change', syncRecorderOptions);
+  syncRecorderOptions();
+
+  async function captureIfDue(force = {}) {
+    if (!$('recordOn').checked && !force.snapshot) return;
+    const due = $('recordOn').checked ? recorder.due() : { fields: false, snapshot: false };
+    const want = { fields: due.fields || !!force.fields, snapshot: due.snapshot || !!force.snapshot };
+    if (want.fields || want.snapshot) await recorder.capture(want);
   }
-  $('regenerate').addEventListener('click', regenerate);
-  regenerate();
+
+  function regenerate(seed = Number.parseInt($('seed').value, 10) || 0, options = {}) {
+    return exclusive(async () => {
+      $('seed').value = seed;
+      const t0 = performance.now();
+      const initOptions = { ...INIT_DEFAULTS, ...options, seed };
+      const state = generateInitialState(icosphere.vertices.length, initOptions);
+      sim.load(state);
+      initStats = { ...state.stats, seed, ms: performance.now() - t0 };
+      recorder.reset({ seed, init_options: initOptions, init_stats: state.stats, restarted_from: null });
+      await captureIfDue({ fields: true, snapshot: true });
+    });
+  }
+
+  function restoreFromZip(bytes, sourceName = 'record') {
+    return exclusive(async () => {
+      const { snapshot, manifest } = snapshotFromZip(bytes);
+      sim.restore(snapshot);
+      const seed = manifest.run.seed;
+      if (seed !== undefined) $('seed').value = seed;
+      initStats = { ...(manifest.run.init_stats ?? {}), seed, ms: 0 };
+      recorder.reset({
+        ...manifest.run,
+        restarted_from: { source: sourceName, build: manifest.model.build, step: snapshot.step, time_myr: snapshot.timeMyr },
+      });
+      await captureIfDue({ fields: true, snapshot: true });
+    });
+  }
+
+  /** Advance n steps without drawing (used by tests and scripts). */
+  function runSteps(n) {
+    return exclusive(async () => {
+      for (let i = 0; i < n; i++) {
+        const encoder = device.createCommandEncoder();
+        sim.encodeStep(encoder);
+        device.queue.submit([encoder.finish()]);
+        await captureIfDue();
+      }
+      await device.queue.onSubmittedWorkDone();
+    });
+  }
+
+  $('regenerate').addEventListener('click', () => regenerate());
+  $('snapshotNow').addEventListener('click', () => exclusive(() => recorder.capture({ fields: false, snapshot: true })));
+  $('downloadRecord').addEventListener('click', () => exclusive(() => {
+    download(recorder.exportZip(), `plate-player_seed${$('seed').value}_step${sim.steps}.zip`);
+  }));
+  $('loadRecord').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      await restoreFromZip(new Uint8Array(await file.arrayBuffer()), file.name);
+    } catch (err) {
+      reportError(`Could not resume from ${file.name}: ${err.message}`);
+    }
+    e.target.value = '';
+  });
 
   // Log slider: 10^value MPa (1 .. 1000 MPa, default ~150 MPa = yield stress).
   const stressRef = () => 10 ** Number($('stressRef').value);
   const showStressRef = () => { $('stressRefOut').textContent = `${stressRef().toFixed(0)} MPa`; };
   $('stressRef').addEventListener('input', showStressRef);
   showStressRef();
+
+  window.plate = {
+    sim, recorder, device, BUILD_INFO,
+    regenerate, runSteps, restoreFromZip,
+    setParams: (overrides) => exclusive(() => sim.setParams(overrides)),
+    snapshot: () => exclusive(() => sim.snapshot()),
+    restore: (snap) => exclusive(() => sim.restore(snap)),
+    readBuffers: (names) => exclusive(() => sim.readBuffers(names)),
+    exportRecord: () => exclusive(() => recorder.exportZip()),
+    pause: (on = true) => { $('pause').checked = on; },
+  };
+
+  await regenerate();
 
   let lastStatsUpdate = 0;
   function frame(now) {
@@ -66,7 +170,8 @@ async function main() {
     camera.update();
 
     const encoder = device.createCommandEncoder();
-    if (!$('pause').checked) sim.encodeStep(encoder);
+    const stepping = !$('pause').checked && !isBusy;
+    if (stepping) sim.encodeStep(encoder);
     renderer.encodeDraw(encoder, {
       viewProj: camera.viewProjection(w / h),
       lightDir: camera.lightDirection(),
@@ -76,19 +181,25 @@ async function main() {
       stressRefMPa: stressRef(),
     });
     device.queue.submit([encoder.finish()]);
+    if (stepping) exclusive(() => captureIfDue()).catch((err) => reportError(err.message));
 
     if (now - lastStatsUpdate > 250) {
       lastStatsUpdate = now;
+      const fmt = (v, d = 2) => (typeof v === 'number' ? v.toFixed(d) : '–');
       showStats([
         ['Seed', initStats.seed],
-        ['Initial particles', initStats.particles],
-        ['Bonds per particle', initStats.bondsPerParticle.toFixed(2)],
-        ['Continental fraction', initStats.continentalFraction.toFixed(2)],
-        ['Damaged bonds (>0.5)', initStats.damagedBondFraction.toFixed(2)],
-        ['Worst initial overlap', `${(100 * initStats.relaxResidual).toFixed(1)}% of contact`],
-        ['Setup time', `${initStats.ms.toFixed(0)} ms`],
+        ['Initial particles', initStats.particles ?? '–'],
+        ['Bonds per particle', fmt(initStats.bondsPerParticle)],
+        ['Continental fraction', fmt(initStats.continentalFraction)],
+        ['Damaged bonds (>0.5)', fmt(initStats.damagedBondFraction)],
+        ['Worst initial overlap', typeof initStats.relaxResidual === 'number' ? `${(100 * initStats.relaxResidual).toFixed(1)}% of contact` : '–'],
+        ['Setup time', `${fmt(initStats.ms, 0)} ms`],
         ['Steps', sim.steps],
-        ['Simulated time', `${(sim.steps * dtMyr).toFixed(2)} Myr`],
+        ['Simulated time', `${sim.timeMyr.toFixed(2)} Myr`],
+        ['Mantle substeps', sim.mantleSubsteps],
+        ['Recorded', `${recorder.samples.length} fields, ${recorder.snapshots.length} snapshots`],
+        ['Record size', `${(recorder.sizeBytes / 2 ** 20).toFixed(1)} MiB`],
+        ['Build', `${String(BUILD_INFO.commit).slice(0, 7)}${BUILD_INFO.dirty ? '+' : ''}`],
       ]);
     }
     requestAnimationFrame(frame);

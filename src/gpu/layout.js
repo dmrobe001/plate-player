@@ -42,6 +42,38 @@ export function defineStruct(name, fields) {
 
 export const NONE = 0xffffffff; // "null index" sentinel shared with WGSL
 
+/**
+ * Decode `count` structs from an ArrayBuffer into one typed array per field
+ * (vec4f fields become Float32Array of length 4 * count).
+ */
+export function unpack(struct, buffer, count) {
+  const f32 = new Float32Array(buffer);
+  const u32 = new Uint32Array(buffer);
+  const out = {};
+  for (const [field, type] of struct.fields) {
+    const o = struct.offsets[field];
+    if (type === 'vec4f') {
+      const a = new Float32Array(4 * count);
+      for (let i = 0; i < count; i++) a.set(f32.subarray(i * struct.words + o, i * struct.words + o + 4), 4 * i);
+      out[field] = a;
+    } else {
+      const a = type === 'f32' ? new Float32Array(count) : type === 'i32' ? new Int32Array(count) : new Uint32Array(count);
+      const src = type === 'f32' ? f32 : u32;
+      for (let i = 0; i < count; i++) a[i] = src[i * struct.words + o];
+      out[field] = a;
+    }
+  }
+  return out;
+}
+
+/** Plain-JSON description of a struct layout, for record manifests. */
+export function describe(struct) {
+  return {
+    byte_size: struct.byteSize,
+    fields: struct.fields.map(([f, t]) => ({ name: f, type: t, byte_offset: 4 * struct.offsets[f] })),
+  };
+}
+
 /** One crust particle: a hexagonal column of crust, drawn as a disc of radius `apothem`. */
 export const Particle = defineStruct('Particle', [
   ['position', 'vec4f'],        // unit-sphere position (w unused)
@@ -59,6 +91,8 @@ export const Particle = defineStruct('Particle', [
   ['density', 'f32'],           // cached thermally-corrected density
   ['elevation', 'f32'],         // cached isostatic elevation, km
   ['split_child', 'u32'],       // index of child created this frame, else NONE
+  ['mantle_node', 'u32'],       // nearest mantle grid node, updated by a local walk each step
+  ['next_state', 'u32'],        // state requested during collisions, applied afterwards
 ]);
 
 /** A bond between two particles. */

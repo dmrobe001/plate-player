@@ -11,7 +11,7 @@ fn crust_predict(@builtin(global_invocation_id) id: vec3<u32>) {
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     let pos = particles[idx].position.xyz;
     var vel = particles[idx].velocity.xyz;
-    let node = nearest_node(pos);
+    let node = particles[idx].mantle_node;
 
     let grid_vel = grid[node].velocity.xyz * sim.sh_grad_to_cm_yr * sim.cm_yr_to_sim_vel;
     var target_vel = grid_vel;
@@ -22,7 +22,8 @@ fn crust_predict(@builtin(global_invocation_id) id: vec3<u32>) {
         target_vel += normalize(grid_vel + vec3f(0.001)) * pull;
     }
 
-    vel = vel + sim.drag_coeff_myr_inv * (target_vel - vel) * sim.dt_crust_myr;
+    // Exact exponential relaxation toward the target: stable for any dt.
+    vel = target_vel + (vel - target_vel) * exp(-sim.drag_coeff_myr_inv * sim.dt_crust_myr);
     particles[idx].predicted_pos = vec4f(normalize(pos + vel * sim.dt_crust_myr), 1.0);
     particles[idx].velocity = vec4f(vel, 0.0);
 }
@@ -110,7 +111,9 @@ fn crust_solve_collisions(@builtin(global_invocation_id) id: vec3<u32>) {
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     let pos_i = particles[idx].predicted_pos.xyz;
     let state_i = particles[idx].state;
-    var total_delta = vec3f(0.0);
+    // Summed in fixed point pair by pair, so the result does not depend on
+    // the (thread-timing-dependent) order of the hash grid's linked lists.
+    var total_delta = vec3i(0);
     var coll_count = 0i;
     let home = hash_cell(pos_i);
     let dim = i32(sim.hash_grid_dim);
@@ -133,14 +136,16 @@ fn crust_solve_collisions(@builtin(global_invocation_id) id: vec3<u32>) {
                 if (overlap > 0.0) {
                     if (state_i == 1u && state_j == 1u && overlap > sim.subduction_overlap) {
                         // Deep overlap between surface particles: the lower one subducts.
-                        if (particles[idx].elevation < particles[j].elevation) { particles[idx].state = 2u; }
+                        // Only this thread writes next_state[idx], and other threads read
+                        // `state`, which does not change until crust_apply_deltas.
+                        if (particles[idx].elevation < particles[j].elevation) { particles[idx].next_state = 2u; }
                     } else if (state_i != state_j) {
                         // Slab under surface crust: no normal push, only basal friction.
                         let rel = (pos_i - particles[idx].position.xyz) - (pos_j - particles[j].position.xyz);
-                        total_delta -= (rel - dot(rel, dir / dist) * (dir / dist)) * 0.2;
+                        total_delta -= to_fixed((rel - dot(rel, dir / dist) * (dir / dist)) * 0.2);
                         coll_count++;
                     } else {
-                        total_delta += (dir / dist) * overlap * 0.5;
+                        total_delta += to_fixed((dir / dist) * overlap * 0.5);
                         coll_count++;
                     }
                 }
@@ -149,13 +154,14 @@ fn crust_solve_collisions(@builtin(global_invocation_id) id: vec3<u32>) {
             iter++;
         }
     }}}
-    if (coll_count > 0i) { add_delta(idx, total_delta, coll_count); }
+    if (coll_count > 0i) { add_delta_fixed(idx, total_delta, coll_count); }
 }
 
 @compute @workgroup_size(64)
 fn crust_apply_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+    if (particles[idx].next_state == 2u) { particles[idx].state = 2u; }
     let count = atomicLoad(&particle_deltas[idx].count);
     if (count > 0i) {
         let sum = vec3f(f32(atomicLoad(&particle_deltas[idx].dx)), f32(atomicLoad(&particle_deltas[idx].dy)), f32(atomicLoad(&particle_deltas[idx].dz)));

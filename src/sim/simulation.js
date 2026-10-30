@@ -2,9 +2,10 @@
 
 import { Constraint, GridNode, NONE, Particle } from '../gpu/layout.js';
 import { createShaderModule } from '../gpu/device.js';
-import { packSimParams, SIM_PARAMS_BYTES, simParamsWGSL } from './params.js';
+import { packSimParams, SIM_PARAMS, SIM_PARAMS_BYTES, simParamsWGSL } from './params.js';
 
 import bindingsWGSL from '../shaders/compute/bindings.wgsl';
+import locateWGSL from '../shaders/compute/locate.wgsl';
 import mantleWGSL from '../shaders/compute/mantle.wgsl';
 import thermalWGSL from '../shaders/compute/thermal.wgsl';
 import growthWGSL from '../shaders/compute/growth.wgsl';
@@ -17,10 +18,13 @@ export const CAPACITY = {
   adjacencyWidth: 6,     // neighbours stored per mantle node
 };
 
-const MANTLE_SUBSTEPS = 50;   // Swift-Hohenberg steps per frame
-const SOLVER_ITERATIONS = 3;  // PBD Jacobi iterations per frame
+const SOLVER_ITERATIONS = 3;   // PBD Jacobi iterations per step
+const MANTLE_STABILITY = 0.5;  // fraction of the explicit-Euler stability limit used per substep
 const FREE_LIST_HEADER_WORDS = 4;
 const WORKGROUP = 64;
+
+/** Buffers that together are the complete simulation state (snapshot / restore). */
+export const STATE_BUFFERS = ['grid', 'particles', 'constraints', 'particlePool', 'constraintPool'];
 
 /** WGSL struct definitions shared by compute and render shaders. */
 export function structsWGSL({ atomicGrid = false } = {}) {
@@ -35,8 +39,9 @@ export class Simulation {
     this.icosphere = icosphere;
     this.numNodes = icosphere.vertices.length;
     this.steps = 0;
+    this.timeMyr = 0;
     const { maxParticles, maxConstraints, hashGridDim, adjacencyWidth } = CAPACITY;
-    const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST;
+    const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
 
     this.buffers = {
       grid: device.createBuffer({ label: 'grid', size: this.numNodes * GridNode.byteSize, usage: S }),
@@ -50,23 +55,45 @@ export class Simulation {
       params: device.createBuffer({ label: 'sim params', size: SIM_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
     };
 
-    device.queue.writeBuffer(this.buffers.params, 0, packSimParams({
-      num_nodes: this.numNodes,
-      max_particles: maxParticles,
-      max_constraints: maxConstraints,
-      hash_grid_dim: hashGridDim,
-    }));
-
     const adjacency = new Uint32Array(this.numNodes * adjacencyWidth).fill(NONE);
     icosphere.neighbours.forEach((list, i) => adjacency.set(list.slice(0, adjacencyWidth), i * adjacencyWidth));
     device.queue.writeBuffer(this.buffers.adjacency, 0, adjacency);
 
+    this.overrides = {};
+    this.setParams({});
     this.#createPipelines(onError);
+  }
+
+  /**
+   * Set parameter overrides (merged with previous ones) and upload. Derived
+   * values are recomputed: the mantle substep is the largest step within
+   * MANTLE_STABILITY of the explicit-Euler limit that divides the mantle
+   * time per crust step evenly.
+   */
+  setParams(overrides) {
+    Object.assign(this.overrides, overrides);
+    const value = (name) => (name in this.overrides ? this.overrides[name] : SIM_PARAMS.find(([n]) => n === name)[2]);
+
+    const mantleTimePerStep = value('mantle_time_per_myr') * value('dt_crust_myr');
+    const limit = mantleStabilityLimit(this.icosphere, value('laplacian_weight'), value('mantle_wavenumber'), value('mantle_rayleigh'));
+    this.mantleSubsteps = Math.max(1, Math.ceil(mantleTimePerStep / (MANTLE_STABILITY * limit.dtMax)));
+    this.mantleStability = { ...limit, dtUsed: mantleTimePerStep / this.mantleSubsteps };
+
+    this.params = {};
+    for (const [name] of SIM_PARAMS) this.params[name] = value(name);
+    Object.assign(this.params, {
+      dt_mantle: this.mantleStability.dtUsed,
+      num_nodes: this.numNodes,
+      max_particles: CAPACITY.maxParticles,
+      max_constraints: CAPACITY.maxConstraints,
+      hash_grid_dim: CAPACITY.hashGridDim,
+    });
+    this.device.queue.writeBuffer(this.buffers.params, 0, packSimParams(this.params));
   }
 
   #createPipelines(onError) {
     const { device, buffers } = this;
-    const code = [structsWGSL({ atomicGrid: true }), bindingsWGSL, mantleWGSL, thermalWGSL, growthWGSL, solverWGSL].join('\n');
+    const code = [structsWGSL({ atomicGrid: true }), bindingsWGSL, locateWGSL, mantleWGSL, thermalWGSL, growthWGSL, solverWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
     const order = ['grid', 'adjacency', 'particles', 'constraints', 'particlePool', 'constraintPool', 'hashGrid', 'deltas'];
@@ -93,10 +120,11 @@ export class Simulation {
 
     const layout = device.createPipelineLayout({ bindGroupLayouts: [memoryLayout, uniformLayout] });
     const entryPoints = [
+      'crust_locate',
       'grid_clear_thermal', 'crust_apply_thermal', 'grid_finalize_thermal',
       'mantle_laplacian', 'mantle_integrate', 'mantle_velocity',
-      'crust_thermo_isostasy', 'crust_constraint_healing',
-      'crust_accumulation', 'crust_rewire_bonds', 'crust_clean_split',
+      'crust_thermo_isostasy', 'crust_refresh_derived', 'crust_constraint_healing',
+      'crust_accumulation', 'crust_commit_splits', 'crust_rewire_bonds', 'crust_clean_split',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
       'crust_clear_deltas', 'crust_solve_constraints', 'crust_solve_collisions', 'crust_apply_deltas',
       'crust_integrate',
@@ -145,10 +173,12 @@ export class Simulation {
       pf[base + po.surface_area] = 2 * Math.sqrt(3) * P.apothem[i] ** 2;
       pf[base + po.apothem] = P.apothem[i];
       pu[base + po.state] = 1;
+      pu[base + po.next_state] = 1;
       pu[base + po.is_active] = 1;
       pu[base + po.next_idx] = NONE;
       pf[base + po.density] = P.compositionDensity[i];
       pu[base + po.split_child] = NONE;
+      pu[base + po.mantle_node] = nearestVertex(this.icosphere.vertices, x, y, z);
     }
     device.queue.writeBuffer(buffers.particles, 0, pbuf);
 
@@ -173,9 +203,20 @@ export class Simulation {
     device.queue.writeBuffer(buffers.particlePool, 0, freeList(P.count, maxParticles));
     device.queue.writeBuffer(buffers.constraintPool, 0, freeList(B.count, maxConstraints));
     this.steps = 0;
+    this.timeMyr = 0;
+
+    // Density and elevation are derived; compute them now so step 0 is complete.
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass({ label: 'refresh derived' });
+    pass.setBindGroup(0, this.memoryBindGroup);
+    pass.setBindGroup(1, this.uniformBindGroup);
+    pass.setPipeline(this.pipelines.crust_refresh_derived);
+    pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
+    pass.end();
+    device.queue.submit([encoder.finish()]);
   }
 
-  /** Record one simulation step (one frame) into a command encoder. */
+  /** Record one simulation step into a command encoder. */
   encodeStep(encoder) {
     const { maxParticles, maxConstraints, hashGridDim } = CAPACITY;
     const groups = (n) => Math.ceil(n / WORKGROUP);
@@ -187,13 +228,15 @@ export class Simulation {
     pass.setBindGroup(1, this.uniformBindGroup);
     const run = (name, count) => { pass.setPipeline(this.pipelines[name]); pass.dispatchWorkgroups(count); };
 
+    run('crust_locate', crust);
+
     // Crust -> mantle heat feedback
     run('grid_clear_thermal', nodes);
     run('crust_apply_thermal', crust);
     run('grid_finalize_thermal', nodes);
 
     // Mantle pattern and the velocity field it implies
-    for (let i = 0; i < MANTLE_SUBSTEPS; i++) {
+    for (let i = 0; i < this.mantleSubsteps; i++) {
       run('mantle_laplacian', nodes);
       run('mantle_integrate', nodes);
     }
@@ -203,6 +246,7 @@ export class Simulation {
     run('crust_thermo_isostasy', crust);
     run('crust_constraint_healing', bonds);
     run('crust_accumulation', crust);
+    run('crust_commit_splits', 1);
     run('crust_rewire_bonds', bonds);
     run('crust_clean_split', crust);
 
@@ -219,6 +263,50 @@ export class Simulation {
     run('crust_integrate', crust);
     pass.end();
     this.steps++;
+    this.timeMyr += this.params.dt_crust_myr;
+  }
+
+  /** Copy named GPU buffers to the CPU. Resolves to {name: ArrayBuffer}. */
+  async readBuffers(names) {
+    const { device } = this;
+    const encoder = device.createCommandEncoder();
+    const staging = names.map((name) => {
+      const src = this.buffers[name];
+      const dst = device.createBuffer({ size: src.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      encoder.copyBufferToBuffer(src, 0, dst, 0, src.size);
+      return dst;
+    });
+    device.queue.submit([encoder.finish()]);
+    await Promise.all(staging.map((b) => b.mapAsync(GPUMapMode.READ)));
+    const out = {};
+    names.forEach((name, i) => {
+      out[name] = staging[i].getMappedRange().slice(0);
+      staging[i].destroy();
+    });
+    return out;
+  }
+
+  /** Complete state: raw buffers plus the CPU-side counters. Restoring it resumes exactly. */
+  async snapshot() {
+    return {
+      step: this.steps,
+      timeMyr: this.timeMyr,
+      overrides: { ...this.overrides },
+      buffers: await this.readBuffers(STATE_BUFFERS),
+    };
+  }
+
+  restore(snap) {
+    this.setParams(snap.overrides ?? {});
+    for (const name of STATE_BUFFERS) {
+      const data = snap.buffers[name];
+      if (data.byteLength !== this.buffers[name].size) {
+        throw new Error(`snapshot buffer ${name} has ${data.byteLength} bytes, expected ${this.buffers[name].size}`);
+      }
+      this.device.queue.writeBuffer(this.buffers[name], 0, data);
+    }
+    this.steps = snap.step;
+    this.timeMyr = snap.timeMyr;
   }
 }
 
@@ -228,4 +316,41 @@ function freeList(used, capacity) {
   for (let i = used; i < capacity; i++) data[FREE_LIST_HEADER_WORDS + n++] = i;
   data[0] = n;
   return data;
+}
+
+export function nearestVertex(vertices, x, y, z) {
+  let best = 0, bestDot = -2;
+  for (let i = 0; i < vertices.length; i++) {
+    const v = vertices[i];
+    const d = v[0] * x + v[1] * y + v[2] * z;
+    if (d > bestDot) { bestDot = d; best = i; }
+  }
+  return best;
+}
+
+/**
+ * Explicit-Euler stability limit of the linearised Swift-Hohenberg operator
+ * r - (L + k^2)^2 on the icosphere, where L is the weighted graph Laplacian
+ * used by mantle.wgsl (eigenvalues -mu, mu in [0, muMax]). The most negative
+ * eigenvalue of the operator is r - (muMax - k^2)^2; Euler is stable while
+ * dt * |that| < 2. muMax comes from power iteration.
+ */
+export function mantleStabilityLimit(icosphere, weight, k0, r) {
+  const n = icosphere.vertices.length;
+  let x = new Float64Array(n).map((_, i) => Math.sin(1.7 * i + 0.3)); // deterministic start
+  let mu = 0;
+  for (let it = 0; it < 200; it++) {
+    const y = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      const nb = icosphere.neighbours[i].slice(0, CAPACITY.adjacencyWidth);
+      let s = nb.length * x[i];
+      for (const j of nb) s -= x[j];
+      y[i] = weight * s;
+    }
+    const norm = Math.hypot(...y);
+    mu = norm / Math.hypot(...x);
+    x = y.map((v) => v / norm);
+  }
+  const lambda = (mu - k0 * k0) ** 2 - r;
+  return { muMax: mu, lambdaMax: lambda, dtMax: 2 / lambda };
 }

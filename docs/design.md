@@ -1,7 +1,8 @@
 # Plate Player — design plan
 
-Status: **proposal**, not yet implemented. The code in `src/` still follows the
-Phase 5 prototype. This document says where it is going and why.
+Status: **phases 0 and 1 implemented**; the rest is a proposal. The physics in
+`src/` still follows the Phase 5 prototype. This document says where it is going
+and why.
 
 Contents
 
@@ -540,8 +541,8 @@ small record, so they double as tests of the recording code.
 
 | Phase | Work | Acceptance test |
 |---|---|---|
-| 0 | Housekeeping: exponential integrators for all rates; cache nearest mantle node; fix free-list and state-flip races | Same seed, same initial frames within tolerance; no rate-dependent blow-up at 10× dt |
-| 1 | **Minimal recording:** manifest + field series + snapshots (tiers a–c), download as zip | Restart from snapshot reproduces the next N steps |
+| 0 ✅ | Housekeeping: exponential integrators for all rates; cache nearest mantle node; fix free-list and state-flip races; mantle substep from a stability bound, mantle time tied to Myr | Every slot free or active exactly once; cached node = nearest; no blow-up at 10× dt. dt sensitivity is *reported*, not asserted: PBD stiffness still depends on dt until phase 2, so that number is the baseline phase 2 must beat |
+| 1 ✅ | **Minimal recording:** manifest + field series + snapshots (tiers a–c), download as zip, resume from zip | Restart from a record ZIP in a fresh page reproduces the next N steps bit for bit |
 | 2 | **Overdamped XPBD core:** drag as mass, real compliance, graph-coloured Gauss–Seidel | Two-particle relaxation matches τ = γ/2k; result independent of dt in the quasi-static limit |
 | 3 | **Unified edges + column contacts + free radius & buoyancy** | Thickened block relaxes to Airy height (Generator: thickened block) |
 | 4 | **Neighbour-fit strain + orientation**, stress-tensor glyphs | Rigid rotation → strain < 10⁻⁶; uniaxial stretch → set Poisson ratio ±5% |

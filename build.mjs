@@ -7,8 +7,20 @@
 import * as esbuild from 'esbuild';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { watch } from 'node:fs';
+import { execSync } from 'node:child_process';
 
 const OUT = 'dist/plate-player.html';
+
+// Git commit and whether the working tree had uncommitted changes, so a
+// record can name the exact code that produced it.
+function buildInfo() {
+  const git = (args) => execSync(`git ${args}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+  try {
+    return { commit: git('rev-parse HEAD'), dirty: git('status --porcelain').length > 0, built: new Date().toISOString() };
+  } catch {
+    return { commit: 'unknown', dirty: true, built: new Date().toISOString() };
+  }
+}
 
 async function build() {
   const started = performance.now();
@@ -18,6 +30,7 @@ async function build() {
     format: 'esm',
     target: 'es2022',
     loader: { '.wgsl': 'text' },
+    define: { __BUILD_INFO__: JSON.stringify(buildInfo()) },
     write: false,
     legalComments: 'none',
   });

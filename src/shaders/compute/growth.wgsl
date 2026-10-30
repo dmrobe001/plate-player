@@ -2,59 +2,76 @@
 // area, and split in two once large enough. The child is fresh oceanic crust.
 // Bonds that now sit closer to the child than to the parent are re-attached.
 
+// Slot allocation for splits is two-phase so that the free lists never
+// change while being read: each splitting thread takes a ticket t from
+// `particle_pool.requests` and claims the t-th slot from the top of both
+// free lists, provided t is below both counts; crust_commit_splits then
+// pops the claimed slots. Which particle gets which slot depends on thread
+// timing, but no slot is ever claimed twice and the counters never wrap.
 @compute @workgroup_size(64)
 fn crust_accumulation(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u || particles[idx].state == 2u) { return; }
     let pos = particles[idx].position.xyz;
-    let node = nearest_node(pos);
+    let node = particles[idx].mantle_node;
 
     // velocity = -grad(psi), so div(velocity) = -lap(psi)
     let div = -grid[node].laplacian_psi;
-    if (div > 1.5) {
-        particles[idx].surface_area += min(div * sim.dt_crust_myr * 0.005, 0.0001);
+    if (div > sim.divergence_threshold) {
+        let rate = min(div * sim.area_growth_coeff, sim.max_area_growth_rate);
+        particles[idx].surface_area += rate * sim.dt_crust_myr;
         particles[idx].apothem = sqrt(particles[idx].surface_area / 3.4641);
     }
 
     let base_area = 3.4641 * sim.base_apothem * sim.base_apothem;
-    if (particles[idx].surface_area > sim.split_area_factor * base_area && particles[idx].split_child == NONE) {
-        // Pop one particle slot and one bond slot from the free lists.
-        let p_count = atomicSub(&particle_pool.counter, 1u);
-        if (p_count == 0u) { atomicAdd(&particle_pool.counter, 1u); return; }
-        let c_count = atomicSub(&constraint_pool.counter, 1u);
-        if (c_count == 0u) { atomicAdd(&particle_pool.counter, 1u); atomicAdd(&constraint_pool.counter, 1u); return; }
-        let child = particle_pool.indices[p_count - 1u];
-        let bond = constraint_pool.indices[c_count - 1u];
+    if (particles[idx].surface_area <= sim.split_area_factor * base_area || particles[idx].split_child != NONE) { return; }
 
-        particles[idx].surface_area *= 0.5;
-        particles[idx].apothem = sqrt(particles[idx].surface_area / 3.4641);
-        particles[idx].split_child = child;
+    let ticket = atomicAdd(&particle_pool.requests, 1u);
+    let p_count = atomicLoad(&particle_pool.counter);
+    let c_count = atomicLoad(&constraint_pool.counter);
+    if (ticket >= min(p_count, c_count)) { return; } // out of slots; try again next step
+    let child = particle_pool.indices[p_count - 1u - ticket];
+    let bond = constraint_pool.indices[c_count - 1u - ticket];
 
-        particles[child] = particles[idx];
-        particles[child].temperature = sim.mantle_temp;
-        particles[child].age = 0.0;
-        particles[child].thickness_km = 7.0;
-        particles[child].composition_density = 3000.0;
-        particles[child].split_child = NONE;
-        particles[child].is_active = 1u;
+    particles[idx].surface_area *= 0.5;
+    particles[idx].apothem = sqrt(particles[idx].surface_area / 3.4641);
+    particles[idx].split_child = child;
 
-        // Separate parent and child along the local mantle flow.
-        var spread_dir = normalize(grid[node].velocity.xyz);
-        if (length(spread_dir) < 0.001) { spread_dir = normalize(cross(pos, vec3f(0.0, 1.0, 0.0))); }
-        let offset = spread_dir * (particles[idx].apothem * 1.05);
-        particles[idx].position = vec4f(normalize(particles[idx].position.xyz - offset), 1.0);
-        particles[child].position = vec4f(normalize(particles[child].position.xyz + offset), 1.0);
+    particles[child] = particles[idx];
+    particles[child].temperature = sim.mantle_temp;
+    particles[child].age = 0.0;
+    particles[child].thickness_km = 7.0;
+    particles[child].composition_density = 3000.0;
+    particles[child].split_child = NONE;
+    particles[child].is_active = 1u;
 
-        constraints[bond].particle_a = idx;
-        constraints[bond].particle_b = child;
-        constraints[bond].rest_length = particles[idx].apothem * 2.0;
-        constraints[bond].compliance = 0.001;
-        constraints[bond].yield_stress_mpa = sim.yield_stress_mpa;
-        constraints[bond].is_active = 1u;
-        constraints[bond].damage = 0.0;
-        constraints[bond].stress_normal_mpa = 0.0;
-        constraints[bond].stress_shear_mpa = 0.0;
-    }
+    // Separate parent and child along the local mantle flow.
+    var spread_dir = normalize(grid[node].velocity.xyz);
+    if (length(spread_dir) < 0.001) { spread_dir = normalize(cross(pos, vec3f(0.0, 1.0, 0.0))); }
+    let offset = spread_dir * (particles[idx].apothem * 1.05);
+    particles[idx].position = vec4f(normalize(particles[idx].position.xyz - offset), 1.0);
+    particles[child].position = vec4f(normalize(particles[child].position.xyz + offset), 1.0);
+
+    constraints[bond].particle_a = idx;
+    constraints[bond].particle_b = child;
+    constraints[bond].rest_length = particles[idx].apothem * 2.0;
+    constraints[bond].compliance = 0.001;
+    constraints[bond].yield_stress_mpa = sim.yield_stress_mpa;
+    constraints[bond].is_active = 1u;
+    constraints[bond].damage = 0.0;
+    constraints[bond].stress_normal_mpa = 0.0;
+    constraints[bond].stress_shear_mpa = 0.0;
+}
+
+// Single thread: pop the slots claimed in crust_accumulation.
+@compute @workgroup_size(1)
+fn crust_commit_splits() {
+    let p_count = atomicLoad(&particle_pool.counter);
+    let c_count = atomicLoad(&constraint_pool.counter);
+    let granted = min(atomicLoad(&particle_pool.requests), min(p_count, c_count));
+    atomicStore(&particle_pool.counter, p_count - granted);
+    atomicStore(&constraint_pool.counter, c_count - granted);
+    atomicStore(&particle_pool.requests, 0u);
 }
 
 @compute @workgroup_size(64)

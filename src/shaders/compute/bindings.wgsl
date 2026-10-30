@@ -9,7 +9,9 @@ const NONE: u32 = 0xFFFFFFFFu;
 // so the summed correction is deterministic.
 const FIXED_POINT: f32 = 1000000.0;
 
-struct FreeList { counter: atomic<u32>, pad1: u32, pad2: u32, pad3: u32, indices: array<u32> }
+// Stack of free slot indices. `requests` is used by two-phase allocation
+// (crust_accumulation reserves, crust_commit_splits pops; see growth.wgsl).
+struct FreeList { counter: atomic<u32>, requests: atomic<u32>, pad2: u32, pad3: u32, indices: array<u32> }
 struct ParticleDelta { dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count: atomic<i32> }
 
 @group(0) @binding(0) var<storage, read_write> grid: array<GridNode>;
@@ -23,25 +25,24 @@ struct ParticleDelta { dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count:
 
 @group(1) @binding(1) var<uniform> sim: SimParams;
 
-// Brute-force nearest mantle node (O(num_nodes) per call; see README to-do).
-fn nearest_node(p: vec3f) -> u32 {
-    var best = 0u;
-    var best_dist = 1000.0;
-    for (var i = 0u; i < sim.num_nodes; i++) {
-        let d = distance(p, grid[i].position.xyz);
-        if (d < best_dist) { best_dist = d; best = i; }
-    }
-    return best;
+fn to_fixed(v: vec3f) -> vec3i {
+    return vec3i(round(v * FIXED_POINT));
 }
 
-fn add_delta(i: u32, d: vec3f, count: i32) {
-    atomicAdd(&particle_deltas[i].dx, i32(d.x * FIXED_POINT));
-    atomicAdd(&particle_deltas[i].dy, i32(d.y * FIXED_POINT));
-    atomicAdd(&particle_deltas[i].dz, i32(d.z * FIXED_POINT));
+fn add_delta_fixed(i: u32, d: vec3i, count: i32) {
+    atomicAdd(&particle_deltas[i].dx, d.x);
+    atomicAdd(&particle_deltas[i].dy, d.y);
+    atomicAdd(&particle_deltas[i].dz, d.z);
     atomicAdd(&particle_deltas[i].count, count);
 }
 
+fn add_delta(i: u32, d: vec3f, count: i32) {
+    add_delta_fixed(i, to_fixed(d), count);
+}
+
 // Return an index to a free list (used when particles melt or bonds die).
+// Pushes only ever run in dispatches without pops, so the slot written is
+// never being read concurrently.
 fn release(pool_is_particles: bool, idx: u32) {
     if (pool_is_particles) {
         let n = atomicAdd(&particle_pool.counter, 1u);

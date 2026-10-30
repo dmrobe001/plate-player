@@ -6,7 +6,10 @@
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
-    "watch": "node build.mjs --watch"
+    "watch": "node build.mjs --watch",
+    "test:unit": "node --test test/unit.test.mjs",
+    "test:gpu": "node --test --test-concurrency=1 test/gpu.test.mjs",
+    "test": "npm run test:unit && npm run build && npm run test:gpu"
   },
   "devDependencies": {
     "esbuild": "0.25.10"

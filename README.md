@@ -103,7 +103,8 @@ plate-player/
 ├── src/
 │   ├── index.html             page template (build inlines CSS + JS where the markers are)
 │   ├── styles.css
-│   ├── main.js                entry: device, initial state, UI, frame loop
+│   ├── main.js                entry: device, initial state, UI, frame loop, window.plate API
+│   ├── build-info.js          git commit injected at build time (written into records)
 │   ├── gpu/
 │   │   ├── device.js          WebGPU init, shader compile-error reporting
 │   │   └── layout.js          GPU struct definitions (Particle, Constraint, GridNode)
@@ -118,12 +119,19 @@ plate-player/
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
+│   ├── record/
+│   │   ├── recorder.js        record schedule, manifest, snapshots, ZIP export / resume
+│   │   ├── sampling.js        particles -> fixed mesh (Gaussian kernel), geographic frame
+│   │   └── zip.js             minimal stored-only ZIP reader/writer
 │   ├── render/
 │   │   ├── renderer.js        render pipelines and draw calls
 │   │   └── camera.js          orbit camera
 │   └── shaders/
-│       ├── compute/           bindings.wgsl, mantle, thermal, growth, solver
+│       ├── compute/           bindings.wgsl, locate, mantle, thermal, growth, solver
 │       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
+├── test/
+│   ├── unit.test.mjs          CPU tests (Node only)
+│   └── gpu.test.mjs           acceptance tests that drive the built page in Chromium
 └── dist/                      build output (git-ignored)
 ```
 
@@ -154,26 +162,73 @@ use it as `sim.<name>` in any shader. To **add a compute stage**, write an
 `@compute` function in one of the `shaders/compute/*.wgsl` files and add its name
 to `entryPoints` and to the schedule in `encodeStep` (`simulation.js`).
 
-### Testing without a browser window
-
-The initial-condition code is plain JavaScript and runs in Node:
+### Tests
 
 ```bash
-node -e "import('./src/init/initial-state.js').then(m => console.log(m.generateInitialState(642, { seed: 1 }).stats))"
+npm run test:unit    # CPU code (zip, sampling, neighbour search, initial state); seconds
+npm run test:gpu     # acceptance tests against dist/plate-player.html; minutes
+npm test             # both, rebuilding first
 ```
 
-For the GPU part, headless Chromium's software WebGPU (SwiftShader) can run the
-page but cannot present the canvas. Use a headed browser under a virtual display
-(`xvfb-run`) to take screenshots with Playwright. It runs at about one step per
-second, which is enough to check that shaders compile and things look right.
+The GPU tests drive the built page in Chromium through `window.plate` (the same
+object you can poke at in the browser console). They need Playwright with Chromium
+(`npx playwright install chromium`). By default the browser uses SwiftShader, a CPU
+implementation of WebGPU, so results don't depend on your graphics card; set
+`PLATE_GPU=hardware` to use the real GPU. Headless Chromium can't present a WebGPU
+canvas, so the browser runs with a window; on a machine with no display (a server,
+CI), run `xvfb-run -a npm run test:gpu`. Under SwiftShader a step takes ~0.4 s, so
+the GPU suite takes several minutes.
+
+Opening the page with `?paused` starts it paused, which scripts use to control
+stepping exactly.
+
+## Recording
+
+Every run is recorded unless **Record this run** is unchecked (design.md §8.3 has
+the full rationale):
+
+- **Field series** every *Fields every* Myr (default 1): particle quantities averaged
+  onto a fixed icosphere mesh (10 242 nodes, ~220 km spacing) with a Gaussian kernel
+  one particle-spacing wide. Fields: surface height, crust thickness, density, age,
+  temperature, east/north velocity (mm/yr), bond damage, slab fraction, and
+  `support` (~1 under continuous crust, →0 in gaps; NaN values mark "no crust here").
+- **Snapshots** every *Snapshot every* Myr (default 25), plus one at the start and on
+  **Snapshot now**: the raw GPU buffers, enough to resume the run exactly.
+- **Download record** saves everything as a ZIP; **Resume from record** loads the
+  latest snapshot in a ZIP and continues from it (as a new record that notes where it
+  came from).
+
+Inside the ZIP, `manifest.json` describes everything else: the seed, initial-condition
+options, every parameter, the git commit of the build, the memory layout of each
+snapshot buffer, and the shape, dtype and units of every array. Arrays are raw
+little-endian binaries. Reading a record in Python:
+
+```python
+import json, zipfile, numpy as np
+z = zipfile.ZipFile("plate-player_seed1_step600.zip")
+m = json.loads(z.read("manifest.json"))
+def array(entry):
+    return np.frombuffer(z.read(entry["file"]), dtype=entry["dtype"]).reshape(entry["shape"])
+lat_lon = array(m["mesh"]["files"]["lat_lon"])            # (nodes, 2) degrees
+t = array(m["fields"]["time"])                            # (T,) Myr
+fields = {v["name"]: array(v) for v in m["fields"]["variables"]}
+height = fields["surface_height"]                         # (T, nodes) km above sea level
+```
+
+Recording costs ~0.4 MB per field sample and ~7 MB per snapshot. A readback pauses
+the simulation for a few milliseconds, so each sample is taken at an exact step.
 
 ## Reproducibility
 
 - The initial state is a pure function of the seed and `INIT_DEFAULTS`.
-- GPU evolution is *mostly* deterministic. Position corrections are summed with
-  integer atomics, which is order-independent. Free-list pops (particle
-  splitting) and the subduction state flip depend on thread scheduling, so two
-  runs can diverge once particles split or subduct.
+- GPU evolution is *mostly* deterministic. Position corrections are summed in fixed
+  point with integer atomics, which is order-independent (including per-pair in the
+  collision loop), and the subduction state flip is deferred to a separate pass. Two
+  sources of thread-timing dependence remain, both recorded in each manifest:
+  which free slot a splitting particle receives, and the 50-entry cap on collision
+  neighbour lists (rarely reached).
+- A snapshot restores the complete state; resuming from one reproduces the
+  continuation bit for bit (tested), as long as no split lands in a different slot.
 - The simulation advances one step per displayed frame, so simulated time per
   wall-clock second depends on the monitor's refresh rate and GPU speed. The
   panel reports steps and simulated Myr.
@@ -189,10 +244,11 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       (density ≈ 3300 × (1 + α ΔT)). The pull magnitude (`× 0.02` rad/Myr per
       kg/m³) is also orders of magnitude above plate speeds. Its direction
       follows the mantle flow (biased by `+vec3(0.001)`), not the trench normal.
-- [ ] **Slabs melt within a few frames.** Each step adds 2.5 × dt ≈ 4% of the
-      temperature gap, and the thickness loss is 0.1 km per K, so a 7 km slab is
-      gone in about two steps. The rate should be per Myr and much slower, so
-      slabs persist long enough to pull.
+- [ ] **Slabs melt within a few frames.** Slab heating relaxes at 2.5 /Myr (now
+      integrated exactly) and thickness loss is 0.1 km per K, so a 7 km slab is
+      gone in about two steps. The rates (`slab_heating_rate`,
+      `slab_assimilation_km_per_k`) should be much slower so slabs persist long
+      enough to pull; design phase 7 replaces this mechanism.
 - [ ] **No ocean depth–age relation.** Real sea floor deepens about 3 km from ridge
       to old basin (depth ∝ √age, from cooling of the lithospheric mantle). Here
       only the 7 km crust contracts, about 0.25 km. Adding a lithosphere term
@@ -226,27 +282,35 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [ ] **Subduction choice.** The lower disc of any deeply overlapping pair
       subducts, including continent under continent. The polarity is decided per
       pair, so a trench can flip polarity along its length.
+- [ ] **The mantle pattern takes hundreds of Myr to emerge.** Pattern time advances
+      at 0.0156 units per Myr and the growth rate is r = 0.2, so one e-folding of
+      the fastest mode takes ~320 Myr. Meanwhile off-wavelength noise decays (max
+      |ψ| falls from 0.05 to 0.009 in the first 1.6 Myr) and plates drift at
+      ~1–2 cm/yr. (Inherited from the Phase 5 constants.) Either start ψ from a
+      developed pattern or raise `mantle_time_per_myr`.
 - [ ] **Mantle has no toroidal (rotational) flow.** Velocity = −∇ψ is curl-free, so
       transform-style motion arises only from crust interactions.
-- [ ] Mantle time is a pattern-time variable (50 × 5×10⁻⁶ per frame) with no stated
-      relation to Myr, and the explicit Euler step is near its stability limit
-      for the ∇⁴ term (λ_max·dt ≈ 1.5 of the limit 2). Changing
-      `laplacian_weight` or the subdivision level can make ψ blow up.
+- [x] ~~Mantle time had no stated relation to Myr, and the explicit step size was
+      hand-tuned.~~ Pattern time now advances at `mantle_time_per_myr`, and the
+      substep is derived from a power-iteration estimate of the operator's largest
+      eigenvalue (half the explicit-Euler limit). For the record: the old step sat at
+      λ_max·dt ≈ 0.75 against a limit of 2, not the ≈ 1.5 this list first claimed.
 
 **Correctness / GPU**
-- [ ] Race in `crust_solve_collisions`: a thread writes `particles[idx].state = 2`
-      while neighbours read `state` in the same dispatch. Record the flip in a
-      separate buffer and apply it afterwards.
-- [ ] Race in free-list pops: `atomicSub` on an empty counter wraps to 0xFFFFFFFF
-      before being restored, and concurrent threads can read that value.
+- [x] ~~Race in `crust_solve_collisions` on the subduction state flip.~~ The flip is
+      written to `next_state` and applied in `crust_apply_deltas`.
+- [x] ~~Race in free-list pops.~~ Splits now reserve slots with tickets and a
+      single-thread `crust_commit_splits` pops them; counters never wrap. The GPU
+      tests check that every slot is either active or free, exactly once.
+- [x] ~~Explicit relaxation rates (velocity drag, temperatures) had dt-dependent
+      stability.~~ They are integrated as exact exponentials, and area growth is a
+      rate per Myr. A 10× time step runs stably (tested).
 - [ ] Healing is effectively off. At surface temperatures exp(−Eₐ/RT) underflows
       the `> −50` guard, so only near-mantle-temperature bonds heal.
 
 **Performance**
-- [ ] `nearest_node` is a brute-force loop over all 642 mantle nodes, run three
-      times per particle per frame (thermal, accumulation, predict). Caching the
-      node index per particle (search only the previous node's neighbours) removes
-      about 50 M distance evaluations per frame.
+- [x] ~~`nearest_node` brute force over all mantle nodes.~~ Each particle caches
+      its node and updates it by a greedy walk over the icosphere (`locate.wgsl`).
 - [ ] Every dispatch covers the full capacity (25 000 particles, 100 000 bonds)
       regardless of how many are active. An indirect dispatch on the live count
       would help.
@@ -256,6 +320,6 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       step budget) so speed doesn't depend on the monitor.
 
 **For game use**
-- [ ] Export: read back particle positions and elevations, rasterise them to an
-      equirectangular height map, and save as PNG.
+- [ ] Export: rasterise a record's `surface_height` to an equirectangular height
+      map and save as PNG (the record already has the data on a mesh).
 - [ ] Expose `INIT_DEFAULTS` (continent fraction, plate count, etc.) in the UI.
