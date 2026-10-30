@@ -1,0 +1,597 @@
+# Plate Player — design plan
+
+Status: **proposal**, not yet implemented. The code in `src/` still follows the
+Phase 5 prototype. This document says where it is going and why.
+
+Contents
+
+1. [Goals and non-goals](#1-goals-and-non-goals)
+2. [Principles](#2-principles)
+3. [State](#3-state-what-the-gpu-holds)
+4. [Physics: one energy, one dissipation](#4-physics-one-energy-one-dissipation)
+5. [The time step](#5-the-time-step)
+6. [Boundaries, subduction and spreading](#6-boundaries-subduction-and-spreading)
+7. [Resolution and adaptivity](#7-resolution-and-adaptivity)
+8. [Contracts between scales](#8-contracts-between-scales)
+9. [Implementation phases and acceptance tests](#9-implementation-phases-and-acceptance-tests)
+10. [Open questions](#10-open-questions)
+11. [Glossary](#11-glossary)
+
+---
+
+## 1. Goals and non-goals
+
+**Goals**
+
+- Generate plausible planets for a game: continents, ocean basins, mountain belts,
+  trenches, rifts, and their evolution over hundreds of Myr.
+- Physics that is *coherent*: every force comes from one energy or one dissipation,
+  so the behaviours agree with each other and with the method's stability guarantee.
+- Designed for **~50 km particle spacing (~240k particles)**, with graceful
+  degradation at coarser resolution (~220 km, ~10k particles) for fast iteration.
+  "Graceful" means it still runs and still looks tectonic. Statistics like trench
+  widths may deviate from Earth's.
+- One member of a **stack of models** at decreasing scale. Each runs in isolation
+  and communicates only through recorded data (section 8).
+- Reproducible: a manifest (code version, seed, parameters) regenerates a run,
+  subject to the documented GPU nondeterminism.
+
+**Non-goals (for this level)**
+
+- Inertia. Plate tectonics is overdamped (Reynolds number ~10⁻²⁰).
+- Two-way coupling between scales. Information flows down only.
+- Surface processes (erosion, sedimentation, climate) and earthquakes. These belong
+  to lower levels or separate models; this level exports what they need.
+- Geological history and provenance. They are deferred, but the design leaves room:
+  per-particle fields and an event log (section 8.5).
+
+---
+
+## 2. Principles
+
+1. **Overdamped implicit steps.** Velocity is set by force balance, not by
+   integrating accelerations. Each step minimises
+
+   > Φ(x) = Σᵢ (γᵢ / 2dt) |xᵢ − x̃ᵢ|² + U(x)
+
+   where γᵢ is basal drag, x̃ᵢ is where the mantle alone would carry particle i,
+   and U is the total potential energy. This is implicit Euler for overdamped
+   dynamics, and the Onsager variational principle in discrete form.
+   **Extended position-based dynamics (XPBD) solves exactly this problem with
+   drag in place of mass** (section 5.2).
+
+2. **Everything else is integrated unconditionally stably.** Relaxations
+   (temperature, damage healing) use exact exponentials, x ← x∞ + (x − x∞)e^(−k dt).
+   Irreversible changes (yield, damage, topology) are applied as corrections between
+   solves. No explicit rate may have a stability limit on dt.
+
+3. **Boundaries live on edges.** Bonds and contacts are one structure, the *edge*.
+   Plate-boundary character (ridge, trench, transform, suture) is either stored edge
+   state or derived from edge kinematics.
+
+4. **Two levels of resolution in the solver.** Plates are the coarse level: rigid
+   rotations about Euler poles, solved first. Particles are the fine level and carry
+   deformation within plates. This is aggregation multigrid with geologically
+   meaningful aggregates.
+
+5. **Material parameters are continuum quantities.** Young's modulus, Poisson's
+   ratio, elastic thickness, viscosities and densities are given in physical units
+   and converted to per-particle and per-edge constants using the local particle
+   size. The material must not change when resolution changes.
+
+6. **Levels talk only through records.** A model never reads another model's
+   internals; it reads a *forcing* built from a parent's *record* or from a
+   procedural generator, under a stated contract (section 8).
+
+7. **Seeded randomness only**, as now.
+
+---
+
+## 3. State: what the GPU holds
+
+Sizes are for the 50 km target: ~240k particles, ~1M edges, ≤256 plates.
+Memory stays within a few hundred MB of storage buffers.
+
+### 3.1 Particle = lithospheric column
+
+A particle is a hexagonal prism of lithosphere. Its *position* is the centre of
+its top surface and its *director* is its axis, which is radial for flat-lying
+crust and tilted for slabs.
+
+| Field | Type | Units | Notes |
+|---|---|---|---|
+| `position` | vec3 | unit sphere | **free radius** (new): \|x\| = 1 + surface height / R |
+| `director` | vec3 | unit vector | column axis; carries bending (new) |
+| `orientation` | f32 | rad | rotation about the director, from the polar decomposition (new) |
+| `area` | f32 | unit sphere² | hexagon area; apothem = √(area / 2√3) |
+| `crust_thickness` | f32 | km | |
+| `lith_mantle_thickness` | f32 | km | cold mantle layer that moves with the crust (new) |
+| `crust_density` | f32 | kg/m³ | at mantle temperature, as now |
+| `age` | f32 | Myr | time since formation; drives oceanic cooling |
+| `thermal_age` | f32 | Myr | reset by reheating (rifting, arcs); sets lith_mantle_thickness (new) |
+| `plastic_strain` | f32 | – | accumulated irreversible strain; weakens the column (new) |
+| `plate` | u32 | – | plate slot, from labelling (new) |
+| `kind` | u32 | – | surface / slab / ghost (boundary-driven) / inactive |
+| `level` | u32 | – | resolution level for adaptivity (new; 0 = base) |
+| `strain` | 3×f32 | – | symmetric 2×2 strain from the neighbour fit (diagnostic + yield) |
+| `stress` | 3×f32 | MPa·km | thickness-integrated stress tensor (diagnostic + export) |
+| `x_prev`, `x_pred` | vec3 | | solver scratch |
+
+Temperature is no longer a per-particle prognostic scalar. The column's thermal
+structure follows from `thermal_age` (half-space cooling) plus a reheating rule for
+slabs and arcs. That removes an explicit ODE and gives the depth–age law directly.
+
+### 3.2 Edge = bond or contact
+
+| Field | Type | Notes |
+|---|---|---|
+| `a`, `b` | u32 | particle indices |
+| `type` | u32 | `BOND` (cohesive), `CONTACT` (touching, no cohesion), `SUBDUCTION` (contact with polarity) |
+| `rest_a`, `rest_b` | 2×vec2 | rest edge vector in each particle's own frame; used by the strain fit and for bending |
+| `damage` | f32 | 0..1, weakens cohesion; a BOND at damage 1 becomes a CONTACT |
+| `polarity` | u32 | SUBDUCTION only: which end goes down |
+| `lambda` | f32 | XPBD multiplier for this step |
+| `friction_state` | f32 | Coulomb friction scratch (stick/slip) |
+| `born` | f32 | Myr; for events and history |
+| `stress_n`, `stress_t` | f32 | resolved normal and shear stress from the particle tensors (display) |
+
+Edges are created in two ways. **Bonds** come from initial conditions, from splits,
+and from welding (a contact held long enough under compression can become a bond:
+suturing). **Contacts** are created by the collision pass when two non-bonded
+columns overlap, and destroyed when they separate.
+
+Boundary *classification* for display and export (divergent, convergent, transform)
+is derived from the relative velocity across the edge, not stored.
+
+### 3.3 Plate (coarse level)
+
+| Field | Type | Notes |
+|---|---|---|
+| `omega` | vec3 | angular velocity about the Euler pole, rad/Myr |
+| `torque` | 3×i32 atomic | fixed-point accumulation |
+| `drag_tensor` | 6×i32 atomic | I_γ = Σ γᵢ (\|rᵢ\|² 𝟙 − rᵢ rᵢᵀ), symmetric |
+| `area`, `centroid` | | for export |
+| `persistent_id` | u32 | stable across re-labelling (section 5.3) |
+
+### 3.4 Mantle
+
+The Swift–Hohenberg (SH) pattern on the icosphere stays for now. Architecturally it
+becomes a **basal-forcing generator** (section 8.4). It supplies v_mantle(x, t) and
+basal heat flux to the plate model, and it keeps its current feedback from crust
+(thermal blanket, slab cooling). Its time integration moves to a stable scheme:
+semi-implicit for the linear operator, or substeps sized by an explicit stability
+check.
+
+---
+
+## 4. Physics: one energy, one dissipation
+
+Notation: A = column area, hₑ = elastic thickness (from `thermal_age` and crust
+type), E = Young's modulus, ν = Poisson's ratio, g = gravity, ρ_m = mantle density.
+
+### 4.1 Dissipation (the "mass" of the solver)
+
+- **Basal drag:** γᵢ = Aᵢ η_a / h_a, with η_a and h_a the asthenosphere viscosity
+  and thickness. It resists motion relative to the mantle velocity at the column.
+- **Slab drag:** slab particles feel isotropic drag in 3D,
+  γ_slab ~ (Stokes-like) η_m · (particle size).
+
+### 4.2 In-plane elasticity (replaces the bond springs and the bogus shear)
+
+For each particle i, fit the local deformation gradient by least squares over its
+bonded neighbours j, comparing rest vectors Dᵢⱼ (stored in i's frame) with current
+vectors dᵢⱼ (projected into i's tangent plane):
+
+> Fᵢ = (Σⱼ wᵢⱼ dᵢⱼ Dᵢⱼᵀ)(Σⱼ wᵢⱼ Dᵢⱼ Dᵢⱼᵀ)⁻¹
+
+Polar decomposition Fᵢ = Rᵢ Sᵢ. The rotation Rᵢ updates `orientation`, so rigid
+rotation produces **zero strain**. The stretch gives εᵢ = Sᵢ − 𝟙. Energy, as
+thickness-integrated plane stress:
+
+> U_el = Σᵢ Aᵢ hₑ,ᵢ [ μ ε_dev:ε_dev + ½ K₂ (tr ε)² ],  μ = E / 2(1+ν),  K₂ = E / 2(1−ν)
+
+This is a multi-particle XPBD constraint, involving i and its ≤6 neighbours. It
+frees Poisson's ratio from the 1/3 that central springs on a triangular lattice
+force, and gives a true stress tensor for yield, display and export.
+
+### 4.3 Bending (new; needed at 50 km)
+
+Directors nᵢ, with flexural rigidity D = E hₑ³ / 12(1−ν²):
+
+> U_bend = Σ_edges (D Aᵢⱼ / 2ℓᵢⱼ²) |nⱼ − nᵢ − (rest difference)|²
+>        + Σ_edges k_K (nᵢ · (xⱼ − xᵢ))²
+
+The second term is a soft Kirchhoff constraint keeping the director normal to the
+sheet. The discretisation is the least settled part of the design. It is accepted
+only if it passes the line-load flexure benchmark (section 9) at 50 km.
+
+### 4.4 Buoyancy (new; free radius)
+
+Each surface column has an equilibrium surface radius r_eq,i from Airy isostasy of
+its whole column (crust + lithospheric mantle, with temperature-dependent densities),
+with water loading Δρ = ρ_m − ρ_w where submerged:
+
+> U_iso = Σᵢ ½ Δρ g Aᵢ (rᵢ − r_eq,i)²
+
+This is a Winkler foundation. With D = 0 every column sits at r_eq, recovering
+today's Airy elevation. With D > 0, loads spread over the flexural length α:
+foreland basins, forebulges and trench outer rises emerge.
+
+Slab particles are below the lithosphere base and have no restoring equilibrium.
+They feel a body force (ρ_col − ρ_m) g V along the local vertical, and sink until
+assimilated.
+
+### 4.5 Contact
+
+Columns are prisms with radial extent [r_bottom, r_top]. Two columns are in contact
+only if they overlap in map view **and** in depth. This is what lets a slab pass
+beneath an overriding plate. Contacts are XPBD inequality constraints (non-penetration)
+with Coulomb friction μ_f on the tangential part. The subduction interface uses a
+low μ_f (it is weak on Earth).
+
+### 4.6 Gravitational potential energy (ridge push, plateau collapse)
+
+A thin-sheet column model loses the horizontal force from lateral differences in
+gravitational potential energy (GPE). Add it as an explicit, smooth body force:
+
+> Fᵢ = −Aᵢ ∇Γ,  Γ = ∫ (lithostatic pressure − reference column pressure) dz
+
+The gradient comes from a least-squares fit over neighbours. With depth–age
+cooling this produces ridge push, and on thick continents it produces plateau
+collapse and orogenic spreading. Explicit is acceptable here because Γ varies
+slowly; a test should confirm it has no stability limit in practice.
+
+### 4.7 Irreversible processes (between solves)
+
+- **Yield:** pressure-dependent (Byerlee-type, i.e. frictional) yield stress at
+  shallow depth, Arrhenius-weakened ductile yield deeper. The depth-integrated yield
+  envelope is evaluated per column from its thermal structure. Excess stress
+  converts to `plastic_strain` (return mapping) and damages that particle's edges.
+- **Damage healing:** exponential relaxation, faster when hot.
+- **Volume conservation:** dilatation changes area; crust_thickness × area is
+  conserved. Compression thickens (mountains) and extension thins (rifts), except
+  where melt adds volume (section 6).
+- **Thermal:** `thermal_age` advances; reheating rules reset it at arcs and rifts.
+
+---
+
+## 5. The time step
+
+### 5.1 Schedule
+
+```
+1. thermal + irreversible     exponential updates; yield/damage return mapping
+2. topology events            contacts from hash grid; edge state transitions;
+                              subduction initiation; splits/merges; slab removal at depth
+3. plate labelling            incremental min-label propagation over intact bonds
+4. predict                    x̃ᵢ = xᵢ + v_mantle(xᵢ)·dt + F_ext,i·dt/γᵢ
+5. coarse solve               per plate: I_γ Ω = Σ rᵢ × (γᵢ v_mantle,i + Fᵢ) ; move x̃ by rotation Ω·dt
+6. fine solve                 k sweeps of XPBD over constraints (elastic, bending, buoyancy,
+                              contact), graph-coloured Gauss–Seidel
+7. finish                     v = (x − x_prev)/dt (diagnostic); orientation/director update;
+                              stresses for display; recording if due
+```
+
+Steps 5 and 6 can alternate twice if benchmarks show the fine solve fighting the
+coarse one.
+
+### 5.2 XPBD with drag in place of mass
+
+Multiplying Φ by dt gives ½|x − x̃|²_Γ + dt·U. For a constraint Cₖ with compliance αₖ
+(energy Cₖ²/2αₖ):
+
+> Δλₖ = (−Cₖ − α̃ₖ λₖ) / (Σᵢ wᵢ |∇ᵢCₖ|² + α̃ₖ),   Δxᵢ = wᵢ ∇ᵢCₖ Δλₖ
+> with **wᵢ = 1/γᵢ** (instead of 1/mᵢ) and **α̃ₖ = αₖ/dt** (instead of αₖ/dt²)
+
+Velocity is no longer state; it is a diagnostic. Large dt is safe; it only makes
+each step more nearly quasi-static.
+
+### 5.3 Plate labelling
+
+- Every frame, run a few sweeps where each particle takes the minimum plate label
+  over its intact BOND edges (damage < threshold). Labels persist between frames,
+  so a few sweeps per frame keep up.
+- Min-label propagation detects merges but **not splits**. Every K steps, re-seed
+  labels from particle indices and propagate to convergence. Then map the new
+  components to old `persistent_id`s by majority overlap: a small readback, done on
+  the CPU. Split and merge events go to the event log.
+
+### 5.4 Parallelism and determinism
+
+- Graph-colour the edges (at most ~7 colours on a near-triangular lattice). Recolour
+  on topology change, locally and greedily.
+- Fixed-point integer atomics for all accumulations, as now, so sums are
+  order-independent.
+- The remaining nondeterminism (free-list pops, contact creation order) is
+  documented. Where cheap, make it deterministic by resolving conflicts by index
+  (e.g. the lower particle index wins a free slot).
+
+---
+
+## 6. Boundaries, subduction and spreading
+
+**Spreading (kept, reinterpreted).** Where columns are pulled apart, area grows by
+dilatation, the crust thins, and the gap fills with new 7 km oceanic crust from melt.
+Concretely, the current grow-then-split rule stays, but:
+- the parent keeps its *volume*, so its thickness drops;
+- the child is new oceanic crust with `age` = `thermal_age` = 0.
+
+Ridges stand high because young lithosphere is thin and hot (4.4), and ridge push
+follows (4.6).
+
+**Continental rifting → breakup.** Stretching continental crust thins until a
+threshold, then behaves as above. The first oceanic child is logged as a breakup
+event.
+
+**Subduction initiation.** A convergent CONTACT edge becomes SUBDUCTION when:
+1. one side's column is negatively buoyant relative to the mantle (old ocean,
+   ≳30–40 Myr); and
+2. normal stress across the contact exceeds a threshold, sustained over a time
+   window (a stored accumulator).
+
+Polarity: the denser column goes down. If both qualify, the older one goes down.
+Continent never goes down while it remains buoyant; continent–continent convergence
+produces collision (thickening) instead.
+
+**Subduction (explicit slab).** The downgoing column's `kind` becomes slab. It
+keeps its bonds to the trailing plate, so slab pull is transmitted through real
+edges. It sinks under its own negative buoyancy, bends via the director energy, and
+its depth interval no longer overlaps the overriding plate's, so they slide past
+each other with interface friction. At a cutoff depth (e.g. 660 km), or once
+thermally assimilated, the particle is removed and its edges retired. The slab is
+the memory: polarity persistence and the slab-pull–speed feedback come from the
+geometry, not from bookkeeping.
+
+**Arcs.** Overriding columns within a set distance of a SUBDUCTION edge gain crust
+volume at a rate proportional to the subduction flux, and their `thermal_age` is
+reset (hot, weak arc lithosphere). This is how continents grow over time.
+
+**Collision and suturing.** Buoyant columns in sustained compressive contact thicken
+by volume conservation. A contact held long enough can weld into a BOND (suture),
+merging plates (a logged event).
+
+**Coarse-resolution fallback (~220 km).** Slabs are only 2–3 particles long, bending
+is aliased, and arcs are one particle wide. The same rules still run; slab pull is
+just lumpier. No separate code path. Deviation from Earth statistics is accepted.
+
+---
+
+## 7. Resolution and adaptivity
+
+- **Base resolution** is set by `base_apothem`. All continuum parameters are scaled
+  per particle and per edge from physical values (principle 5).
+- **Refinement:** split a particle (same machinery as spreading, but
+  volume-preserving and keeping the parent's material) where any of these exceeds a
+  threshold:
+  - strain-rate magnitude;
+  - proximity to a SUBDUCTION or damaged edge;
+  - curvature (|∇n|).
+- **Coarsening:** merge two bonded same-plate particles of the same level in calm
+  interiors. Their bonds rewire to the merged particle, with rest vectors recomputed
+  from current geometry, so the merge is stress-neutral. Merging is the fiddly
+  operation; implement it after refinement works.
+- **Level ratio:** neighbouring particles differ by at most one level, so area
+  ratio ≤ 2, as in quadtree balancing.
+- **Hash grid:** cell size ≥ the largest contact distance, so the coarsest level sets
+  it. If levels differ a lot, use one grid per level, or a grid sized for the finest
+  level plus multi-cell insertion for coarse particles.
+- **Time step:** the implicit solve has no stability limit from small particles.
+  Accuracy near fine particles may want smaller dt; prefer more iterations to
+  substepping.
+- **Precision:** float32 on the unit sphere resolves ~0.4 m, enough for this level.
+  Lower levels use local coordinates (section 8.2).
+
+---
+
+## 8. Contracts between scales
+
+### 8.1 Vocabulary and rules
+
+- **Level:** one model at one scale, e.g. L0 mantle (optional), **L1 global plates
+  (this model)**, L2 regional crust patch, L3 local terrain…
+- **Record:** what a run writes, self-describing and versioned.
+- **Forcing:** what a run reads.
+- **Adapter:** turns a parent's Record into a child's Forcing (cropping,
+  reprojection, resampling). This is the only code that knows about two levels.
+- **Generator:** produces a Forcing procedurally or analytically, with no parent run.
+  A Generator and an Adapter must produce forcings with the same schema, so a child
+  cannot tell them apart.
+
+Rules:
+
+1. **One-way.** Children never alter parents. Disagreement is measured and
+   reported, never fed back.
+2. **Fields, not particles.** Children consume Eulerian fields sampled on a stated
+   mesh, so they are independent of the parent's discretisation. Lagrangian
+   snapshots exist for restart and debugging; no child depends on them.
+3. **Every quantity declares** its units, reference frame, sampling (point value vs
+   cell average) and extensiveness. Extensive quantities (volume, mass) are remapped
+   conservatively; intensive ones (velocity, temperature) are interpolated.
+4. **Time resolution is part of the contract.** A record states its sampling
+   interval. A child must not depend on parent variability faster than that; that is
+   the child's own physics.
+5. **Records are reproducible.** The manifest is sufficient to regenerate the record
+   (section 8.3).
+6. **Policy for disagreement:** the parent is authoritative at the child's lateral
+   boundary; the child is authoritative in its interior. Between them sits a
+   relaxation zone, where the child is nudged toward the parent over a stated width
+   and time scale. This mirrors the lateral boundary conditions of regional climate
+   models ("dynamical downscaling", Davies relaxation), a field with decades of
+   practice on exactly this problem.
+
+### 8.2 Frames and time
+
+- **Global frame:** unit sphere, body-fixed (rotation is not modelled at L1).
+  Latitude/longitude derived from it, conventions stated in the manifest.
+- **Patch frame:** a projection centred on (lat₀, lon₀) with a stated projection
+  (default: azimuthal equidistant), local units in km, local float32 coordinates.
+- **Time:** Myr since the start of the run that produced the record (`t_model`), plus
+  an offset to a shared epoch if a stack wants one. A child's forcing covers
+  [t₀, t₁] in the parent's time; the child may run its own clock and dt.
+- **Vertical:** heights in km relative to sea level, with sea level as its own time
+  series. Depths are positive down from sea level.
+
+### 8.3 Record contents (what a level exports)
+
+Four tiers; a run can be configured to write any subset.
+
+**a. Manifest** (always): schema version, model name, code version (git commit),
+seed, full parameter set, resolution, frames, time range, list of included tiers
+and fields, and known nondeterminism.
+
+**b. Field series** (the main product): fields sampled every Δt_rec (default 1 Myr at
+L1) on a fixed mesh. Proposed mesh: an icosphere at least as fine as the particles,
+plus optional derived equirectangular rasters for convenience.
+
+| Field | Units | Kind | Needed by |
+|---|---|---|---|
+| surface height | km rel. sea level | intensive | everything |
+| crust thickness | km | extensive (× area) | L2 initial state, inflow |
+| lithosphere thickness / thermal age | km / Myr | intensive | L2 thermal state, strength |
+| crust density / composition class | kg/m³, enum | intensive (mode for enums) | L2 material |
+| surface velocity | km/Myr, 2 tangent comps | intensive | L2 boundary conditions |
+| strain rate (tensor) | 1/Myr, 3 comps | intensive | L2 boundary conditions, nudging |
+| integrated stress (tensor) | MPa·km, 3 comps | intensive | traction boundary conditions |
+| plate id | persistent id | enum | context, game |
+| boundary type and distance to nearest boundary | enum, km | intensive | L2 tectonic context |
+| subduction polarity / slab depth beneath | enum, km | intensive | L2 arcs, basal context |
+| basal heat flux | mW/m² | intensive | L2 thermal |
+| mantle velocity at base | km/Myr | intensive | L2 basal forcing |
+| plastic strain / damage | – | intensive | inherited weakness in L2 |
+| sea level (scalar series) | km | global | everything |
+
+**c. Snapshots** (sparse): the complete Lagrangian state (particles, edges, plates)
+every Δt_snap. This is enough to restart a run exactly, and lets a child start from
+an exact cropped state if it shares this model's code.
+
+**d. Events** (cheap, the seed of later history): an append-only log of discrete
+happenings, each with time, location (lat/lon or a polyline), involved plate ids and
+a magnitude. Types: `rift_onset`, `breakup`, `subduction_initiation`,
+`slab_breakoff`, `collision_onset`, `suture`, `plate_split`, `plate_merge`.
+
+**e. Tracers** (later, for history): Lagrangian markers recording provenance
+(birth time, birth setting, peak pressure/temperature). Deferred; listed so the
+schema reserves a place.
+
+**Storage:** keep it boring and portable. A directory (or zip, for browser
+downloads) holding `manifest.json`, plus one little-endian binary array per field
+per time block, with shapes and dtypes declared in the manifest. Field metadata
+should follow climate-and-forecast (CF) naming conventions (`units`, `long_name`,
+`standard_name` where one exists), so NetCDF or Zarr conversion is a renaming, not
+a redesign.
+
+### 8.4 Forcing contracts (what a level needs)
+
+**L1 (this model) needs from above: a basal forcing.**
+- Mantle velocity at the lithosphere base, v_m(x, t).
+- Basal heat flux or mantle temperature.
+- Optionally, down-going flow regions (where slabs are allowed to sink).
+
+Today this comes from the internal SH generator, which also takes feedback from the
+crust. That feedback means it is part of L1 rather than a separate level. Contract
+for swapping: the generator implements `sample(x, t) → {v_m, q_basal}` and may
+optionally read L1 state. A recorded mantle model (true L0) would supply the same
+fields with no feedback.
+
+**L2 (regional patch) needs from L1:**
+- **Domain:** centre, projection, extent, and time window [t₀, t₁].
+- **Initial state at t₀** on the patch: crust and lithosphere thickness, composition,
+  thermal age, plastic strain, plate ids and boundary context.
+- **Lateral boundary forcing** along ∂Ω over [t₀, t₁]: velocity (kinematic boundary
+  condition) and/or integrated stress (traction boundary condition), plus the
+  material state of anything flowing *in* (thickness, age, composition).
+- **Basal forcing** over Ω: mantle velocity, heat flux, slab presence and depth.
+- **Globals:** sea level(t).
+- **Nudging targets** (optional): interior fields for the relaxation zone.
+
+**What L1 should guarantee to children:**
+- Fields are continuous in time between samples (linear interpolation is valid).
+- Velocities and strain rates are consistent (strain rate is the symmetric gradient
+  of velocity on the record mesh).
+- Crust volume is conserved by the remap.
+
+### 8.5 Generators (procedural and test forcings)
+
+The same schema, produced from formulas. They double as validation benchmarks, since
+many have analytic answers:
+
+| Generator | Purpose | Analytic expectation |
+|---|---|---|
+| rigid rotation about a pole | null test | zero strain everywhere |
+| steady ridge at rate V | spreading, depth–age | depth ∝ √(distance / V) |
+| uniform convergence | collision, thickening | thickness grows at rate (V/L)·h |
+| line load on a plate | flexure | w(x) = w₀ e^(−x/α)(cos x/α + sin x/α) |
+| thickened block | isostatic relaxation | settles to Airy height; time scale γ/(Δρ g A) |
+| isolated plate + slab | slab pull | terminal speed = slab force / Σγ |
+| noise-driven basal flow | game "world seeds" without a mantle model | – |
+
+### 8.6 Downward to the game
+
+The game is just another consumer. Height maps, biome-relevant fields (crust age,
+plate boundaries, volcanic arcs) and the event log are rendered from the same
+records. Nothing game-specific lives in the simulation.
+
+---
+
+## 9. Implementation phases and acceptance tests
+
+Each phase ends with a check that could fail. Benchmarks run headless and write a
+small record, so they double as tests of the recording code.
+
+| Phase | Work | Acceptance test |
+|---|---|---|
+| 0 | Housekeeping: exponential integrators for all rates; cache nearest mantle node; fix free-list and state-flip races | Same seed, same initial frames within tolerance; no rate-dependent blow-up at 10× dt |
+| 1 | **Minimal recording:** manifest + field series + snapshots (tiers a–c), download as zip | Restart from snapshot reproduces the next N steps |
+| 2 | **Overdamped XPBD core:** drag as mass, real compliance, graph-coloured Gauss–Seidel | Two-particle relaxation matches τ = γ/2k; result independent of dt in the quasi-static limit |
+| 3 | **Unified edges + column contacts + free radius & buoyancy** | Thickened block relaxes to Airy height (Generator: thickened block) |
+| 4 | **Neighbour-fit strain + orientation**, stress-tensor glyphs | Rigid rotation → strain < 10⁻⁶; uniaxial stretch → set Poisson ratio ±5% |
+| 5 | **Plate coarse level** (labelling, Euler poles) | Push one edge of an isolated plate: far edge responds in one step; iterations needed do not grow with N |
+| 6 | **Lithosphere column:** thermal age, depth–age, GPE force | Ridge Generator reproduces depth ∝ √age |
+| 7 | **Subduction:** initiation rule, slab particles, bending directors | Line-load flexure profile within 10% at 50 km; plate speed correlates positively with slab-attached perimeter in free runs |
+| 8 | **Volume conservation, collision, suturing, arcs** | Uniform-convergence Generator thickens at the predicted rate; continent never subducts |
+| 9 | **Adaptivity** (refine first, coarsen second) | Benchmarks 3–8 give the same continuum answer at 220/110/50 km within stated tolerances |
+| 10 | **Patch mode:** run L1 code on a projected patch driven by a Forcing; adapters from records; event log | Patch driven by a global record stays within tolerance of the global fields in its interior over [t₀, t₁] |
+
+The order is chosen so that phases 0–4 already improve the current game output at
+220 km, before 50 km is needed.
+
+---
+
+## 10. Open questions
+
+- **Bending discretisation** (4.3): directors with a Kirchhoff penalty vs. dihedral
+  constraints on edge pairs. Decide by the flexure benchmark.
+- **Coarse/fine coupling:** is one coarse solve per step enough, or do they need to
+  alternate? Decide by the phase-5 benchmark.
+- **Contact forces in the coarse solve:** inter-plate forces lagged by one step
+  (explicit) is simplest. Check it does not oscillate at convergent boundaries.
+- **Plate labelling stability:** how often to re-seed; how to avoid id flicker for
+  plates joined by a few weak bonds.
+- **Slab fate:** a hard removal depth is simple. Does it make trench behaviour
+  depend visibly on the cutoff?
+- **Mantle generator:** keep SH as L1-internal with feedback, or freeze it to a
+  recorded field for reproducible benchmark runs? Likely both, by configuration.
+- **Record mesh:** icosphere (uniform, awkward for tools) vs. HEALPix (Hierarchical
+  Equal Area isoLatitude Pixelization: uniform and tool-friendly) for field series.
+- **History:** when it returns, are tracers enough, or do columns carry their own
+  stratigraphy?
+
+---
+
+## 11. Glossary
+
+| Term | Meaning |
+|---|---|
+| Myr | million years |
+| PBD / XPBD | position-based dynamics / extended PBD (Müller et al. 2007; Macklin, Müller & Chentanez 2016) |
+| SH | Swift–Hohenberg: a pattern-forming equation used here as a stand-in for mantle convection |
+| GPE | gravitational potential energy (per unit area of a lithospheric column) |
+| Euler pole | axis about which a rigid plate rotates on the sphere (Euler's rotation theorem) |
+| Airy isostasy | each column floats independently at the height its density allows |
+| flexural isostasy | columns coupled by bending stiffness, so loads spread over the flexural length α = (4D/Δρg)^¼ |
+| Winkler foundation | restoring force proportional to vertical displacement, i.e. buoyancy |
+| Cosserat medium | a continuum whose points carry orientation as well as position |
+| polar decomposition | writing a deformation gradient as rotation × stretch |
+| CF conventions | Climate and Forecast metadata conventions for gridded scientific data |
+| HEALPix | Hierarchical Equal Area isoLatitude Pixelization of the sphere |
+| downscaling, relaxation zone | regional climate modelling practice for driving a fine model with a coarse one at its boundaries |

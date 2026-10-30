@@ -9,6 +9,12 @@ The build produces a single self-contained file, `dist/plate-player.html`. Open 
 in a WebGPU-capable browser (recent Chrome or Edge; Firefox and Safari have partial
 support). It works straight from disk, with no server needed.
 
+**Where this is going:** [`docs/design.md`](docs/design.md) is the plan for the next
+version: overdamped implicit solver, unified bond/contact edges, explicit slabs, plates as
+Euler-pole rotations, and the record/forcing contracts for nesting finer models below
+this one. The to-do list at the end of this README is the problem inventory that plan
+answers.
+
 ## Quick start
 
 ```bash
@@ -92,6 +98,8 @@ All parameters are in `INIT_DEFAULTS` and `CRUST` at the top of that file.
 plate-player/
 ├── build.mjs                  bundle + inline → dist/plate-player.html
 ├── package.json               npm scripts; esbuild is the only dependency
+├── docs/
+│   └── design.md              design plan for the next version
 ├── src/
 │   ├── index.html             page template (build inlines CSS + JS where the markers are)
 │   ├── styles.css
