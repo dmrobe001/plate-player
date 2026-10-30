@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tectonics Phase 5 - Subduction & Assimilation</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #0f172a; color: white; font-family: 'Inter', sans-serif; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+        #ui-layer { position: absolute; top: 0; left: 0; padding: 1rem; pointer-events: none; }
+        .panel { background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(8px); border: 1px solid #334155; border-radius: 0.5rem; padding: 1rem; pointer-events: auto; user-select: text; }
+    </style>
+</head>
+<body>
+    <canvas id="gpuCanvas"></canvas>
+    
+    <div id="ui-layer">
+        <div class="panel max-w-md shadow-lg">
+            <h1 class="text-xl font-bold text-blue-400 mb-2">Tectonics Prototype</h1>
+            <h2 class="text-sm font-semibold text-slate-300 mb-4">Phase 5: Subduction & Assimilation</h2>
+            <div id="status" class="text-sm space-y-2 text-slate-400">
+                Initializing WebGPU...
+            </div>
+            <label class="flex items-center space-x-2 mt-4 cursor-pointer">
+                <input type="checkbox" id="spinToggle" class="w-4 h-4 rounded bg-slate-800 border-slate-600">
+                <span class="text-slate-300 font-medium text-sm">Auto-Spin Globe</span>
+            </label>
+        </div>
+    </div>
+
+    <script type="module">
+        // --- 1. Icosphere Generation (Mantle Grid) ---
+        function normalize(v) {
+            let len = Math.sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+            return [v[0]/len, v[1]/len, v[2]/len];
+        }
+
+        function createIcosphere(subdivisions) {
+            const t = (1.0 + Math.sqrt(5.0)) / 2.0;
+            let vertices = [
+                [-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0],
+                [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
+                [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]
+            ].map(normalize);
+
+            let faces = [
+                [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+                [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+                [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+                [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]
+            ];
+
+            let cache = new Map();
+            function getMiddlePoint(p1, p2) {
+                let smaller = Math.min(p1, p2), greater = Math.max(p1, p2);
+                let key = (smaller << 16) + greater;
+                if (cache.has(key)) return cache.get(key);
+                let point1 = vertices[p1], point2 = vertices[p2];
+                let middle = normalize([(point1[0] + point2[0]) / 2.0, (point1[1] + point2[1]) / 2.0, (point1[2] + point2[2]) / 2.0]);
+                vertices.push(middle);
+                let index = vertices.length - 1;
+                cache.set(key, index);
+                return index;
+            }
+
+            for (let i = 0; i < subdivisions; i++) {
+                let facesSubdiv = [];
+                for (let tri of faces) {
+                    let a = getMiddlePoint(tri[0], tri[1]); let b = getMiddlePoint(tri[1], tri[2]); let c = getMiddlePoint(tri[2], tri[0]);
+                    facesSubdiv.push([tri[0], a, c]); facesSubdiv.push([tri[1], b, a]); facesSubdiv.push([tri[2], c, b]); facesSubdiv.push([a, b, c]);
+                }
+                faces = facesSubdiv;
+            }
+
+            let adj = Array.from({length: vertices.length}, () => new Set());
+            for (let tri of faces) {
+                adj[tri[0]].add(tri[1]); adj[tri[0]].add(tri[2]);
+                adj[tri[1]].add(tri[0]); adj[tri[1]].add(tri[2]);
+                adj[tri[2]].add(tri[0]); adj[tri[2]].add(tri[1]);
+            }
+
+            let indices = new Uint16Array(faces.length * 3);
+            for (let i = 0; i < faces.length; i++) {
+                indices[i*3] = faces[i][0]; indices[i*3+1] = faces[i][1]; indices[i*3+2] = faces[i][2];
+            }
+
+            return { vertices, adjacency: adj, indices };
+        }
+
+        // --- 2. WebGPU Setup & Memory Architecture ---
+        async function initWebGPU() {
+            if (!navigator.gpu) throw new Error("WebGPU not supported on this browser.");
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) throw new Error("No appropriate GPU adapter found.");
+            const device = await adapter.requestDevice();
+            const canvas = document.getElementById('gpuCanvas');
+            const context = canvas.getContext('webgpu');
+            const format = navigator.gpu.getPreferredCanvasFormat();
+            
+            device.addEventListener('uncapturederror', (event) => {
+                console.error("WebGPU Error:", event.error.message);
+                const statusDiv = document.getElementById('status');
+                const errDiv = document.createElement('div');
+                errDiv.className = "text-red-400 mt-2 font-mono text-xs bg-red-900/50 p-2 rounded border border-red-500/50 select-text cursor-text break-words overflow-auto max-h-32";
+                errDiv.textContent = `GPU Error: ${event.error.message}`;
+                if (statusDiv.childElementCount < 10) statusDiv.appendChild(errDiv);
+            });
+
+            context.configure({ device, format, alphaMode: 'premultiplied' });
+
+            const SUBDIVISIONS = 3; 
+            const icosphere = createIcosphere(SUBDIVISIONS);
+            const NUM_GRID_NODES = icosphere.vertices.length;
+            const MAX_PARTICLES = 25000;
+            const MAX_CONSTRAINTS = 100000;
+            const HASH_GRID_DIM = 32;
+            const HASH_GRID_CELLS = HASH_GRID_DIM * HASH_GRID_DIM * HASH_GRID_DIM;
+
+            const GRID_NODE_SIZE = 48; 
+            const ADJ_MAX_NEIGHBORS = 6;
+            const ADJ_NODE_SIZE = ADJ_MAX_NEIGHBORS * 4; 
+            
+            const PARTICLE_SIZE = 96; 
+            const CONSTRAINT_SIZE = 32;
+            const FREE_LIST_HEADER_SIZE = 16; 
+
+            // Create Buffers
+            const gridBuffer = device.createBuffer({ size: NUM_GRID_NODES * GRID_NODE_SIZE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.VERTEX });
+            const adjacencyBuffer = device.createBuffer({ size: NUM_GRID_NODES * ADJ_NODE_SIZE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const particleBuffer = device.createBuffer({ size: MAX_PARTICLES * PARTICLE_SIZE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.VERTEX });
+            const constraintBuffer = device.createBuffer({ size: MAX_CONSTRAINTS * CONSTRAINT_SIZE, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const particleFreeListBuffer = device.createBuffer({ size: FREE_LIST_HEADER_SIZE + (MAX_PARTICLES * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const constraintFreeListBuffer = device.createBuffer({ size: FREE_LIST_HEADER_SIZE + (MAX_CONSTRAINTS * 4), usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const hashGridBuffer = device.createBuffer({ size: HASH_GRID_CELLS * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const particleDeltaBuffer = device.createBuffer({ size: MAX_PARTICLES * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            const indexBuffer = device.createBuffer({ size: Math.ceil(icosphere.indices.byteLength / 4) * 4, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
+            device.queue.writeBuffer(indexBuffer, 0, icosphere.indices);
+
+            // Populate Grid Data
+            const gridData = new Float32Array(NUM_GRID_NODES * (GRID_NODE_SIZE / 4));
+            const adjData = new Uint32Array(NUM_GRID_NODES * ADJ_MAX_NEIGHBORS);
+            adjData.fill(0xFFFFFFFF); 
+
+            for (let i = 0; i < NUM_GRID_NODES; i++) {
+                let v = icosphere.vertices[i];
+                let offset = i * (GRID_NODE_SIZE / 4);
+                gridData[offset] = v[0]; gridData[offset+1] = v[1]; gridData[offset+2] = v[2]; gridData[offset+3] = 1.0; 
+                gridData[offset+4] = 0; gridData[offset+5] = 0; gridData[offset+6] = 0; gridData[offset+7] = 0;
+                gridData[offset+8] = (Math.random() - 0.5) * 0.1; gridData[offset+9] = 0; gridData[offset+10] = 0; gridData[offset+11] = 0; 
+                let neighbors = Array.from(icosphere.adjacency[i]);
+                for (let j = 0; j < Math.min(neighbors.length, ADJ_MAX_NEIGHBORS); j++) adjData[i * ADJ_MAX_NEIGHBORS + j] = neighbors[j];
+            }
+            device.queue.writeBuffer(gridBuffer, 0, gridData);
+            device.queue.writeBuffer(adjacencyBuffer, 0, adjData);
+
+            // Populate Initial Crust Particles
+            const initialParticles = 3000;
+            const particleData = new ArrayBuffer(MAX_PARTICLES * PARTICLE_SIZE);
+            const particleF32 = new Float32Array(particleData);
+            const particleU32 = new Uint32Array(particleData);
+
+            let placedCount = 0, attempts = 0;
+            while(placedCount < initialParticles && attempts < 20000) {
+                attempts++;
+                let theta = Math.random() * Math.PI * 2; let phi = Math.acos((Math.random() * 0.5) + 0.5); // Concentrate a bit to force collisions
+                let x = Math.sin(phi) * Math.cos(theta); let y = Math.sin(phi) * Math.sin(theta); let z = Math.cos(phi);
+                
+                let tooClose = false;
+                for(let k = 0; k < placedCount; k++) {
+                    let k_off = k * (PARTICLE_SIZE / 4);
+                    let dx = x - particleF32[k_off]; let dy = y - particleF32[k_off+1]; let dz = z - particleF32[k_off+2];
+                    if (Math.sqrt(dx*dx + dy*dy + dz*dz) < 0.04) { tooClose = true; break; } 
+                }
+                if (tooClose) continue;
+
+                let offset = placedCount * (PARTICLE_SIZE / 4);
+                particleF32[offset] = x; particleF32[offset+1] = y; particleF32[offset+2] = z; particleF32[offset+3] = 1.0; 
+                particleF32[offset+4] = x; particleF32[offset+5] = y; particleF32[offset+6] = z; particleF32[offset+7] = 1.0; 
+                particleF32[offset+8] = 0; particleF32[offset+9] = 0; particleF32[offset+10] = 0; particleF32[offset+11] = 0; 
+                
+                particleF32[offset+12] = 35.0;     // thickness_km
+                particleF32[offset+13] = 2700.0;   // comp_density
+                particleF32[offset+14] = 293.0;    // temp (K)
+                particleF32[offset+15] = 100.0;    // age (Myr)
+                
+                let apothem = 0.0175;
+                particleF32[offset+16] = 2.0 * Math.sqrt(3.0) * apothem * apothem;
+                particleF32[offset+17] = apothem;
+                
+                particleU32[offset+18] = 1; // state: 1 = Surface
+                particleU32[offset+19] = 1; // is_active
+                particleU32[offset+20] = 0xFFFFFFFF; // next_idx
+                
+                particleF32[offset+21] = 2700.0; // density cache
+                particleF32[offset+22] = 5.0;    // elevation cache
+                particleU32[offset+23] = 0xFFFFFFFF; // split_child
+
+                placedCount++;
+            }
+            device.queue.writeBuffer(particleBuffer, 0, particleData);
+
+            const pFreeData = new Uint32Array((FREE_LIST_HEADER_SIZE / 4) + MAX_PARTICLES);
+            let pFreeCount = 0;
+            for (let i = initialParticles; i < MAX_PARTICLES; i++) pFreeData[4 + pFreeCount++] = i;
+            pFreeData[0] = pFreeCount;
+            device.queue.writeBuffer(particleFreeListBuffer, 0, pFreeData);
+
+            const constraintData = new ArrayBuffer(MAX_CONSTRAINTS * CONSTRAINT_SIZE);
+            const constraintF32 = new Float32Array(constraintData);
+            const constraintU32 = new Uint32Array(constraintData);
+            const bondsPerParticle = new Uint32Array(initialParticles); 
+            let numConstraints = 0;
+
+            for(let i = 0; i < placedCount; i++) {
+                if (bondsPerParticle[i] >= 6) continue;
+                let neighbors = [];
+                for(let j = 0; j < placedCount; j++) {
+                    if (i === j) continue;
+                    let o_i = i * (PARTICLE_SIZE / 4); let o_j = j * (PARTICLE_SIZE / 4);
+                    let dist = Math.sqrt(Math.pow(particleF32[o_i]-particleF32[o_j],2) + Math.pow(particleF32[o_i+1]-particleF32[o_j+1],2) + Math.pow(particleF32[o_i+2]-particleF32[o_j+2],2));
+                    if (dist < 0.08) neighbors.push({id: j, dist: dist});
+                }
+                neighbors.sort((a,b) => a.dist - b.dist);
+
+                for (let n of neighbors) {
+                    let j = n.id;
+                    if (bondsPerParticle[i] >= 6 || bondsPerParticle[j] >= 6) break;
+                    if (i < j && numConstraints < MAX_CONSTRAINTS) {
+                        let c_off = numConstraints * (CONSTRAINT_SIZE / 4);
+                        constraintU32[c_off] = i; constraintU32[c_off+1] = j; 
+                        constraintF32[c_off+2] = n.dist; constraintF32[c_off+3] = 0.001; constraintF32[c_off+4] = 150.0;
+                        constraintU32[c_off+5] = 1; constraintF32[c_off+6] = 0.0; constraintF32[c_off+7] = 0.0;
+                        bondsPerParticle[i]++; bondsPerParticle[j]++; numConstraints++;
+                    }
+                }
+            }
+            device.queue.writeBuffer(constraintBuffer, 0, constraintData);
+
+            const cFreeData = new Uint32Array((FREE_LIST_HEADER_SIZE / 4) + MAX_CONSTRAINTS);
+            let cFreeCount = 0;
+            for (let i = numConstraints; i < MAX_CONSTRAINTS; i++) cFreeData[4 + cFreeCount++] = i;
+            cFreeData[0] = cFreeCount;
+            device.queue.writeBuffer(constraintFreeListBuffer, 0, cFreeData);
+
+            // --- WGSL Shaders ---
+            const sharedDefinitions = `
+                struct Particle {
+                    position: vec4f,
+                    predicted_pos: vec4f,
+                    velocity: vec4f,
+                    thickness_km: f32,
+                    composition_density: f32,
+                    temperature: f32,
+                    age: f32,
+                    surface_area: f32,
+                    apothem: f32,
+                    state: u32,
+                    is_active: u32,
+                    next_idx: u32,
+                    density: f32,
+                    elevation: f32,
+                    split_child: u32,
+                }
+                
+                struct Constraint {
+                    particle_a: u32, particle_b: u32, rest_length: f32, compliance: f32, yield_stress_mpa: f32, is_active: u32, damage: f32, pad1: f32,
+                }
+                struct Camera { vp: mat4x4f }
+                struct SimParams {
+                    mantle_rayleigh: f32, mantle_wavenumber: f32, dt_mantle_myr: f32, thermal_diffusivity: f32,
+                    laplacian_weight: f32, num_nodes: u32, dt_crust_myr: f32, drag_coeff_myr_inv: f32,
+                    crust_youngs_modulus_gpa: f32, yield_stress_mpa: f32, earth_radius_km: f32, max_particles: u32,
+                    grid_dim: u32, cm_yr_to_sim_vel: f32, sh_grad_to_cm_yr: f32, activation_energy: f32,
+                    reference_temp: f32, gas_constant: f32, mantle_density: f32, thermal_expansion_coeff: f32,
+                    sea_level: f32, ambient_ocean_temp: f32, mantle_temp: f32, max_constraints: u32,
+                }
+            `;
+
+            const computeShaderModule = device.createShaderModule({
+                code: sharedDefinitions + `
+                    struct GridNode { position: vec4f, velocity: vec4f, psi: f32, laplacian_psi: f32, thermal_blanket: f32, thermal_atomic: atomic<i32> }
+                    struct FreeList { counter: atomic<u32>, pad1: u32, pad2: u32, pad3: u32, indices: array<u32> }
+                    struct ParticleDelta { dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count: atomic<i32> }
+
+                    @group(0) @binding(0) var<storage, read_write> grid: array<GridNode>;
+                    @group(0) @binding(1) var<storage, read> adjacency: array<u32>;
+                    @group(0) @binding(2) var<storage, read_write> particles: array<Particle>;
+                    @group(0) @binding(3) var<storage, read_write> constraints: array<Constraint>;
+                    @group(0) @binding(4) var<storage, read_write> particle_pool: FreeList;
+                    @group(0) @binding(5) var<storage, read_write> constraint_pool: FreeList;
+                    @group(0) @binding(6) var<storage, read_write> hash_grid: array<atomic<u32>>;
+                    @group(0) @binding(7) var<storage, read_write> particle_deltas: array<ParticleDelta>;
+
+                    @group(1) @binding(1) var<uniform> sim: SimParams;
+
+                    // --- PHASE 5: ASSIMILATION IN THERMO ---
+                    @compute @workgroup_size(64)
+                    fn crust_thermo_isostasy(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+
+                        particles[idx].age += sim.dt_crust_myr;
+                        var temp = particles[idx].temperature;
+
+                        if (particles[idx].state == 1u) {
+                            temp += (sim.ambient_ocean_temp - temp) * 0.05 * sim.dt_crust_myr;
+                        } else if (particles[idx].state == 2u) {
+                            // Phase 5: Slabs melt rapidly in the mantle
+                            let temp_diff = sim.mantle_temp - temp;
+                            let temp_inc = temp_diff * 2.5 * sim.dt_crust_myr;
+                            temp += temp_inc;
+                            particles[idx].thickness_km -= temp_inc * 0.1; // Mass assimilation
+                            
+                            if (particles[idx].thickness_km <= 1.0) {
+                                // Slab has melted. Return to Free List.
+                                particles[idx].is_active = 0u;
+                                let p_count = atomicAdd(&particle_pool.counter, 1u);
+                                if (p_count < sim.max_particles) {
+                                    particle_pool.indices[p_count] = idx;
+                                } else {
+                                    atomicSub(&particle_pool.counter, 1u);
+                                }
+                                return; 
+                            }
+                        }
+                        particles[idx].temperature = temp;
+
+                        let rho = particles[idx].composition_density * (1.0 + sim.thermal_expansion_coeff * (sim.mantle_temp - temp));
+                        particles[idx].density = rho;
+
+                        var elevation = particles[idx].thickness_km * (1.0 - rho / sim.mantle_density);
+                        if (elevation < sim.sea_level) { elevation -= (sim.sea_level - elevation) * (1000.0 / sim.mantle_density); }
+                        particles[idx].elevation = elevation;
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_constraint_healing(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let c_idx = id.x;
+                        if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
+                        let temp = max((particles[constraints[c_idx].particle_a].temperature + particles[constraints[c_idx].particle_b].temperature) * 0.5, 1.0);
+                        let exponent = -sim.activation_energy / (sim.gas_constant * temp);
+                        constraints[c_idx].damage = clamp(constraints[c_idx].damage - select(0.0, 100000.0 * exp(exponent), exponent > -50.0) * sim.dt_crust_myr, 0.0, 1.0);
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn grid_clear_thermal(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.num_nodes) { return; }
+                        atomicStore(&grid[idx].thermal_atomic, 0i);
+                        grid[idx].thermal_blanket = 0.0;
+                    }
+
+                    // --- PHASE 5: SLAB HEAT ABSORPTION ---
+                    @compute @workgroup_size(64)
+                    fn crust_apply_thermal(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+                        var best_idx = 0u; var best_dist = 1000.0;
+                        for(var i = 0u; i < sim.num_nodes; i++) {
+                            let d = distance(particles[idx].position.xyz, grid[i].position.xyz);
+                            if (d < best_dist) { best_dist = d; best_idx = i; }
+                        }
+                        var heat_contrib = i32(particles[idx].thickness_km * 5.0);
+                        if (particles[idx].state == 2u) { heat_contrib = -i32(particles[idx].thickness_km * 20.0); } // Slabs cool mantle
+                        atomicAdd(&grid[best_idx].thermal_atomic, heat_contrib);
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn grid_finalize_thermal(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.num_nodes) { return; }
+                        grid[idx].thermal_blanket = clamp(f32(atomicLoad(&grid[idx].thermal_atomic)) * 0.001, -1.5, 1.5); 
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn mantle_laplacian(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x; if (idx >= sim.num_nodes) { return; }
+                        let c = grid[idx].psi; var s = 0.0; var n = 0u;
+                        for (var i = 0u; i < 6u; i++) {
+                            let a = adjacency[idx * 6u + i];
+                            if (a != 0xFFFFFFFFu) { s += grid[a].psi; n += 1u; }
+                        }
+                        grid[idx].laplacian_psi = (s - f32(n) * c) * sim.laplacian_weight;
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn mantle_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x; if (idx >= sim.num_nodes) { return; }
+                        let c = grid[idx].laplacian_psi; var s = 0.0; var n = 0u;
+                        for (var i = 0u; i < 6u; i++) {
+                            let a = adjacency[idx * 6u + i];
+                            if (a != 0xFFFFFFFFu) { s += grid[a].laplacian_psi; n += 1u; }
+                        }
+                        let p = grid[idx].psi;
+                        grid[idx].psi = p + sim.dt_mantle_myr * (sim.mantle_rayleigh * p - ((s - f32(n) * c) * sim.laplacian_weight + 2.0 * sim.mantle_wavenumber * sim.mantle_wavenumber * c + sim.mantle_wavenumber * sim.mantle_wavenumber * sim.mantle_wavenumber * sim.mantle_wavenumber * p) - (p * p * p) + sim.thermal_diffusivity * grid[idx].thermal_blanket);
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn mantle_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x; if (idx >= sim.num_nodes) { return; }
+                        var g = vec3f(0.0); let p = grid[idx].position.xyz;
+                        for (var i = 0u; i < 6u; i++) {
+                            let a = adjacency[idx * 6u + i];
+                            if (a != 0xFFFFFFFFu) {
+                                let dir = grid[a].position.xyz - p; let d = length(dir);
+                                g += (dir / d) * ((grid[a].psi - grid[idx].psi) / d);
+                            }
+                        }
+                        grid[idx].velocity = vec4f(-(g - dot(g, p) * p), 0.0);
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_accumulation(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.max_particles || particles[idx].is_active == 0u || particles[idx].state == 2u) { return; }
+                        let pos = particles[idx].position.xyz;
+                        var b_idx = 0u; var b_dist = 1000.0;
+                        for(var i = 0u; i < sim.num_nodes; i++) {
+                            let d = distance(pos, grid[i].position.xyz);
+                            if (d < b_dist) { b_dist = d; b_idx = i; }
+                        }
+                        let div = -grid[b_idx].laplacian_psi;
+                        if (div > 1.5) { 
+                            particles[idx].surface_area += min(div * sim.dt_crust_myr * 0.005, 0.0001);
+                            particles[idx].apothem = sqrt(particles[idx].surface_area / 3.4641);
+                        }
+                        if (particles[idx].surface_area > (2.0 * 3.4641 * 0.0175 * 0.0175 * 1.5) && particles[idx].split_child == 0xFFFFFFFFu) {
+                            var p_count = atomicSub(&particle_pool.counter, 1u);
+                            if (p_count == 0u) { atomicAdd(&particle_pool.counter, 1u); return; }
+                            var c_count = atomicSub(&constraint_pool.counter, 1u);
+                            if (c_count == 0u) { atomicAdd(&particle_pool.counter, 1u); atomicAdd(&constraint_pool.counter, 1u); return; }
+                            
+                            let child_idx = particle_pool.indices[p_count - 1u]; let new_c_idx = constraint_pool.indices[c_count - 1u];
+                            particles[idx].surface_area *= 0.5; particles[idx].apothem = sqrt(particles[idx].surface_area / 3.4641); particles[idx].split_child = child_idx;
+                            particles[child_idx] = particles[idx]; particles[child_idx].temperature = sim.mantle_temp; particles[child_idx].age = 0.0; particles[child_idx].thickness_km = 7.0; particles[child_idx].composition_density = 3000.0; particles[child_idx].split_child = 0xFFFFFFFFu; particles[child_idx].is_active = 1u;
+                            
+                            var spread_dir = normalize(grid[b_idx].velocity.xyz);
+                            if (length(spread_dir) < 0.001) { spread_dir = normalize(cross(pos, vec3f(0.0, 1.0, 0.0))); }
+                            let offset = spread_dir * (particles[idx].apothem * 1.05);
+                            particles[idx].position = vec4f(normalize(particles[idx].position.xyz - offset), 1.0);
+                            particles[child_idx].position = vec4f(normalize(particles[child_idx].position.xyz + offset), 1.0);
+                            
+                            constraints[new_c_idx].particle_a = idx; constraints[new_c_idx].particle_b = child_idx; constraints[new_c_idx].rest_length = particles[idx].apothem * 2.0; constraints[new_c_idx].compliance = 0.001; constraints[new_c_idx].yield_stress_mpa = sim.yield_stress_mpa; constraints[new_c_idx].is_active = 1u; constraints[new_c_idx].damage = 0.0;
+                        }
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_rewire_bonds(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let c_idx = id.x;
+                        if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
+                        var pA = constraints[c_idx].particle_a; var pB = constraints[c_idx].particle_b; var rewired = false;
+                        let childA = particles[pA].split_child;
+                        if (childA != 0xFFFFFFFFu && childA != pB) {
+                            if (distance(particles[childA].position.xyz, particles[pB].position.xyz) < distance(particles[pA].position.xyz, particles[pB].position.xyz)) {
+                                pA = childA; constraints[c_idx].particle_a = childA; rewired = true;
+                            }
+                        }
+                        let childB = particles[pB].split_child;
+                        if (childB != 0xFFFFFFFFu && childB != pA) {
+                            if (distance(particles[pA].position.xyz, particles[childB].position.xyz) < distance(particles[pA].position.xyz, particles[pB].position.xyz)) {
+                                pB = childB; constraints[c_idx].particle_b = childB; rewired = true;
+                            }
+                        }
+                        if (rewired) { constraints[c_idx].rest_length = particles[pA].apothem + particles[pB].apothem; constraints[c_idx].damage = 0.0; }
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_clean_split(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x; if (idx < sim.max_particles) { particles[idx].split_child = 0xFFFFFFFFu; }
+                    }
+
+                    // --- PHASE 5: SLAB PULL IN PREDICT ---
+                    @compute @workgroup_size(64)
+                    fn crust_predict(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+                        let pos = particles[idx].position.xyz; var vel = particles[idx].velocity.xyz;
+                        var b_idx = 0u; var b_dist = 1000.0;
+                        for(var i = 0u; i < sim.num_nodes; i++) {
+                            let d = distance(pos, grid[i].position.xyz);
+                            if (d < b_dist) { b_dist = d; b_idx = i; }
+                        }
+                        
+                        let grid_vel = grid[b_idx].velocity.xyz * sim.sh_grad_to_cm_yr * sim.cm_yr_to_sim_vel;
+                        var target_vel = grid_vel;
+
+                        // Slab Pull: Subducting denser crust accelerates towards the convergence (downwelling)
+                        if (particles[idx].state == 2u && particles[idx].density > sim.mantle_density) {
+                            let pull = (particles[idx].density - sim.mantle_density) * 0.02;
+                            target_vel += normalize(grid_vel + vec3f(0.001)) * pull;
+                        }
+
+                        vel = vel + sim.drag_coeff_myr_inv * (target_vel - vel) * sim.dt_crust_myr;
+                        particles[idx].predicted_pos = vec4f(normalize(pos + vel * sim.dt_crust_myr), 1.0);
+                        particles[idx].velocity = vec4f(vel, 0.0);
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_hash_clear(@builtin(global_invocation_id) id: vec3<u32>) {
+                        if (id.x < sim.grid_dim * sim.grid_dim * sim.grid_dim) { atomicStore(&hash_grid[id.x], 0xFFFFFFFFu); }
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_hash_build(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx < sim.max_particles && particles[idx].is_active == 1u) {
+                            let c = vec3i(clamp((particles[idx].predicted_pos.xyz + vec3f(1.5)) / 3.0, vec3f(0.0), vec3f(0.999)) * f32(sim.grid_dim));
+                            particles[idx].next_idx = atomicExchange(&hash_grid[u32(c.x) + u32(c.y) * sim.grid_dim + u32(c.z) * sim.grid_dim * sim.grid_dim], idx);
+                        }
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_clear_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx < sim.max_particles) { atomicStore(&particle_deltas[idx].dx, 0i); atomicStore(&particle_deltas[idx].dy, 0i); atomicStore(&particle_deltas[idx].dz, 0i); atomicStore(&particle_deltas[idx].count, 0i); }
+                    }
+
+                    // --- PHASE 5: CONSTRAINT CLEANUP ---
+                    @compute @workgroup_size(64)
+                    fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let c_idx = id.x;
+                        if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
+                        
+                        let pA = constraints[c_idx].particle_a; let pB = constraints[c_idx].particle_b;
+
+                        // Cleanup severed bonds from melted slabs
+                        if (particles[pA].is_active == 0u || particles[pB].is_active == 0u) {
+                            constraints[c_idx].is_active = 0u;
+                            let c_count = atomicAdd(&constraint_pool.counter, 1u);
+                            if (c_count < sim.max_constraints) { constraint_pool.indices[c_count] = c_idx; } 
+                            else { atomicSub(&constraint_pool.counter, 1u); }
+                            return;
+                        }
+
+                        let dir = particles[pB].predicted_pos.xyz - particles[pA].predicted_pos.xyz; let dist = max(length(dir), 0.0001);
+                        let err_n = dist - constraints[c_idx].rest_length;
+                        let rel_move = (particles[pB].predicted_pos.xyz - particles[pB].position.xyz) - (particles[pA].predicted_pos.xyz - particles[pA].position.xyz);
+                        let err_t = rel_move - dot(rel_move, dir/dist) * (dir/dist);
+                        
+                        let total_corr = (dir/dist) * (err_n * select(1.0, 1.0 - constraints[c_idx].damage, err_n > 0.0)) + err_t * max(1.0 - constraints[c_idx].damage, 0.1);
+                        let stress = sqrt((err_n/constraints[c_idx].rest_length)*(err_n/constraints[c_idx].rest_length) + (length(err_t)/constraints[c_idx].rest_length)*(length(err_t)/constraints[c_idx].rest_length)) * sim.crust_youngs_modulus_gpa * 1000.0;
+                        let temp = max((particles[pA].temperature + particles[pB].temperature) * 0.5, 1.0);
+                        let y = constraints[c_idx].yield_stress_mpa * exp(clamp((sim.activation_energy/sim.gas_constant)*(1.0/temp - 1.0/sim.reference_temp), -10.0, 10.0));
+                        
+                        if (stress > y) { constraints[c_idx].damage = min(constraints[c_idx].damage + ((stress - y) / y) * 50.0 * sim.dt_crust_myr, 1.0); }
+                        
+                        let corr = total_corr * 0.5;
+                        atomicAdd(&particle_deltas[pA].dx, i32(corr.x * 1000000.0)); atomicAdd(&particle_deltas[pA].dy, i32(corr.y * 1000000.0)); atomicAdd(&particle_deltas[pA].dz, i32(corr.z * 1000000.0)); atomicAdd(&particle_deltas[pA].count, 1i);
+                        atomicAdd(&particle_deltas[pB].dx, i32(-corr.x * 1000000.0)); atomicAdd(&particle_deltas[pB].dy, i32(-corr.y * 1000000.0)); atomicAdd(&particle_deltas[pB].dz, i32(-corr.z * 1000000.0)); atomicAdd(&particle_deltas[pB].count, 1i);
+                    }
+
+                    // --- PHASE 5: SUBDUCTION & ASYMMETRIC FRICTION ---
+                    @compute @workgroup_size(64)
+                    fn crust_solve_collisions(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+                        let pos_i = particles[idx].predicted_pos.xyz; let state_i = particles[idx].state;
+                        var total_delta = vec3f(0.0); var coll_count = 0i;
+                        let c_coord = vec3i(clamp((pos_i + vec3f(1.5)) / 3.0, vec3f(0.0), vec3f(0.999)) * f32(sim.grid_dim));
+                        
+                        for (var z = -1; z <= 1; z++) {
+                            for (var y = -1; y <= 1; y++) {
+                                for (var x = -1; x <= 1; x++) {
+                                    let nc = c_coord + vec3i(x, y, z);
+                                    if (nc.x >= 0 && nc.x < i32(sim.grid_dim) && nc.y >= 0 && nc.y < i32(sim.grid_dim) && nc.z >= 0 && nc.z < i32(sim.grid_dim)) {
+                                        var n_idx = atomicLoad(&hash_grid[u32(nc.x) + u32(nc.y) * sim.grid_dim + u32(nc.z) * sim.grid_dim * sim.grid_dim]);
+                                        var iter = 0; 
+                                        while (n_idx != 0xFFFFFFFFu && iter < 50) {
+                                            if (n_idx != idx) {
+                                                let pos_j = particles[n_idx].predicted_pos.xyz; let state_j = particles[n_idx].state;
+                                                let dir = pos_i - pos_j; let dist = max(length(dir), 0.0001);
+                                                let overlap = (particles[idx].apothem + particles[n_idx].apothem) - dist; 
+                                                
+                                                if (overlap > 0.0) {
+                                                    // Trigger Subduction
+                                                    if (state_i == 1u && state_j == 1u && overlap > 0.012) {
+                                                        if (particles[idx].elevation < particles[n_idx].elevation) { particles[idx].state = 2u; }
+                                                    } 
+                                                    // Asymmetric Basal Friction
+                                                    else if ((state_i == 1u && state_j == 2u) || (state_i == 2u && state_j == 1u)) {
+                                                        let rel = (pos_i - particles[idx].position.xyz) - (pos_j - particles[n_idx].position.xyz);
+                                                        total_delta -= (rel - dot(rel, dir/dist) * (dir/dist)) * 0.2;
+                                                        coll_count++;
+                                                    } 
+                                                    // Standard Repulsion
+                                                    else {
+                                                        total_delta += (dir / dist) * overlap * 0.5;
+                                                        coll_count++;
+                                                    }
+                                                }
+                                            }
+                                            n_idx = particles[n_idx].next_idx; iter++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (coll_count > 0i) {
+                            atomicAdd(&particle_deltas[idx].dx, i32(total_delta.x * 1000000.0)); atomicAdd(&particle_deltas[idx].dy, i32(total_delta.y * 1000000.0)); atomicAdd(&particle_deltas[idx].dz, i32(total_delta.z * 1000000.0)); atomicAdd(&particle_deltas[idx].count, coll_count);
+                        }
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_apply_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+                        let count = atomicLoad(&particle_deltas[idx].count);
+                        if (count > 0i) {
+                            particles[idx].predicted_pos = vec4f(normalize(particles[idx].predicted_pos.xyz + (vec3f(f32(atomicLoad(&particle_deltas[idx].dx)), f32(atomicLoad(&particle_deltas[idx].dy)), f32(atomicLoad(&particle_deltas[idx].dz))) / (1000000.0 * f32(count)))), 1.0);
+                        }
+                    }
+
+                    @compute @workgroup_size(64)
+                    fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
+                        let idx = id.x;
+                        if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+                        particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, 0.0);
+                        particles[idx].position = vec4f(particles[idx].predicted_pos.xyz, 1.0);
+                    }
+                `
+            });
+
+            const renderShaderModule = device.createShaderModule({
+                code: sharedDefinitions + `
+                    struct GridNode { pos: vec4f, vel: vec4f, psi: f32, lap_psi: f32, therm: f32, therm_a: i32 }
+                    @group(0) @binding(0) var<storage, read> grid: array<GridNode>;
+                    @group(1) @binding(0) var<uniform> camera: Camera;
+
+                    struct VertexOut { @builtin(position) pos: vec4f, @location(0) wpos: vec3f, @location(1) psi: f32 }
+
+                    @vertex
+                    fn vs_grid(@builtin(vertex_index) idx: u32) -> VertexOut {
+                        var out: VertexOut; out.pos = camera.vp * grid[idx].pos; out.wpos = grid[idx].pos.xyz; out.psi = grid[idx].lap_psi * -15.0; return out;
+                    }
+                    @fragment
+                    fn fs_grid(in: VertexOut) -> @location(0) vec4f {
+                        var n = cross(dpdx(in.wpos), dpdy(in.wpos));
+                        let diff = max(dot(select(normalize(in.wpos), normalize(n), length(n) > 0.0001), normalize(vec3f(1.0, 1.0, 1.0))), 0.2);
+                        return vec4f(mix(vec3f(0.1, 0.2, 0.4), vec3f(0.8, 0.3, 0.1), clamp((in.psi + 1.0) * 0.5, 0.0, 1.0)) * diff, 1.0);
+                    }
+                `
+            });
+
+            const particleRenderShaderModule = device.createShaderModule({
+                code: sharedDefinitions + `
+                    @group(0) @binding(0) var<storage, read> particles: array<Particle>;
+                    @group(1) @binding(0) var<uniform> camera: Camera;
+
+                    struct ParticleVertexOut {
+                        @builtin(position) pos: vec4f, 
+                        @location(0) age: f32, 
+                        @location(1) comp: f32, 
+                        @location(2) elev: f32, 
+                        @location(3) @interpolate(flat) state: u32
+                    }
+
+                    @vertex
+                    fn vs_particle(@builtin(vertex_index) idx: u32) -> ParticleVertexOut {
+                        let p = particles[idx]; var out: ParticleVertexOut;
+                        if (p.is_active == 0u) { out.pos = vec4f(0.0); return out; }
+                        out.pos = camera.vp * vec4f(p.position.xyz * (1.02 + clamp(p.elevation * 0.002, -0.01, 0.02)), 1.0);
+                        out.age = p.age; out.comp = p.composition_density; out.elev = p.elevation; out.state = p.state;
+                        return out;
+                    }
+
+                    @fragment
+                    fn fs_particle(in: ParticleVertexOut) -> @location(0) vec4f {
+                        var color = vec3f(0.2, 0.7, 0.3); // Continental Felsic
+                        if (in.state == 2u) {
+                            // Phase 5: Subducting Slab Melting (Dark purple glowing into magma)
+                            color = mix(vec3f(0.8, 0.2, 0.0), vec3f(0.3, 0.0, 0.4), clamp(in.elev / -5.0, 0.0, 1.0));
+                        } else if (in.comp > 2800.0) {
+                            color = mix(vec3f(1.0, 0.3, 0.0), vec3f(0.1, 0.2, 0.4), clamp(in.age / 5.0, 0.0, 1.0)); // Oceanic Mafic
+                        }
+                        return vec4f(color, 1.0);
+                    }
+                `
+            });
+
+            const constraintRenderShaderModule = device.createShaderModule({
+                code: sharedDefinitions + `
+                    @group(0) @binding(0) var<storage, read> constraints: array<Constraint>;
+                    @group(0) @binding(1) var<storage, read> particles: array<Particle>;
+                    @group(1) @binding(0) var<uniform> camera: Camera;
+
+                    struct VertexOut { @builtin(position) pos: vec4f, @location(0) damage: f32 }
+
+                    @vertex
+                    fn vs_constraint(@builtin(vertex_index) idx: u32) -> VertexOut {
+                        let c = constraints[idx / 2u]; var out: VertexOut;
+                        if (c.is_active == 0u) { out.pos = vec4f(0.0); return out; }
+                        let p = particles[select(c.particle_a, c.particle_b, (idx % 2u) == 1u)];
+                        out.pos = camera.vp * vec4f(p.position.xyz * (1.021 + clamp(p.elevation * 0.002, -0.01, 0.02)), 1.0);
+                        out.damage = c.damage; return out;
+                    }
+                    @fragment
+                    fn fs_constraint(in: VertexOut) -> @location(0) vec4f {
+                        return vec4f(mix(vec3f(0.1, 0.4, 0.8), vec3f(1.0, 0.1, 0.1), clamp(in.damage, 0.0, 1.0)), 1.0); 
+                    }
+                `
+            });
+
+            const bindGroupLayoutMemory = device.createBindGroupLayout({
+                entries: Array.from({length: 8}, (_, i) => ({ binding: i, visibility: GPUShaderStage.COMPUTE, buffer: { type: i===1 ? 'read-only-storage' : 'storage' } }))
+            });
+
+            const memoryBindGroup = device.createBindGroup({
+                layout: bindGroupLayoutMemory,
+                entries: [
+                    { binding: 0, resource: { buffer: gridBuffer } }, { binding: 1, resource: { buffer: adjacencyBuffer } },
+                    { binding: 2, resource: { buffer: particleBuffer } }, { binding: 3, resource: { buffer: constraintBuffer } },
+                    { binding: 4, resource: { buffer: particleFreeListBuffer } }, { binding: 5, resource: { buffer: constraintFreeListBuffer } },
+                    { binding: 6, resource: { buffer: hashGridBuffer } }, { binding: 7, resource: { buffer: particleDeltaBuffer } },
+                ]
+            });
+
+            const renderMemoryBindGroupLayout = device.createBindGroupLayout({ entries: [ { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } } ] });
+            const renderMemoryBindGroup = device.createBindGroup({ layout: renderMemoryBindGroupLayout, entries: [ { binding: 0, resource: { buffer: gridBuffer } } ] });
+            const particleRenderMemoryBindGroup = device.createBindGroup({ layout: renderMemoryBindGroupLayout, entries: [ { binding: 0, resource: { buffer: particleBuffer } } ] });
+
+            const constrRenderMemoryBindGroupLayout = device.createBindGroupLayout({
+                entries: [ { binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } }, { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } } ]
+            });
+            const constraintRenderMemoryBindGroup = device.createBindGroup({
+                layout: constrRenderMemoryBindGroupLayout,
+                entries: [ { binding: 0, resource: { buffer: constraintBuffer } }, { binding: 1, resource: { buffer: particleBuffer } } ]
+            });
+
+            const cameraBuffer = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            
+            const simParamsBuffer = device.createBuffer({ size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            const simF32 = new Float32Array(24); const simU32 = new Uint32Array(simF32.buffer);
+            
+            simF32[0] = 0.2;        simF32[1] = 4.0;        simF32[2] = 0.000005;   simF32[3] = 0.4;
+            simF32[4] = 45.0;       simU32[5] = NUM_GRID_NODES; simF32[6] = 0.016;  simF32[7] = 50.0;
+            simF32[8] = 2.0;        simF32[9] = 150.0;      simF32[10] = 6371.0;    simU32[11] = MAX_PARTICLES; 
+            simU32[12] = HASH_GRID_DIM; simF32[13] = 10.0 / 6371.0; simF32[14] = 25.0; simF32[15] = 250.0;
+            simF32[16] = 293.0;     simF32[17] = 0.008314;  simF32[18] = 3300.0;    simF32[19] = 3e-5;
+            simF32[20] = -2.5;      simF32[21] = 278.0;     simF32[22] = 1600.0;    simU32[23] = MAX_CONSTRAINTS;
+            
+            device.queue.writeBuffer(simParamsBuffer, 0, simF32);
+
+            const bindGroupLayoutUniforms = device.createBindGroupLayout({
+                entries: [
+                    { binding: 0, visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
+                    { binding: 1, visibility: GPUShaderStage.COMPUTE | GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }
+                ]
+            });
+
+            const uniformBindGroup = device.createBindGroup({
+                layout: bindGroupLayoutUniforms,
+                entries: [ { binding: 0, resource: { buffer: cameraBuffer } }, { binding: 1, resource: { buffer: simParamsBuffer } } ]
+            });
+
+            const computePipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayoutMemory, bindGroupLayoutUniforms] });
+            const createCP = (ep) => device.createComputePipeline({ layout: computePipelineLayout, compute: { module: computeShaderModule, entryPoint: ep } });
+
+            const pipelines = {
+                gridClearThermal: createCP('grid_clear_thermal'), crustApplyThermal: createCP('crust_apply_thermal'), gridFinalizeThermal: createCP('grid_finalize_thermal'),
+                laplacian: createCP('mantle_laplacian'), integrate: createCP('mantle_integrate'), velocity: createCP('mantle_velocity'),
+                thermoIsostasy: createCP('crust_thermo_isostasy'), constraintHealing: createCP('crust_constraint_healing'),
+                accumulation: createCP('crust_accumulation'), rewireBonds: createCP('crust_rewire_bonds'), cleanSplit: createCP('crust_clean_split'),
+                hashClear: createCP('crust_hash_clear'), crustPredict: createCP('crust_predict'), hashBuild: createCP('crust_hash_build'),
+                clearDeltas: createCP('crust_clear_deltas'), solveConstraints: createCP('crust_solve_constraints'), solveCollisions: createCP('crust_solve_collisions'),
+                applyDeltas: createCP('crust_apply_deltas'), crustIntegrate: createCP('crust_integrate'),
+            };
+
+            const renderPipeline = device.createRenderPipeline({
+                layout: device.createPipelineLayout({ bindGroupLayouts: [renderMemoryBindGroupLayout, bindGroupLayoutUniforms] }),
+                vertex: { module: renderShaderModule, entryPoint: 'vs_grid' }, fragment: { module: renderShaderModule, entryPoint: 'fs_grid', targets: [{ format }] },
+                primitive: { topology: 'triangle-list', cullMode: 'none' }, depthStencil: { depthWriteEnabled: true, depthCompare: 'less', format: 'depth24plus' },
+            });
+            const particleRenderPipeline = device.createRenderPipeline({
+                layout: device.createPipelineLayout({ bindGroupLayouts: [renderMemoryBindGroupLayout, bindGroupLayoutUniforms] }),
+                vertex: { module: particleRenderShaderModule, entryPoint: 'vs_particle' }, fragment: { module: particleRenderShaderModule, entryPoint: 'fs_particle', targets: [{ format }] },
+                primitive: { topology: 'point-list' }, depthStencil: { depthWriteEnabled: true, depthCompare: 'less', format: 'depth24plus' },
+            });
+            const constraintRenderPipeline = device.createRenderPipeline({
+                layout: device.createPipelineLayout({ bindGroupLayouts: [constrRenderMemoryBindGroupLayout, bindGroupLayoutUniforms] }),
+                vertex: { module: constraintRenderShaderModule, entryPoint: 'vs_constraint' }, fragment: { module: constraintRenderShaderModule, entryPoint: 'fs_constraint', targets: [{ format }] },
+                primitive: { topology: 'line-list' }, depthStencil: { depthWriteEnabled: true, depthCompare: 'less', format: 'depth24plus' },
+            });
+
+            let depthTexture;
+            function updateDepthTexture() {
+                if (depthTexture) depthTexture.destroy();
+                depthTexture = device.createTexture({ size: [Math.max(1, canvas.width), Math.max(1, canvas.height), 1], format: 'depth24plus', usage: GPUTextureUsage.RENDER_ATTACHMENT });
+            }
+            canvas.width = Math.max(1, window.innerWidth); canvas.height = Math.max(1, window.innerHeight); updateDepthTexture();
+
+            document.getElementById('status').innerHTML = `
+                <div class="flex justify-between border-b border-slate-700 py-1"><span>Subduction Trigger:</span> <span class="text-purple-400">Elevation Priority</span></div>
+                <div class="flex justify-between border-b border-slate-700 py-1"><span>Mantle Heat Assimilation:</span> <span class="text-blue-400">Active</span></div>
+                <div class="flex justify-between py-1"><span>Status:</span> <span class="text-emerald-400">Phase 5 Active ✓</span></div>
+                <p class="text-xs text-slate-500 mt-2">Denser rock overcomes isostatic barriers during severe compression to sink into the mantle. Dark purple slabs pull attached trailing plates (Slab Pull) while absorbing mantle heat until they melt, returning memory IDs to Free Lists.</p>
+            `;
+
+            function multiply(a, b) { let out = new Float32Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) out[c*4+r] = a[0*4+r]*b[c*4+0] + a[1*4+r]*b[c*4+1] + a[2*4+r]*b[c*4+2] + a[3*4+r]*b[c*4+3]; return out; }
+            function perspective(fovy, aspect, near, far) { let f = 1.0 / Math.tan(fovy / 2); let nf = 1 / (near - far); return new Float32Array([ f/aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, far*nf, -1, 0, 0, far*near*nf, 0 ]); }
+            function cross(a, b) { return [ a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0] ]; }
+            function lookAt(e, c, u) { let z = normalize([e[0]-c[0], e[1]-c[1], e[2]-c[2]]); let x = normalize(cross(u, z)); let y = normalize(cross(z, x)); return new Float32Array([ x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -(x[0]*e[0]+x[1]*e[1]+x[2]*e[2]), -(y[0]*e[0]+y[1]*e[1]+y[2]*e[2]), -(z[0]*e[0]+z[1]*e[1]+z[2]*e[2]), 1 ]); }
+            
+            let camYaw = 0, camPitch = 0.2, camRadius = 3.5, isDragging = false, lastX = 0, lastY = 0;
+            canvas.addEventListener('pointerdown', e => { isDragging = true; lastX = e.clientX; lastY = e.clientY; canvas.setPointerCapture(e.pointerId); });
+            canvas.addEventListener('pointermove', e => { if (isDragging) { camYaw -= (e.clientX - lastX) * 0.005; camPitch = Math.max(-Math.PI/2+0.01, Math.min(Math.PI/2-0.01, camPitch + (e.clientY - lastY) * 0.005)); lastX = e.clientX; lastY = e.clientY; } });
+            canvas.addEventListener('pointerup', e => { isDragging = false; canvas.releasePointerCapture(e.pointerId); });
+            canvas.addEventListener('wheel', e => { camRadius = Math.max(1.5, Math.min(10.0, camRadius + e.deltaY * 0.005)); }, { passive: true });
+            const spinCheckbox = document.getElementById('spinToggle');
+            
+            function render() {
+                if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) { canvas.width = window.innerWidth; canvas.height = window.innerHeight; updateDepthTexture(); }
+                if (spinCheckbox && spinCheckbox.checked) camYaw -= 0.005;
+
+                device.queue.writeBuffer(cameraBuffer, 0, multiply(perspective(Math.PI/4, canvas.width / canvas.height, 0.1, 100.0), lookAt([camRadius*Math.cos(camPitch)*Math.sin(camYaw), camRadius*Math.sin(camPitch), camRadius*Math.cos(camPitch)*Math.cos(camYaw)], [0, 0, 0], [0, 1, 0])));
+
+                const commandEncoder = device.createCommandEncoder(); const computePass = commandEncoder.beginComputePass();
+                computePass.setBindGroup(0, memoryBindGroup); computePass.setBindGroup(1, uniformBindGroup);
+                
+                const mantleWG = Math.ceil(NUM_GRID_NODES / 64); const crustWG = Math.ceil(MAX_PARTICLES / 64); const constraintWG = Math.ceil(MAX_CONSTRAINTS / 64); const hashWG = Math.ceil(HASH_GRID_CELLS / 64);
+
+                computePass.setPipeline(pipelines.gridClearThermal); computePass.dispatchWorkgroups(mantleWG);
+                computePass.setPipeline(pipelines.crustApplyThermal); computePass.dispatchWorkgroups(crustWG);
+                computePass.setPipeline(pipelines.gridFinalizeThermal); computePass.dispatchWorkgroups(mantleWG);
+                for(let i = 0; i < 50; i++) { computePass.setPipeline(pipelines.laplacian); computePass.dispatchWorkgroups(mantleWG); computePass.setPipeline(pipelines.integrate); computePass.dispatchWorkgroups(mantleWG); }
+                computePass.setPipeline(pipelines.velocity); computePass.dispatchWorkgroups(mantleWG);
+
+                computePass.setPipeline(pipelines.thermoIsostasy); computePass.dispatchWorkgroups(crustWG);
+                computePass.setPipeline(pipelines.constraintHealing); computePass.dispatchWorkgroups(constraintWG);
+                computePass.setPipeline(pipelines.accumulation); computePass.dispatchWorkgroups(crustWG);
+                computePass.setPipeline(pipelines.rewireBonds); computePass.dispatchWorkgroups(constraintWG);
+                computePass.setPipeline(pipelines.cleanSplit); computePass.dispatchWorkgroups(crustWG);
+
+                computePass.setPipeline(pipelines.crustPredict); computePass.dispatchWorkgroups(crustWG);
+                computePass.setPipeline(pipelines.hashClear); computePass.dispatchWorkgroups(hashWG);
+                computePass.setPipeline(pipelines.hashBuild); computePass.dispatchWorkgroups(crustWG);
+                
+                for (let i = 0; i < 3; i++) {
+                    computePass.setPipeline(pipelines.clearDeltas); computePass.dispatchWorkgroups(crustWG);
+                    computePass.setPipeline(pipelines.solveConstraints); computePass.dispatchWorkgroups(constraintWG);
+                    computePass.setPipeline(pipelines.solveCollisions); computePass.dispatchWorkgroups(crustWG);
+                    computePass.setPipeline(pipelines.applyDeltas); computePass.dispatchWorkgroups(crustWG);
+                }
+                computePass.setPipeline(pipelines.crustIntegrate); computePass.dispatchWorkgroups(crustWG);
+                computePass.end();
+
+                const renderPass = commandEncoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), clearValue: { r: 0.06, g: 0.09, b: 0.16, a: 1.0 }, loadOp: 'clear', storeOp: 'store' }], depthStencilAttachment: { view: depthTexture.createView(), depthClearValue: 1.0, depthLoadOp: 'clear', depthStoreOp: 'store' } });
+                renderPass.setPipeline(renderPipeline); renderPass.setBindGroup(0, renderMemoryBindGroup); renderPass.setBindGroup(1, uniformBindGroup); renderPass.setIndexBuffer(indexBuffer, 'uint16'); renderPass.drawIndexed(icosphere.indices.length);
+                renderPass.setPipeline(particleRenderPipeline); renderPass.setBindGroup(0, particleRenderMemoryBindGroup); renderPass.draw(MAX_PARTICLES);
+                renderPass.setPipeline(constraintRenderPipeline); renderPass.setBindGroup(0, constraintRenderMemoryBindGroup); renderPass.setBindGroup(1, uniformBindGroup); renderPass.draw(MAX_CONSTRAINTS * 2);
+                renderPass.end();
+                
+                device.queue.submit([commandEncoder.finish()]); requestAnimationFrame(render);
+            }
+            render();
+        }
+
+        initWebGPU().catch(err => { document.getElementById('status').innerHTML = `<span class="text-red-400">Error: ${err.message}</span>`; console.error(err); });
+    </script>
+</body>
+</html>
