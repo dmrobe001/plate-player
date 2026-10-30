@@ -17,10 +17,21 @@ export const SIM_PARAMS = [
   ['blanket_forcing', 'f32', 0.4],      // how strongly crust heat (thermal blanket) forces psi
   ['num_nodes', 'u32', null],
 
-  // --- crust: position-based dynamics ---
+  // --- crust: overdamped XPBD (see design.md 5.2) ---
+  // Each step minimises  sum_i (gamma_i / 2 dt) |x_i - x~_i|^2 + U(x):
+  // basal drag gamma plays the role of mass. Bond stiffness and drag come from
+  // the physical values below; only their ratio enters (bond_rate_myr_inv).
   ['dt_crust_myr', 'f32', 0.016],
-  ['drag_coeff_myr_inv', 'f32', 50.0],  // relaxation rate of crust velocity toward mantle velocity (integrated exactly)
-  ['crust_youngs_modulus_gpa', 'f32', 2.0], // used only to convert strain to stress (diagnostics, yielding)
+  ['solver_iterations', 'u32', 4],      // constraint + collision iterations per step (read by simulation.js)
+  // Stop-gap: real lithosphere is ~70 GPa, but until plate-scale stress
+  // converges (design phase 5), Jacobi residual strain times 70 GPa reads as
+  // >150 MPa in ~13% of bonds and spreads spurious damage. 2 GPa (the Phase 5
+  // prototype's value) keeps residual stresses at a few MPa. See design.md, phase 2.
+  ['crust_youngs_modulus_gpa', 'f32', 2.0],
+  ['elastic_thickness_km', 'f32', 30.0],     // thickness that carries in-plane stress
+  ['asthenosphere_viscosity_pa_s', 'f32', 1e19],
+  ['asthenosphere_thickness_km', 'f32', 100.0], // basal drag per area = viscosity / thickness
+  ['bond_rate_myr_inv', 'f32', null],   // derived: bond stiffness / drag of a base-size particle, 1/Myr
   ['yield_stress_mpa', 'f32', 150.0],
   ['cm_yr_to_sim_vel', 'f32', 10.0 / 6371.0], // 1 cm/yr = 10 km/Myr; / Earth radius -> rad/Myr
   ['sh_grad_to_cm_yr', 'f32', 25.0],    // grad(psi) -> plate speed in cm/yr

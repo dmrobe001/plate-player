@@ -3,9 +3,13 @@
 //
 // Recipe (every random choice flows from one seed):
 //   1. Scatter N points uniformly on the sphere.
-//   2. Relax them with pure pairwise repulsion (no bonds yet) so that no two
-//      discs overlap. N is chosen so the hexagons would cover a fraction
-//      `coverage` < 1 of the sphere, which leaves room to remove every overlap.
+//   2. Relax them with pure pairwise repulsion (no bonds yet). N is chosen so
+//      the hexagons would cover a fraction `coverage` < 1 of the sphere, which
+//      leaves room to remove nearly every overlap; the few that remain are
+//      removed by shrinking those particles' apothems to half the distance to
+//      their nearest neighbour (typically by well under 1%). Otherwise bonds
+//      (holding the current distance) and contacts (pushing to the apothem sum)
+//      would fight from the first step.
 //   3. Crust type: threshold a fractal-noise field so that a fraction
 //      `continentalFraction` of particles is continental. Continental
 //      thickness rises from coast to interior.
@@ -55,6 +59,17 @@ export function generateInitialState(numMantleNodes, options = {}) {
   const position = new Float32Array(3 * n);
   for (let i = 0; i < n; i++) position.set(randomOnSphere(rng), 3 * i);
   const relaxResidual = relax(position, contact, opt.relaxIterations);
+  const apothem = new Float32Array(n).fill(opt.apothem);
+  new CellList(position, contact).forEachPair((i, j, dx, dy, dz, d) => {
+    const fit = (d / 2) * (1 - 1e-5); // margin for float32 rounding on the GPU
+    apothem[i] = Math.min(apothem[i], fit);
+    apothem[j] = Math.min(apothem[j], fit);
+  });
+  let shrunk = 0, minApothem = opt.apothem;
+  for (let i = 0; i < n; i++) {
+    if (apothem[i] < opt.apothem) shrunk++;
+    minApothem = Math.min(minApothem, apothem[i]);
+  }
 
   // 3. Crust type from thresholded fractal noise.
   const continentNoise = createPerlin3(rng);
@@ -75,7 +90,7 @@ export function generateInitialState(numMantleNodes, options = {}) {
     compositionDensity: new Float32Array(n),
     temperature: new Float32Array(n),
     age: new Float32Array(n),
-    apothem: new Float32Array(n).fill(opt.apothem),
+    apothem,
   };
   let continental = 0;
   for (let i = 0; i < n; i++) {
@@ -120,6 +135,8 @@ export function generateInitialState(numMantleNodes, options = {}) {
       continentalFraction: continental / n,
       damagedBondFraction: damaged / bonds.count,
       relaxResidual,
+      shrunkFraction: shrunk / n,
+      minApothemRatio: minApothem / opt.apothem,
     },
   };
 }

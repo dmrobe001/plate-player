@@ -15,6 +15,11 @@ Euler-pole rotations, and the record/forcing contracts for nesting finer models 
 this one. The to-do list at the end of this README is the problem inventory that plan
 answers.
 
+**This is a work in progress, and so is its design.** The design document is a map,
+not a contract. Don't pursue its goals too doggedly: when a step turns out to be
+hard, costly, or a poor fit for what we've learned, stop and discuss a redesign
+rather than forcing the plan through.
+
 ## Quick start
 
 ```bash
@@ -58,14 +63,23 @@ column with thickness, composition density, temperature, age, and area
 (2√3·apothem²). Its density follows thermal expansion and its elevation follows
 Airy isostasy: thickness × (1 − ρ/ρ_mantle), with extra depression under water.
 
-**Bonds** (`Constraint`). Each bond has a rest length, a yield stress, and damage
-in [0, 1]. Stress beyond an Arrhenius-weakened yield stress accumulates damage;
-damage weakens tension and shear (never compression); heat slowly heals it.
+**Bonds** (`Constraint`). Each bond is a central spring with a rest length, a yield
+stress, and damage in [0, 1]. Its stiffness comes from the lithosphere's Young's
+modulus and elastic thickness, k = (√3/2)·E·hₑ (the 2D modulus of a triangular spring
+network). The default E is a stop-gap 2 GPa rather than the physical ~70 GPa; see the
+to-do list. Stress beyond an Arrhenius-weakened yield stress accumulates damage;
+damage softens tension (never compression); heat slowly heals it.
 
-**Motion** (`shaders/compute/solver.wgsl`). Position-based dynamics (PBD): each
-frame, velocities relax toward the mantle flow, positions are predicted, then three
-Jacobi iterations of bond constraints and disc-disc collisions correct them.
-Collisions use a uniform hash grid.
+**Motion** (`shaders/compute/solver.wgsl`). Overdamped extended position-based
+dynamics (XPBD), with basal drag in the role of mass: each step minimises
+Σ (γᵢ/2dt)|xᵢ − x̃ᵢ|² + U(x), where x̃ is where the mantle flow alone would carry
+each particle, γ = area × asthenosphere viscosity / thickness, and U is the bond
+energy. There is no inertia, and velocity is only a diagnostic. Bonds are solved by
+Jacobi sweeps that keep the multipliers consistent with the displacement; collisions
+are position projections found with a uniform hash grid. With the default physical
+values a single bond relaxes in ~40 years, so every step (16 kyr) is effectively
+quasi-static: what limits rigidity at plate scale is solver convergence, not E (see
+design.md, phase 2).
 
 **Growth and subduction** (`growth.wgsl`, `solver.wgsl`, `thermal.wgsl`). Particles
 over strong divergence grow in area. Past 3× the base area they split, and the
@@ -182,6 +196,14 @@ the GPU suite takes several minutes.
 Opening the page with `?paused` starts it paused, which scripts use to control
 stepping exactly.
 
+**What belongs in the test suite.** Keep tests cheap and about *mechanisms*:
+invariants (every slot free or active exactly once), small analytic cases (two
+particles relaxing on a known time scale), file formats. Don't accumulate regression
+tests on high-level results (plate speeds, land fraction, how a 100 Myr run looks).
+They need lots of compute and pin down behaviour that is supposed to keep changing.
+Measure those once when a phase lands, write the number in `docs/design.md`, and
+move on.
+
 ## Recording
 
 Every run is recorded unless **Record this run** is unchecked (design.md §8.3 has
@@ -220,15 +242,18 @@ the simulation for a few milliseconds, so each sample is taken at an exact step.
 
 ## Reproducibility
 
-- The initial state is a pure function of the seed and `INIT_DEFAULTS`.
-- GPU evolution is *mostly* deterministic. Position corrections are summed in fixed
-  point with integer atomics, which is order-independent (including per-pair in the
-  collision loop), and the subduction state flip is deferred to a separate pass. Two
-  sources of thread-timing dependence remain, both recorded in each manifest:
-  which free slot a splitting particle receives, and the 50-entry cap on collision
-  neighbour lists (rarely reached).
-- A snapshot restores the complete state; resuming from one reproduces the
-  continuation bit for bit (tested), as long as no split lands in a different slot.
+What we want: a seed reproduces the initial world, a record says exactly what made it,
+and a snapshot resumes a run. What we don't chase: **bit-identical GPU results**. On
+GPUs that is more trouble than it's worth, since thread timing, driver versions and
+floating-point contraction all vary. A resumed or re-run simulation should match
+*statistically and visually*, not byte for byte.
+
+- The initial state is a pure function of the seed and `INIT_DEFAULTS` (CPU code).
+- A snapshot restores the complete state, so resuming continues the same run. The
+  test checks that the continuation matches to within a small tolerance.
+- Known sources of run-to-run variation are listed in each record's manifest (which
+  free slot a splitting particle receives; neighbour-list order in the collision
+  search). We note them; we don't engineer them away.
 - The simulation advances one step per displayed frame, so simulated time per
   wall-clock second depends on the monitor's refresh rate and GPU speed. The
   panel reports steps and simulated Myr.
@@ -253,24 +278,23 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       to old basin (depth ∝ √age, from cooling of the lithospheric mantle). Here
       only the 7 km crust contracts, about 0.25 km. Adding a lithosphere term
       ∝ √(κ·age) to elevation would give ridges and basins.
-- [ ] **Bond "shear" resists rigid rotation.** The tangential error is the relative
-      displacement *this step*, which is a velocity difference, not a strain. A
-      rigidly rotating plate therefore shears every bond, and the term acts as
-      drag. Options: give particles an orientation, or measure shear from the
-      change in bond angle relative to neighbouring bonds.
-- [ ] **Young's modulus has no dynamical effect.** PBD with stiffness 1 makes bonds
-      as stiff as the iteration count allows; `crust_youngs_modulus_gpa` only
-      converts strain to stress for yielding and display, and `compliance` is
-      unused. Using XPBD (extended PBD, where compliance = 1/stiffness) would make
-      stiffness a real material parameter independent of iteration count.
-- [ ] Shear stress uses Young's modulus E rather than the shear modulus
-      G = E / (2(1+ν)).
-- [ ] **Bond rest length vs. contact distance.** Bonds hold particles at their rest
-      length while collisions push any pair closer than the sum of apothems apart,
-      so the two rules fight wherever rest < contact. Growth makes this worse,
-      because a growing particle's bonds keep their old rest length. Consider
-      excluding bonded pairs from collision handling, or keeping rest length
-      = apothem sum.
+- [x] ~~Bond "shear" resisted rigid rotation~~ (it was a velocity difference, not a
+      strain). Removed in phase 2: bonds are central springs. A rotation-free shear
+      measure comes with the per-particle strain fit (design phase 4); until then the
+      shear ticks are blank.
+- [x] ~~Young's modulus had no dynamical effect.~~ Phase 2: bond stiffness and drag
+      are physical, and the two-particle relaxation matches τ = γ/2k (tested).
+- [ ] **Plate-scale stress doesn't converge.** Jacobi sweeps move information about
+      one bond per iteration, so a few iterations per step leave residual strain from
+      the mantle's velocity gradients. With a physical E = 70 GPa that residual reads
+      as a median 56 MPa, with 13% of bonds over yield (4 iterations; 16 iterations
+      only reaches 38 MPa and 5.5%), and damage spreads spuriously. Until design
+      phase 5 (plates as a coarse level) fixes convergence, the default E is 2 GPa.
+- [ ] **Growth recreates bond/contact conflicts.** The initial state is now
+      stress-free (apothems are shrunk so no pair overlaps; with the mantle off, the
+      stress is exactly zero), but a growing particle's bonds keep their rest length
+      while collisions push to the new apothem sum. Design phase 3 stops bonded pairs
+      from colliding.
 - [ ] **Bonds never form and never die from damage.** A fully damaged bond still
       resists compression and keeps 10% of its shear stiffness, and colliding
       plates never weld (no suturing or accretion).

@@ -1,5 +1,7 @@
-// GPU acceptance tests for design phases 0 and 1. They drive the built page
-// (dist/plate-player.html) in Chromium through `window.plate`.
+// GPU mechanism tests. They drive the built page (dist/plate-player.html) in
+// Chromium through `window.plate`. Keep them cheap and about mechanisms with
+// known answers; high-level behaviour is benchmarked once per design phase,
+// not kept here (see README, "What belongs in the test suite").
 //
 //   npm run build && npm run test:gpu
 //
@@ -80,9 +82,9 @@ function checkFreeLists(state) {
   return P;
 }
 
-test('phase 0: free lists account for every slot; cached mantle node matches brute force', { timeout: 600_000 }, async () => {
+test('free lists account for every slot; cached mantle node matches brute force', { timeout: 300_000 }, async () => {
   const page = await openPage();
-  await page.evaluate(() => plate.runSteps(100));
+  await page.evaluate(() => plate.runSteps(20));
   const state = await readState(page);
   const P = checkFreeLists(state);
 
@@ -109,64 +111,81 @@ test('phase 0: free lists account for every slot; cached mantle node matches bru
   await page.close();
 });
 
-test('phase 0: 10x time step stays finite and bounded; dt sensitivity reported', { timeout: 900_000 }, async () => {
-  const T = 1.6; // Myr
-  const runAt = async (dt) => {
-    const page = await openPage();
-    await page.evaluate(async (dt) => { await plate.setParams({ dt_crust_myr: dt }); }, dt);
-    await page.evaluate((n) => plate.runSteps(n), Math.round(T / dt));
-    const state = await readState(page);
-    assert.deepEqual(page.errors, []);
-    await page.close();
-    return state;
-  };
-  const fine = await runAt(0.016);
-  const coarse = await runAt(0.16);
+test('a 10x time step stays finite and bounded', { timeout: 300_000 }, async () => {
+  const page = await openPage();
+  await page.evaluate(async () => { await plate.setParams({ dt_crust_myr: 0.16 }); await plate.runSteps(10); });
+  const state = await readState(page);
+  assert.deepEqual(page.errors, []);
+  await page.close();
 
-  for (const state of [fine, coarse]) {
-    const P = checkFreeLists(state);
-    let maxSpeed = 0;
-    for (let i = 0; i < MAX_PARTICLES; i++) {
-      if (!P.is_active[i]) continue;
-      const r = Math.hypot(P.position[4 * i], P.position[4 * i + 1], P.position[4 * i + 2]);
-      assert.ok(Math.abs(r - 1) < 1e-4, `particle ${i} left the sphere (r = ${r})`);
-      const v = Math.hypot(P.velocity[4 * i], P.velocity[4 * i + 1], P.velocity[4 * i + 2]);
-      assert.ok(Number.isFinite(v), `particle ${i} velocity is not finite`);
-      maxSpeed = Math.max(maxSpeed, v);
-    }
-    const psi = new Float32Array(state.grid).filter((_, w) => w % 12 === 8); // GridNode.psi at word 8 of 12
-    const maxPsi = Math.max(...psi.map(Math.abs));
-    assert.ok(Number.isFinite(maxPsi) && maxPsi < 10, `mantle psi out of bounds: ${maxPsi}`);
-    console.log(`  max speed ${(maxSpeed * 637.1).toFixed(1)} cm/yr, max |psi| ${maxPsi.toFixed(3)}`);
-    assert.ok(maxSpeed * 637.1 < 100, 'plate speed above 100 cm/yr');
-  }
-
-  // Sensitivity to dt, as a baseline for phase 2 (PBD stiffness still
-  // depends on dt, so this is reported rather than asserted): RMS difference
-  // of particle positions present in both runs, relative to RMS displacement.
-  const Pf = unpack(Particle, fine.particles, MAX_PARTICLES);
-  const Pc = unpack(Particle, coarse.particles, MAX_PARTICLES);
-  const P0 = await (async () => {
-    const page = await openPage();
-    const s = await readState(page);
-    await page.close();
-    return unpack(Particle, s.particles, MAX_PARTICLES);
-  })();
-  let diff = 0, disp = 0, n = 0;
+  const P = checkFreeLists(state);
+  let maxSpeed = 0;
   for (let i = 0; i < MAX_PARTICLES; i++) {
-    if (!P0.is_active[i] || !Pf.is_active[i] || !Pc.is_active[i] || Pf.state[i] !== 1 || Pc.state[i] !== 1) continue;
-    let d2 = 0, m2 = 0;
-    for (let c = 0; c < 3; c++) {
-      d2 += (Pf.position[4 * i + c] - Pc.position[4 * i + c]) ** 2;
-      m2 += (Pf.position[4 * i + c] - P0.position[4 * i + c]) ** 2;
-    }
-    diff += d2; disp += m2; n++;
+    if (!P.is_active[i]) continue;
+    const r = Math.hypot(P.position[4 * i], P.position[4 * i + 1], P.position[4 * i + 2]);
+    assert.ok(Math.abs(r - 1) < 1e-4, `particle ${i} left the sphere (r = ${r})`);
+    const v = Math.hypot(P.velocity[4 * i], P.velocity[4 * i + 1], P.velocity[4 * i + 2]);
+    assert.ok(Number.isFinite(v), `particle ${i} velocity is not finite`);
+    maxSpeed = Math.max(maxSpeed, v);
   }
-  console.log(`  dt 0.16 vs 0.016 over ${T} Myr: rms position difference / rms displacement = ${Math.sqrt(diff / disp).toFixed(3)} (${n} particles)`);
+  const psi = new Float32Array(state.grid).filter((_, w) => w % 12 === 8); // GridNode.psi at word 8 of 12
+  const maxPsi = Math.max(...psi.map(Math.abs));
+  assert.ok(Number.isFinite(maxPsi) && maxPsi < 10, `mantle psi out of bounds: ${maxPsi}`);
+  console.log(`  max speed ${(maxSpeed * 637.1).toFixed(1)} cm/yr, max |psi| ${maxPsi.toFixed(3)}`);
+  assert.ok(maxSpeed * 637.1 < 100, 'plate speed above 100 cm/yr');
 });
 
-test('phase 1: restart from a record ZIP in a fresh page reproduces the continuation', { timeout: 900_000 }, async () => {
-  const N = 30;
+test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { timeout: 300_000 }, async () => {
+  // One stretched bond, no mantle flow. Drag-as-mass XPBD should reproduce
+  // implicit Euler for  dC/dt = -C / tau  exactly: C_n = C_0 (1 + dt/tau)^-n,
+  // for time steps far below, at, and far above tau.
+  const page = await openPage();
+  const results = await page.evaluate(async () => {
+    const a = 0.0175, L = 3 * a, eps = 0.1;
+    await plate.setParams({ blanket_forcing: 0, mantle_time_per_myr: 0, crust_youngs_modulus_gpa: 70 });
+    const kappa70 = plate.sim.params.bond_rate_myr_inv;
+    await plate.setParams({ crust_youngs_modulus_gpa: 70 * 0.5 / kappa70 }); // kappa = 0.5/Myr, tau = 1/(2 kappa) = 1 Myr
+    const tau = 1 / (2 * plate.sim.params.bond_rate_myr_inv);
+    const half = Math.asin(L * (1 + eps) / 2);
+    const state = () => ({
+      particles: {
+        count: 2,
+        position: Float32Array.from([-Math.sin(half), 0, Math.cos(half), Math.sin(half), 0, Math.cos(half)]),
+        thickness: Float32Array.of(7, 7), compositionDensity: Float32Array.of(3000, 3000),
+        temperature: Float32Array.of(278, 278), age: Float32Array.of(0, 0), apothem: Float32Array.of(a, a),
+      },
+      bonds: { count: 1, a: Uint32Array.of(0), b: Uint32Array.of(1), restLength: Float32Array.of(L), damage: Float32Array.of(0) },
+      mantlePsi: new Float32Array(plate.sim.numNodes),
+      yieldStressMPa: 1e6,
+    });
+    const stretch = async () => {
+      const buf = (await plate.readBuffers(['particles'])).particles;
+      const f = new Float32Array(buf);
+      const w = buf.byteLength / 4 / 25000; // words per particle
+      return Math.hypot(f[w] - f[0], f[w + 1] - f[1], f[w + 2] - f[2]) - L;
+    };
+    const out = [];
+    for (const [dt, steps] of [[0.1, 10], [1, 3], [10, 1]]) {
+      await plate.setParams({ dt_crust_myr: dt });
+      await plate.loadState(state());
+      const c0 = await stretch();
+      await plate.runSteps(steps);
+      out.push({ dt, steps, tau, ratio: (await stretch()) / c0, expected: (1 + dt / tau) ** -steps });
+    }
+    return out;
+  });
+  for (const r of results) {
+    console.log(`  dt/tau = ${(r.dt / r.tau).toFixed(1)}, ${r.steps} steps: C/C0 = ${r.ratio.toFixed(5)}, implicit Euler ${r.expected.toFixed(5)}`);
+    assert.ok(Math.abs(r.ratio - r.expected) < 0.01 * r.expected + 2e-3, `dt ${r.dt}: ${r.ratio} vs ${r.expected}`);
+  }
+  assert.deepEqual(page.errors, []);
+  await page.close();
+});
+
+test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 }, async () => {
+  // Bit-identical GPU results are not a goal (README, "Reproducibility");
+  // the continuation must match to well below a particle spacing.
+  const N = 10;
   const a = await openPage();
   await a.evaluate((n) => plate.runSteps(n), N);
   const zipB64 = await a.evaluate(async (toB64Src) => {
@@ -190,33 +209,23 @@ test('phase 1: restart from a record ZIP in a fresh page reproduces the continua
   await b.close();
 
   assert.equal(stepsB, stepsA);
-  // Splits draw free slots in thread-timing order (documented
-  // nondeterminism). Report whether any happened in the window.
-  const freeAt = (s) => new Uint32Array(s.particlePool)[0];
-  console.log(`  free particle slots after ${2 * N} steps: ${freeAt(continuous)} (continuous) vs ${freeAt(restarted)} (restarted)`);
-  for (const name of ['grid', 'constraints', 'particlePool', 'constraintPool']) {
-    const x = new Uint8Array(continuous[name]), y = new Uint8Array(restarted[name]);
-    let first = -1;
-    for (let k = 0; k < x.length && first < 0; k++) if (x[k] !== y[k]) first = k;
-    assert.equal(first, -1, `${name} differs after restart (first differing byte ${first})`);
-  }
-  // Particles: every field bit for bit, except next_idx, the collision hash
-  // grid's linked-list pointer. It is rebuilt each step by atomic exchanges
-  // whose order depends on thread timing, and carries no physical state.
   const Pa = unpack(Particle, continuous.particles, MAX_PARTICLES);
   const Pb = unpack(Particle, restarted.particles, MAX_PARTICLES);
-  for (const [field] of Particle.fields) {
-    if (field === 'next_idx') continue;
-    const x = new Uint32Array(Pa[field].buffer), y = new Uint32Array(Pb[field].buffer); // compare bits, not values (NaN-safe)
-    const bad = x.findIndex((v, k) => v !== y[k]);
-    assert.equal(bad, -1, `particle field ${field} differs after restart (first at element ${bad})`);
+  let active = 0, worst = 0;
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    assert.equal(Pa.is_active[i], Pb.is_active[i], `particle ${i} active in only one run`);
+    if (!Pa.is_active[i]) continue;
+    active++;
+    for (let c = 0; c < 3; c++) worst = Math.max(worst, Math.abs(Pa.position[4 * i + c] - Pb.position[4 * i + c]));
   }
+  console.log(`  ${active} particles, largest position difference ${worst.toExponential(2)} (spacing 0.035)`);
+  assert.ok(worst < 1e-4, `resumed run drifted by ${worst}`);
 });
 
-test('phase 1: record ZIP is complete and self-consistent', { timeout: 600_000 }, async () => {
+test('record ZIP is complete and self-consistent', { timeout: 300_000 }, async () => {
   const page = await openPage();
   await page.evaluate(() => { plate.recorder.options.fieldIntervalMyr = 0.16; }); // every 10 steps
-  await page.evaluate(() => plate.runSteps(30));
+  await page.evaluate(() => plate.runSteps(20));
   const zip = fromB64(await page.evaluate(async (toB64Src) => eval(toB64Src)(await plate.exportRecord()), toB64));
   await page.close();
 
@@ -235,7 +244,7 @@ test('phase 1: record ZIP is complete and self-consistent', { timeout: 600_000 }
   };
   Object.values(manifest.mesh.files).forEach(check);
   const time = new Float64Array(check(manifest.fields.time).slice().buffer);
-  assert.equal(time.length, 4); // steps 0, 10, 20, 30
+  assert.equal(time.length, 3); // steps 0, 10, 20
   for (let t = 1; t < time.length; t++) assert.ok(time[t] > time[t - 1]);
 
   const field = (name) => {

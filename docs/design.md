@@ -1,8 +1,13 @@
 # Plate Player — design plan
 
-Status: **phases 0 and 1 implemented**; the rest is a proposal. The physics in
-`src/` still follows the Phase 5 prototype. This document says where it is going
-and why.
+Status: **phases 0–2 implemented**; the rest is a proposal. This document says where
+the model is going and why.
+
+**How to use this document.** It is a working plan, not a specification. Don't
+pursue its goals too doggedly: when a phase runs into difficult problems (a method
+that doesn't converge, a cost that doesn't fit, a requirement that turns out to fight
+another), stop and discuss a redesign rather than forcing the plan through. Record
+what changed and why in the phase table (section 9).
 
 Contents
 
@@ -34,8 +39,9 @@ Contents
   widths may deviate from Earth's.
 - One member of a **stack of models** at decreasing scale. Each runs in isolation
   and communicates only through recorded data (section 8).
-- Reproducible: a manifest (code version, seed, parameters) regenerates a run,
-  subject to the documented GPU nondeterminism.
+- Reproducible *enough*: a seed regenerates the initial world, a manifest records the
+  code version and parameters, and snapshots resume runs. Bit-identical GPU results
+  are explicitly **not** a goal; on GPUs they cost more than they are worth.
 
 **Non-goals (for this level)**
 
@@ -301,11 +307,10 @@ each step more nearly quasi-static.
 
 - Graph-colour the edges (at most ~7 colours on a near-triangular lattice). Recolour
   on topology change, locally and greedily.
-- Fixed-point integer atomics for all accumulations, as now, so sums are
-  order-independent.
-- The remaining nondeterminism (free-list pops, contact creation order) is
-  documented. Where cheap, make it deterministic by resolving conflicts by index
-  (e.g. the lower particle index wins a free slot).
+- Fixed-point integer atomics for accumulations (WGSL has no float atomics).
+- Thread-timing-dependent behaviour (free-list pops, contact creation order) is
+  listed in record manifests, not engineered away. Runs should agree statistically,
+  not bit for bit.
 
 ---
 
@@ -411,8 +416,8 @@ Rules:
 4. **Time resolution is part of the contract.** A record states its sampling
    interval. A child must not depend on parent variability faster than that; that is
    the child's own physics.
-5. **Records are reproducible.** The manifest is sufficient to regenerate the record
-   (section 8.3).
+5. **Records are traceable.** The manifest names the code, seed and parameters, so the
+   run can be regenerated to statistical (not bitwise) agreement (section 8.3).
 6. **Policy for disagreement:** the parent is authoritative at the child's lateral
    boundary; the child is authoritative in its interior. Between them sits a
    relaxation zone, where the child is nudged toward the parent over a stated width
@@ -536,14 +541,20 @@ records. Nothing game-specific lives in the simulation.
 
 ## 9. Implementation phases and acceptance tests
 
-Each phase ends with a check that could fail. Benchmarks run headless and write a
-small record, so they double as tests of the recording code.
+Each phase ends with a check that could fail. Two kinds:
+
+- **Mechanism tests** are cheap (seconds to a minute), small, and about one
+  mechanism with a known answer. They stay in `test/`.
+- **Benchmarks** of high-level behaviour (dt sensitivity of a whole planet, plate
+  speeds, flexure profiles at 50 km) are run once when the phase lands, and the
+  number is written in the table below. They are *not* kept as regression tests:
+  they are expensive and the behaviour they measure is meant to evolve.
 
 | Phase | Work | Acceptance test |
 |---|---|---|
 | 0 ✅ | Housekeeping: exponential integrators for all rates; cache nearest mantle node; fix free-list and state-flip races; mantle substep from a stability bound, mantle time tied to Myr | Every slot free or active exactly once; cached node = nearest; no blow-up at 10× dt. dt sensitivity is *reported*, not asserted: PBD stiffness still depends on dt until phase 2, so that number is the baseline phase 2 must beat |
-| 1 ✅ | **Minimal recording:** manifest + field series + snapshots (tiers a–c), download as zip, resume from zip | Restart from a record ZIP in a fresh page reproduces the next N steps bit for bit |
-| 2 | **Overdamped XPBD core:** drag as mass, real compliance, graph-coloured Gauss–Seidel | Two-particle relaxation matches τ = γ/2k; result independent of dt in the quasi-static limit |
+| 1 ✅ | **Minimal recording:** manifest + field series + snapshots (tiers a–c), download as zip, resume from zip | Restart from a record ZIP in a fresh page continues the run (bitwise at the time; now checked to a tolerance, since bit-identity is not a goal) |
+| 2 ✅ (partly) | **Overdamped XPBD core:** drag as mass, real compliance. *Changed:* λ-consistent Jacobi instead of graph-coloured Gauss–Seidel (see below) | Two-particle relaxation matches implicit Euler, (1 + dt/τ)⁻ⁿ with τ = γ/2k, to 0.1% at dt/τ = 0.1, 1, 10 (kept as a test). Whole-planet dt-independence **not met**: blocked on plate-scale convergence (findings below) |
 | 3 | **Unified edges + column contacts + free radius & buoyancy** | Thickened block relaxes to Airy height (Generator: thickened block) |
 | 4 | **Neighbour-fit strain + orientation**, stress-tensor glyphs | Rigid rotation → strain < 10⁻⁶; uniaxial stretch → set Poisson ratio ±5% |
 | 5 | **Plate coarse level** (labelling, Euler poles) | Push one edge of an isolated plate: far edge responds in one step; iterations needed do not grow with N |
@@ -555,6 +566,42 @@ small record, so they double as tests of the recording code.
 
 The order is chosen so that phases 0–4 already improve the current game output at
 220 km, before 50 km is needed.
+
+### Phase 2 findings (measured once, 30 steps = 0.48 Myr, seed 1, SwiftShader)
+
+- **Physical scales.** With E = 70 GPa, hₑ = 30 km, η_a = 10¹⁹ Pa·s, h_a = 100 km, a
+  single bond relaxes in τ ≈ 40 yr against dt = 16 kyr: every step is quasi-static.
+  Stress diffuses through a drag-coupled elastic sheet at D = E·hₑ·h_a/η_a ≈ 20 m²/s,
+  i.e. ~3000 km (≈15 particle spacings) per step. So the *physical* plate is nearly
+  rigid over one step; the *numerical* one is not, because each Jacobi sweep moves
+  information one bond.
+- **Bond–contact conflict was the largest stress source.** With the mantle switched
+  off, the residual overlaps from the initial packing alone gave a median 31 MPa and
+  p99 630 MPa after one step at 70 GPa. Fixed in the initial state (apothems shrunk to
+  fit, median by 0.3%): with the mantle off, stress is now exactly zero.
+- **Remaining stress is under-convergence.** Mantle on, 70 GPa: median |σ| 56 MPa, 13%
+  of bonds over yield, damaged bonds 9.2% → 10.4% in 0.48 Myr (4 iterations). 16
+  iterations: 38 MPa, 5.5%. Fourfold iterations buy only 1.5×, as diffusion-like
+  propagation predicts. A converged solve at today's 1–2 cm/yr should give a few MPa.
+- **Default E = 2 GPa as a stop-gap** (median 1.6 MPa, no spurious yielding) until the
+  plate level converges stress.
+- **Why Jacobi, not graph-coloured Gauss–Seidel:** colouring has to be maintained as
+  splits and rewiring change topology, for a gain of ~2× in convergence rate. That
+  doesn't change the (L/ℓ)² scaling that is the actual problem, so it isn't worth the
+  bookkeeping yet. Multipliers are scaled by 1/(bonds at either end) and accumulated
+  in full, so a converged Jacobi solve is the true energy minimum.
+- **Whole-planet dt sensitivity** (rms position difference between dt = 0.16 and 0.016
+  over 1.6 Myr, relative to rms displacement): 0.37, measured *before* the
+  initial-overlap fix, against 0.30 in phase 0. Not re-measured; it can't approach 0
+  until plate-scale stress converges.
+- **Practical:** queuing many slow steps tripped Chromium's GPU watchdog (device lost);
+  `runSteps` now keeps at most two steps in flight.
+
+**Proposed re-ordering (for discussion):** do phase 5 (plates as a coarse level)
+before phases 3–4, since it decides whether stresses mean anything. A cheaper
+intermediate is Chebyshev semi-iterative acceleration of the Jacobi sweeps (Wang 2015,
+for projective and position-based dynamics), a few lines on the GPU, often an order of
+magnitude in convergence; it may be enough at 220 km but not at 50 km.
 
 ---
 

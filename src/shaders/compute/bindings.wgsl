@@ -5,9 +5,10 @@
 const NONE: u32 = 0xFFFFFFFFu;
 
 // Position corrections are accumulated with integer atomics in fixed point,
-// because WGSL has no float atomics. Integer addition is order-independent,
-// so the summed correction is deterministic.
-const FIXED_POINT: f32 = 1000000.0;
+// because WGSL has no float atomics. 1e8 resolves 1e-8 of the unit sphere
+// (6 cm; a bond strain of ~3e-7), and the largest corrections (an overlap of
+// ~0.035 from each of ~50 neighbours) stay well inside i32.
+const FIXED_POINT: f32 = 100000000.0;
 
 // Stack of free slot indices. `requests` is used by two-phase allocation
 // (crust_accumulation reserves, crust_commit_splits pops; see growth.wgsl).

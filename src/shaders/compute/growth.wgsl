@@ -55,7 +55,7 @@ fn crust_accumulation(@builtin(global_invocation_id) id: vec3<u32>) {
     constraints[bond].particle_a = idx;
     constraints[bond].particle_b = child;
     constraints[bond].rest_length = particles[idx].apothem * 2.0;
-    constraints[bond].compliance = 0.001;
+    constraints[bond].lambda = 0.0;
     constraints[bond].yield_stress_mpa = sim.yield_stress_mpa;
     constraints[bond].is_active = 1u;
     constraints[bond].damage = 0.0;

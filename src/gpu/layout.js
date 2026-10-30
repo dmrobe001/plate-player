@@ -93,6 +93,7 @@ export const Particle = defineStruct('Particle', [
   ['split_child', 'u32'],       // index of child created this frame, else NONE
   ['mantle_node', 'u32'],       // nearest mantle grid node, updated by a local walk each step
   ['next_state', 'u32'],        // state requested during collisions, applied afterwards
+  ['bond_count', 'u32'],        // active bonds this step; scales Jacobi updates
 ]);
 
 /** A bond between two particles. */
@@ -100,7 +101,7 @@ export const Constraint = defineStruct('Constraint', [
   ['particle_a', 'u32'],
   ['particle_b', 'u32'],
   ['rest_length', 'f32'],
-  ['compliance', 'f32'],        // currently unused by the solver
+  ['lambda', 'f32'],            // XPBD multiplier accumulated over this step's iterations
   ['yield_stress_mpa', 'f32'],
   ['is_active', 'u32'],
   ['damage', 'f32'],            // 0 intact .. 1 fully damaged

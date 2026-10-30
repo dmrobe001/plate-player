@@ -18,7 +18,8 @@ export const CAPACITY = {
   adjacencyWidth: 6,     // neighbours stored per mantle node
 };
 
-const SOLVER_ITERATIONS = 3;   // PBD Jacobi iterations per step
+const EARTH_RADIUS_M = 6.371e6;
+const SECONDS_PER_MYR = 3.15576e13;
 const MANTLE_STABILITY = 0.5;  // fraction of the explicit-Euler stability limit used per substep
 const FREE_LIST_HEADER_WORDS = 4;
 const WORKGROUP = 64;
@@ -82,6 +83,7 @@ export class Simulation {
     this.params = {};
     for (const [name] of SIM_PARAMS) this.params[name] = value(name);
     Object.assign(this.params, {
+      bond_rate_myr_inv: bondRate(this.params),
       dt_mantle: this.mantleStability.dtUsed,
       num_nodes: this.numNodes,
       max_particles: CAPACITY.maxParticles,
@@ -126,6 +128,7 @@ export class Simulation {
       'crust_thermo_isostasy', 'crust_refresh_derived', 'crust_constraint_healing',
       'crust_accumulation', 'crust_commit_splits', 'crust_rewire_bonds', 'crust_clean_split',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
+      'crust_begin_constraints', 'crust_store_bond_count',
       'crust_clear_deltas', 'crust_solve_constraints', 'crust_solve_collisions', 'crust_apply_deltas',
       'crust_integrate',
     ];
@@ -192,7 +195,6 @@ export class Simulation {
       cu[base + co.particle_a] = B.a[k];
       cu[base + co.particle_b] = B.b[k];
       cf[base + co.rest_length] = B.restLength[k];
-      cf[base + co.compliance] = 0.001;
       cf[base + co.yield_stress_mpa] = state.yieldStressMPa;
       cu[base + co.is_active] = 1;
       cf[base + co.damage] = B.damage[k];
@@ -250,13 +252,20 @@ export class Simulation {
     run('crust_rewire_bonds', bonds);
     run('crust_clean_split', crust);
 
-    // Crust motion (position-based dynamics)
+    // Crust motion: overdamped XPBD. Predict where the mantle alone would
+    // carry each particle, then iterate bonds and collisions toward the
+    // minimum of drag + elastic energy.
     run('crust_predict', crust);
     run('crust_hash_clear', cells);
     run('crust_hash_build', crust);
-    for (let i = 0; i < SOLVER_ITERATIONS; i++) {
+    run('crust_clear_deltas', crust);
+    run('crust_begin_constraints', bonds); // reset lambda, count bonds per particle
+    run('crust_store_bond_count', crust);
+    for (let i = 0; i < this.params.solver_iterations; i++) {
       run('crust_clear_deltas', crust);
       run('crust_solve_constraints', bonds);
+      run('crust_apply_deltas', crust);
+      run('crust_clear_deltas', crust);
       run('crust_solve_collisions', crust);
       run('crust_apply_deltas', crust);
     }
@@ -316,6 +325,21 @@ function freeList(used, capacity) {
   for (let i = used; i < capacity; i++) data[FREE_LIST_HEADER_WORDS + n++] = i;
   data[0] = n;
   return data;
+}
+
+/**
+ * Bond stiffness over basal drag for a base-size particle, in 1/Myr.
+ * For a triangular network of central springs, the 2D (thickness-integrated)
+ * Young's modulus is E_2D = (2/sqrt 3) k, so k = (sqrt 3 / 2) E h_e,
+ * independent of spacing. Basal drag of a column is gamma = A eta / h_a.
+ * Positions are on the unit sphere, but the radius cancels in the ratio:
+ * both the drag term and the elastic energy scale with R^2.
+ */
+export function bondRate(p) {
+  const k = (Math.sqrt(3) / 2) * p.crust_youngs_modulus_gpa * 1e9 * p.elastic_thickness_km * 1e3; // N/m
+  const area = 2 * Math.sqrt(3) * (p.base_apothem * EARTH_RADIUS_M) ** 2;                          // m^2
+  const gamma = (area * p.asthenosphere_viscosity_pa_s) / (p.asthenosphere_thickness_km * 1e3);     // N s/m
+  return k / (gamma / SECONDS_PER_MYR);
 }
 
 export function nearestVertex(vertices, x, y, z) {

@@ -111,16 +111,30 @@ async function main() {
     });
   }
 
+  /** Load a hand-built state (same shape as generateInitialState's result). */
+  function loadState(state, run = { seed: null, init_options: 'custom' }) {
+    return exclusive(async () => {
+      sim.load(state);
+      initStats = { ...(state.stats ?? {}), seed: run.seed, ms: 0 };
+      recorder.reset({ ...run, restarted_from: null });
+    });
+  }
+
   /** Advance n steps without drawing (used by tests and scripts). */
   function runSteps(n) {
     return exclusive(async () => {
+      // Keep at most two steps in flight: queuing many slow steps at once can
+      // trip the browser's GPU watchdog, which kills the device.
+      const inFlight = [];
       for (let i = 0; i < n; i++) {
         const encoder = device.createCommandEncoder();
         sim.encodeStep(encoder);
         device.queue.submit([encoder.finish()]);
+        inFlight.push(device.queue.onSubmittedWorkDone());
+        if (inFlight.length > 2) await inFlight.shift();
         await captureIfDue();
       }
-      await device.queue.onSubmittedWorkDone();
+      await Promise.all(inFlight);
     });
   }
 
@@ -148,7 +162,7 @@ async function main() {
 
   window.plate = {
     sim, recorder, device, BUILD_INFO,
-    regenerate, runSteps, restoreFromZip,
+    regenerate, loadState, runSteps, restoreFromZip,
     setParams: (overrides) => exclusive(() => sim.setParams(overrides)),
     snapshot: () => exclusive(() => sim.snapshot()),
     restore: (snap) => exclusive(() => sim.restore(snap)),
@@ -192,7 +206,8 @@ async function main() {
         ['Bonds per particle', fmt(initStats.bondsPerParticle)],
         ['Continental fraction', fmt(initStats.continentalFraction)],
         ['Damaged bonds (>0.5)', fmt(initStats.damagedBondFraction)],
-        ['Worst initial overlap', typeof initStats.relaxResidual === 'number' ? `${(100 * initStats.relaxResidual).toFixed(1)}% of contact` : '–'],
+        ['Worst overlap after relaxing', typeof initStats.relaxResidual === 'number' ? `${(100 * initStats.relaxResidual).toFixed(1)}% of contact` : '–'],
+        ['Particles shrunk to fit', typeof initStats.shrunkFraction === 'number' ? `${(100 * initStats.shrunkFraction).toFixed(0)}% (smallest ${(100 * initStats.minApothemRatio).toFixed(0)}%)` : '–'],
         ['Setup time', `${fmt(initStats.ms, 0)} ms`],
         ['Steps', sim.steps],
         ['Simulated time', `${sim.timeMyr.toFixed(2)} Myr`],

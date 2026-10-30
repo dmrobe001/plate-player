@@ -1,31 +1,41 @@
-// Crust motion: position-based dynamics (PBD).
-//   1. predict:   drag velocity toward the mantle flow, predict new positions
+// Crust motion: overdamped XPBD (design.md 5.2).
+// Each step minimises  sum_i (gamma_i / 2 dt) |x_i - x~_i|^2 + U(x):
+// basal drag gamma_i plays the role of mass, and there is no inertia.
+//   1. predict:   x~ = where the mantle flow alone would carry the particle
 //   2. hash:      bin predicted positions into a uniform grid for collisions
-//   3. iterate:   bond constraints + collisions accumulate position corrections,
-//                 which are averaged and applied (Jacobi iteration)
-//   4. integrate: velocity = (predicted - old) / dt
+//   3. iterate:   bonds (XPBD, with accumulated multipliers lambda), then
+//                 collisions (position projection), each applied as a Jacobi sweep
+//   4. integrate: velocity = (x - x_old) / dt, a diagnostic only
+//
+// Units inside the solver: drag is relative to a base-size particle
+// (w_i = base_area / area_i is the inverse drag), and bond stiffness is
+// sim.bond_rate_myr_inv in those units, so compliance~ = 1 / (rate * dt).
+
+fn base_area() -> f32 {
+    return 3.4641 * sim.base_apothem * sim.base_apothem;
+}
+
+fn inverse_drag(i: u32) -> f32 {
+    return base_area() / particles[i].surface_area;
+}
 
 @compute @workgroup_size(64)
 fn crust_predict(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     let pos = particles[idx].position.xyz;
-    var vel = particles[idx].velocity.xyz;
     let node = particles[idx].mantle_node;
 
     let grid_vel = grid[node].velocity.xyz * sim.sh_grad_to_cm_yr * sim.cm_yr_to_sim_vel;
     var target_vel = grid_vel;
 
-    // Slab pull: a slab denser than the mantle is dragged along the flow.
+    // Slab pull, as an extra velocity (force / drag).
     if (particles[idx].state == 2u && particles[idx].density > sim.mantle_density) {
         let pull = (particles[idx].density - sim.mantle_density) * 0.02;
         target_vel += normalize(grid_vel + vec3f(0.001)) * pull;
     }
 
-    // Exact exponential relaxation toward the target: stable for any dt.
-    vel = target_vel + (vel - target_vel) * exp(-sim.drag_coeff_myr_inv * sim.dt_crust_myr);
-    particles[idx].predicted_pos = vec4f(normalize(pos + vel * sim.dt_crust_myr), 1.0);
-    particles[idx].velocity = vec4f(vel, 0.0);
+    particles[idx].predicted_pos = vec4f(normalize(pos + target_vel * sim.dt_crust_myr), 1.0);
 }
 
 @compute @workgroup_size(64)
@@ -54,6 +64,31 @@ fn crust_clear_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
+// Start of the solve: reset multipliers, and count each particle's bonds
+// (into particle_deltas.count, copied to bond_count by the next pass).
+@compute @workgroup_size(64)
+fn crust_begin_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
+    let c_idx = id.x;
+    if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
+    constraints[c_idx].lambda = 0.0;
+    atomicAdd(&particle_deltas[constraints[c_idx].particle_a].count, 1i);
+    atomicAdd(&particle_deltas[constraints[c_idx].particle_b].count, 1i);
+}
+
+@compute @workgroup_size(64)
+fn crust_store_bond_count(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+    particles[idx].bond_count = u32(atomicLoad(&particle_deltas[idx].count));
+}
+
+// One XPBD update per bond, C = |x_b - x_a| - rest_length:
+//   dlambda = (-C - a~ lambda) / (w_a + w_b + a~),  a~ = 1 / (stiffness * dt)
+//   dx_a = -w_a n dlambda,  dx_b = +w_b n dlambda
+// Bonds are updated simultaneously (Jacobi), so each dlambda is scaled by
+// 1 / max(bonds at either end). Scaling dlambda, not the applied dx, keeps
+// lambda consistent with the displacement it caused, so a converged solve is
+// the true minimum of drag + elastic energy.
 @compute @workgroup_size(64)
 fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
@@ -70,39 +105,35 @@ fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let dir = particles[pB].predicted_pos.xyz - particles[pA].predicted_pos.xyz;
-    let dist = max(length(dir), 0.0001);
+    let dist = max(length(dir), 1e-6);
     let n = dir / dist;
+    let C = dist - c.rest_length; // + stretched, - compressed
 
-    // Normal error: stretch (+) or compression (-) relative to rest length.
-    let err_n = dist - c.rest_length;
-    // "Shear" error: relative motion *this step* perpendicular to the bond.
-    let rel_move = (particles[pB].predicted_pos.xyz - particles[pB].position.xyz)
-                 - (particles[pA].predicted_pos.xyz - particles[pA].position.xyz);
-    let err_t = rel_move - dot(rel_move, n) * n;
+    // Damage softens tension, never compression.
+    let stiffness_factor = select(1.0, max(1.0 - c.damage, 1e-4), C > 0.0);
+    let alpha = 1.0 / (sim.bond_rate_myr_inv * stiffness_factor * sim.dt_crust_myr);
+    let wA = inverse_drag(pA);
+    let wB = inverse_drag(pB);
+    let degree = f32(max(max(particles[pA].bond_count, particles[pB].bond_count), 1u));
+    let dlambda = (-C - alpha * c.lambda) / (wA + wB + alpha) / degree;
+    constraints[c_idx].lambda = c.lambda + dlambda;
 
-    // Damage weakens tension and shear, but never compression.
-    let tension_factor = select(1.0, 1.0 - c.damage, err_n > 0.0);
-    let shear_factor = max(1.0 - c.damage, 0.1);
-    let total_corr = n * (err_n * tension_factor) + err_t * shear_factor;
-
-    // Strain -> stress (MPa) for yielding and for the stress display.
-    let modulus_mpa = sim.crust_youngs_modulus_gpa * 1000.0;
-    let sigma_n = err_n / c.rest_length * modulus_mpa;
-    let sigma_t = length(err_t) / c.rest_length * modulus_mpa;
-    constraints[c_idx].stress_normal_mpa = sigma_n * tension_factor;
-    constraints[c_idx].stress_shear_mpa = sigma_t * shear_factor;
+    // Stress (MPa) for yielding and display. Central bonds carry no shear;
+    // a real shear measure arrives with the per-particle strain fit (phase 4).
+    let sigma_n = sim.crust_youngs_modulus_gpa * 1000.0 * stiffness_factor * C / c.rest_length;
+    constraints[c_idx].stress_normal_mpa = sigma_n;
+    constraints[c_idx].stress_shear_mpa = 0.0;
 
     // Arrhenius-weakened yield stress; overstress accumulates damage.
-    let stress = sqrt(sigma_n * sigma_n + sigma_t * sigma_t);
     let temp = bond_temperature(c);
     let y = c.yield_stress_mpa * exp(clamp((sim.activation_energy / sim.gas_constant) * (1.0 / temp - 1.0 / sim.reference_temp), -10.0, 10.0));
-    if (stress > y) {
-        constraints[c_idx].damage = min(c.damage + ((stress - y) / y) * 50.0 * sim.dt_crust_myr, 1.0);
+    if (abs(sigma_n) > y) {
+        constraints[c_idx].damage = min(c.damage + ((abs(sigma_n) - y) / y) * 50.0 * sim.dt_crust_myr, 1.0);
     }
 
-    let corr = total_corr * 0.5;
-    add_delta(pA, corr, 1i);
-    add_delta(pB, -corr, 1i);
+    // count 0: bond corrections are applied in full (see crust_apply_deltas).
+    add_delta(pA, -wA * dlambda * n, 0i);
+    add_delta(pB, wB * dlambda * n, 0i);
 }
 
 @compute @workgroup_size(64)
@@ -145,7 +176,10 @@ fn crust_solve_collisions(@builtin(global_invocation_id) id: vec3<u32>) {
                         total_delta -= to_fixed((rel - dot(rel, dir / dist) * (dir / dist)) * 0.2);
                         coll_count++;
                     } else {
-                        total_delta += to_fixed((dir / dist) * overlap * 0.5);
+                        // Non-penetration, split in proportion to inverse drag.
+                        let w_i = inverse_drag(idx);
+                        let share = w_i / (w_i + inverse_drag(j));
+                        total_delta += to_fixed((dir / dist) * overlap * share);
                         coll_count++;
                     }
                 }
@@ -162,9 +196,11 @@ fn crust_apply_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     if (particles[idx].next_state == 2u) { particles[idx].state = 2u; }
-    let count = atomicLoad(&particle_deltas[idx].count);
-    if (count > 0i) {
-        let sum = vec3f(f32(atomicLoad(&particle_deltas[idx].dx)), f32(atomicLoad(&particle_deltas[idx].dy)), f32(atomicLoad(&particle_deltas[idx].dz)));
+    // Collision corrections are averaged over their count (position-based
+    // dynamics); bond corrections arrive with count 0 and are applied in full.
+    let count = max(atomicLoad(&particle_deltas[idx].count), 1i);
+    let sum = vec3f(f32(atomicLoad(&particle_deltas[idx].dx)), f32(atomicLoad(&particle_deltas[idx].dy)), f32(atomicLoad(&particle_deltas[idx].dz)));
+    if (any(sum != vec3f(0.0))) {
         particles[idx].predicted_pos = vec4f(normalize(particles[idx].predicted_pos.xyz + sum / (FIXED_POINT * f32(count))), 1.0);
     }
 }
@@ -173,6 +209,7 @@ fn crust_apply_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
 fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+    // Overdamped: velocity is not state, only a record of this step's motion.
     particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, 0.0);
     particles[idx].position = vec4f(particles[idx].predicted_pos.xyz, 1.0);
 }
