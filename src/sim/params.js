@@ -47,6 +47,7 @@ export const SIM_PARAMS = [
   ['base_apothem', 'f32', 0.0175],      // reference particle apothem
   ['split_area_factor', 'f32', 3.0],    // particle splits when area > factor * base hexagon area
   ['subduction_overlap', 'f32', 0.012], // overlap depth that triggers subduction
+  ['contact_margin', 'f32', 0.1],       // contacts are created for gaps below this fraction of the apothem sum
   // Spreading proxy (until design phase 8): crust over diverging mantle grows
   // in area at the divergence rate. With ~1%/Myr divergence over upwellings,
   // global crust production is ~0.5%/Myr of the surface (Earth: ~0.6%/Myr).

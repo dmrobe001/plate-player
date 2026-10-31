@@ -120,11 +120,11 @@ fn column_bottom(i: u32) -> f32 { return particles[i].elevation - lithosphere_th
 
 // Contact detection (design 3.2, 4.5). Two columns touch if they overlap in
 // map view *and* in depth; a slab below the overriding lithosphere passes
-// beneath it. Each touching pair without a bond gets a CONTACT edge for this
-// step, solved together with the bonds. Contacts are linearised per step:
-// a contact found here acts in both directions until the step ends (a
-// contact that opens during the step pulls slightly), which keeps the
-// iteration linear for Chebyshev acceleration (design.md, phase 3 findings).
+// beneath it. Each pair without a bond that touches, or nearly touches
+// (gap below contact_margin of the apothem sum), gets a CONTACT edge for
+// this step, solved together with the bonds. Contacts are one-sided: they
+// push, never pull (lambda >= 0). The margin catches pairs that the solve
+// pushes into contact during the step (design.md, phase 3 findings).
 //
 // Deep overlap between two surface columns triggers subduction instead: the
 // lower one becomes a slab at the end of the step (no contact between them).
@@ -150,9 +150,10 @@ fn crust_find_contacts(@builtin(global_invocation_id) id: vec3<u32>) {
             let next = particles[j].next_idx;
             iter++;
             if (j == idx) { j = next; continue; }
-            let overlap = (particles[idx].apothem + particles[j].apothem) - distance(pos_i, particles[j].predicted_pos.xyz);
+            let contact = particles[idx].apothem + particles[j].apothem;
+            let overlap = contact - distance(pos_i, particles[j].predicted_pos.xyz);
             let depth_overlap = min(column_top(idx), column_top(j)) > max(column_bottom(idx), column_bottom(j));
-            if (overlap <= 0.0 || !depth_overlap) { j = next; continue; }
+            if (overlap <= -sim.contact_margin * contact || !depth_overlap) { j = next; continue; }
 
             if (surface_i && particles[j].state == 1u && overlap > sim.subduction_overlap) {
                 let lower = select(j, idx, particles[idx].elevation < particles[j].elevation
@@ -259,9 +260,15 @@ fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     let wA = inverse_drag(pA);
     let wB = inverse_drag(pB);
     let degree = f32(max(max(particles[pA].edge_count, particles[pB].edge_count), 1u));
-    let dlambda = (-C - alpha * c.lambda) / (wA + wB + alpha) / degree;
+    var dlambda = (-C - alpha * c.lambda) / (wA + wB + alpha) / degree;
     let omega = chebyshev_omega();
-    constraints[c_idx].lambda = omega * (c.lambda + dlambda - c.lambda_prev) + c.lambda_prev;
+    var lambda = omega * (c.lambda + dlambda - c.lambda_prev) + c.lambda_prev;
+    if (c.kind == CONTACT) {
+        // One-sided: the total multiplier (push) never goes negative.
+        dlambda = max(c.lambda + dlambda, 0.0) - c.lambda;
+        lambda = max(lambda, 0.0);
+    }
+    constraints[c_idx].lambda = lambda;
     constraints[c_idx].lambda_prev = c.lambda;
 
     add_delta(pA, -wA * dlambda * n, 0i);
@@ -290,7 +297,8 @@ fn crust_bond_stress(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // Central bonds carry no shear; a real shear measure arrives with the
     // per-particle strain fit (design phase 4).
-    let sigma_n = sim.crust_youngs_modulus_gpa * 1000.0 * stiffness_factor * C / rest;
+    var sigma_n = sim.crust_youngs_modulus_gpa * 1000.0 * stiffness_factor * C / rest;
+    if (c.kind == CONTACT) { sigma_n = min(sigma_n, 0.0); } // an open contact carries nothing
     constraints[c_idx].stress_normal_mpa = sigma_n;
     constraints[c_idx].stress_shear_mpa = 0.0;
     if (c.kind == CONTACT) { return; } // no cohesion, nothing to damage
