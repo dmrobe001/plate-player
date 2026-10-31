@@ -92,3 +92,66 @@ test('east/north frame is orthonormal and tangent', () => {
     assert.ok(lat2 > lat);
   }
 });
+
+// --- plates ---------------------------------------------------------------
+import { eulerPole, labelPlates } from '../src/plates/plates.js';
+
+/** Synthetic network: rows of particles along the equator, bonded in chains. */
+function chains(lengths, { damagedBetween = [] } = {}) {
+  const n = lengths.reduce((a, b) => a + b, 0);
+  const P = { is_active: new Uint32Array(n).fill(1), state: new Uint32Array(n).fill(1), position: new Float32Array(4 * n), velocity: new Float32Array(4 * n) };
+  const a = [], b = [], damage = [];
+  let i = 0;
+  lengths.forEach((len, c) => {
+    for (let k = 0; k < len; k++, i++) {
+      const phi = i * 0.03, lat = c * 0.01;
+      P.position.set([Math.cos(lat) * Math.sin(phi), Math.sin(lat), Math.cos(lat) * Math.cos(phi)], 4 * i);
+      if (k > 0) { a.push(i - 1); b.push(i); damage.push(0); }
+    }
+    if (c > 0) { a.push(i - len - 1); b.push(i - len); damage.push(damagedBetween.includes(c) ? 1 : 0); } // link to previous chain
+  });
+  const C = { is_active: new Uint32Array(a.length).fill(1), particle_a: Uint32Array.from(a), particle_b: Uint32Array.from(b), damage: Float32Array.from(damage) };
+  return { P, C };
+}
+
+test('plates: components of intact bonds, persistent ids, split and merge events', () => {
+  // Two chains joined by an intact bond: one plate.
+  const joined = chains([30, 30]);
+  const first = labelPlates(joined.P, joined.C);
+  assert.equal(first.plates.length, 1);
+  assert.equal(first.plates[0].size, 60);
+
+  // Damage the joint: two plates; the larger share keeps the id, the other is a split.
+  const split = chains([30, 30], { damagedBetween: [1] });
+  const second = labelPlates(split.P, split.C, first);
+  assert.equal(second.plates.length, 2);
+  assert.ok(second.plates.some((p) => p.id === first.plates[0].id));
+  assert.deepEqual(second.events.map((e) => e.type), ['plate_split']);
+
+  // Heal it: back to one plate, and the other id is reported as absorbed.
+  const third = labelPlates(joined.P, joined.C, second);
+  assert.equal(third.plates.length, 1);
+  assert.deepEqual(third.events.map((e) => e.type), ['plate_merge']);
+
+  // Components below the minimum size are not plates.
+  const small = chains([10]);
+  assert.equal(labelPlates(small.P, small.C).plates.length, 0);
+});
+
+test('plates: Euler pole recovers a rigid rotation, and the residual measures non-rigid motion', () => {
+  const { P, C } = chains([40, 40]);
+  const omega = [0.002, -0.001, 0.003]; // rad/Myr
+  const n = P.is_active.length;
+  for (let i = 0; i < n; i++) {
+    const r = P.position.subarray(4 * i, 4 * i + 3);
+    P.velocity.set([omega[1] * r[2] - omega[2] * r[1], omega[2] * r[0] - omega[0] * r[2], omega[0] * r[1] - omega[1] * r[0]], 4 * i);
+  }
+  const [plate] = labelPlates(P, C).plates;
+  const rigid = eulerPole(P, plate.members);
+  rigid.omega.forEach((w, k) => assert.ok(Math.abs(w - omega[k]) < 1e-6, `omega ${rigid.omega}`));
+  assert.ok(rigid.rigidityResidual < 1e-4, `residual ${rigid.rigidityResidual}`);
+
+  // Add a non-rigid stretch: the residual grows accordingly.
+  for (let i = 0; i < n; i++) P.velocity[4 * i] += 1e-3 * (i / n - 0.5);
+  assert.ok(eulerPole(P, plate.members).rigidityResidual > 0.05);
+});

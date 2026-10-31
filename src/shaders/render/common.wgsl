@@ -4,7 +4,7 @@ struct View {
     view_proj: mat4x4f,
     light_dir: vec4f,
     stress_ref_mpa: f32,   // stress at which a stress line is one apothem wide
-    flags: u32,            // bit 0: normal-stress lines, bit 1: shear ticks
+    flags: u32,            // bit 0: normal-stress lines, bit 1: shear ticks, bit 2: colour by plate
     _pad0: f32,
     _pad1: f32,
 }
@@ -12,6 +12,7 @@ struct View {
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<storage, read> constraints: array<Constraint>;
 @group(0) @binding(2) var<storage, read> grid: array<GridNode>;
+@group(0) @binding(3) var<storage, read> plate_ids: array<u32>;   // from PlateTracker
 @group(1) @binding(0) var<uniform> view: View;
 @group(1) @binding(1) var<uniform> sim: SimParams;
 

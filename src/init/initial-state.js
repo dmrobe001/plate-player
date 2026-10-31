@@ -108,14 +108,19 @@ export function generateInitialState(numMantleNodes, options = {}) {
   const bonds = buildBonds(position, opt.bondCutoff * contact, opt.maxBondsPerParticle);
 
   // 5. Damage along warped Voronoi borders, evaluated at bond midpoints.
-  const borderDistance = plateBorderField(rng, opt.plateCount, opt.boundaryWarp);
+  //    Any bond joining particles in different cells is fully damaged, so
+  //    the borders really separate plates; the smooth band around them
+  //    weakens their surroundings.
+  const plateField = plateBorderField(rng, opt.plateCount, opt.boundaryWarp);
+  const cell = new Uint16Array(n);
+  for (let i = 0; i < n; i++) cell[i] = plateField(position[3 * i], position[3 * i + 1], position[3 * i + 2]).cell;
   const [w0, w1] = opt.boundaryWidth.map((w) => w * contact);
   let damaged = 0;
   for (let k = 0; k < bonds.count; k++) {
     const i = bonds.a[k], j = bonds.b[k];
-    const g = borderDistance(
+    const { border } = plateField(
       position[3 * i] + position[3 * j], position[3 * i + 1] + position[3 * j + 1], position[3 * i + 2] + position[3 * j + 2]);
-    bonds.damage[k] = 1 - smoothstep(w0, w1, g);
+    bonds.damage[k] = cell[i] !== cell[j] ? 1 : 1 - smoothstep(w0, w1, border);
     damaged += bonds.damage[k] > 0.5;
   }
 
@@ -199,15 +204,16 @@ function buildBonds(position, cutoff, maxBonds) {
 }
 
 /**
- * Returns g(x, y, z): for a point (any length, projected to the sphere), the
- * difference between the angular distances to its second-nearest and nearest
- * plate centre. g = 0 exactly on a Voronoi border and grows away from it.
- * The point is first displaced by vector noise so borders are not geodesics.
+ * Returns f(x, y, z) -> {cell, border} for a point (any length, projected to
+ * the sphere): the index of the nearest plate centre, and the difference
+ * between the angular distances to the second-nearest and nearest centres
+ * (0 exactly on a Voronoi border, growing away from it). The point is first
+ * displaced by vector noise so borders are not geodesics.
  */
 function plateBorderField(rng, plateCount, warp) {
   const centres = Array.from({ length: plateCount }, () => randomOnSphere(rng));
   const warpNoise = createPerlin3(rng);
-  return function borderDistance(x, y, z) {
+  return function plateField(x, y, z) {
     let len = Math.hypot(x, y, z);
     x /= len; y /= len; z /= len;
     const wx = fbm(warpNoise, 2 * x + 11.3, 2 * y, 2 * z, 3);
@@ -217,11 +223,11 @@ function plateBorderField(rng, plateCount, warp) {
     len = Math.hypot(x, y, z);
     x /= len; y /= len; z /= len;
 
-    let best = -2, second = -2; // largest dot products = smallest angles
-    for (const c of centres) {
+    let best = -2, second = -2, cell = 0; // largest dot products = smallest angles
+    centres.forEach((c, k) => {
       const d = x * c[0] + y * c[1] + z * c[2];
-      if (d > best) { second = best; best = d; } else if (d > second) second = d;
-    }
-    return Math.acos(Math.min(1, second)) - Math.acos(Math.min(1, best));
+      if (d > best) { second = best; best = d; cell = k; } else if (d > second) second = d;
+    });
+    return { cell, border: Math.acos(Math.min(1, second)) - Math.acos(Math.min(1, best)) };
   };
 }

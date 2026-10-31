@@ -557,7 +557,7 @@ Each phase ends with a check that could fail. Two kinds:
 | 2 ✅ (partly) | **Overdamped XPBD core:** drag as mass, real compliance. *Changed:* λ-consistent Jacobi instead of graph-coloured Gauss–Seidel (see below) | Two-particle relaxation matches implicit Euler, (1 + dt/τ)⁻ⁿ with τ = γ/2k, to 0.1% at dt/τ = 0.1, 1, 10 (kept as a test). Whole-planet dt-independence **not met**: blocked on plate-scale convergence (findings below) |
 | 3 | **Unified edges + column contacts + free radius & buoyancy** | Thickened block relaxes to Airy height (Generator: thickened block) |
 | 4 | **Neighbour-fit strain + orientation**, stress-tensor glyphs | Rigid rotation → strain < 10⁻⁶; uniaxial stretch → set Poisson ratio ±5% |
-| 5 | **Plate coarse level** (labelling, Euler poles) | Push one edge of an isolated plate: far edge responds in one step; iterations needed do not grow with N |
+| 5 (identification ✅; coarse solve: redesign question) | **Plate coarse level** (labelling, Euler poles) | Labelling, persistent ids, split/merge events and Euler-pole fits are unit-tested on synthetic networks. The coarse *solve* does not fit the XPBD formulation (findings below) |
 | 6 | **Lithosphere column:** thermal age, depth–age, GPE force | Ridge Generator reproduces depth ∝ √age |
 | 7 | **Subduction:** initiation rule, slab particles, bending directors | Line-load flexure profile within 10% at 50 km; plate speed correlates positively with slab-attached perimeter in free runs |
 | 8 | **Volume conservation, collision, suturing, arcs** | Uniform-convergence Generator thickens at the predicted rate; continent never subducts |
@@ -599,6 +599,40 @@ The order is chosen so that phases 0–4 already improve the current game output
 
 **Re-ordering (agreed):** Chebyshev acceleration of the Jacobi sweeps first, then
 phase 5 (plates as a coarse level), then phases 3–4.
+
+### Phase 5 findings: plate identification done, coarse solve reconsidered
+
+- **Identification** (`src/plates/`): plates are connected components of intact bonds,
+  found exactly by union-find on the CPU every 0.25 Myr (milliseconds for 10⁴
+  particles; no extra GPU state). Ids persist by majority inheritance, which yields
+  `plate_split`, `plate_merge` and `plate_lost` events (the event log of §8.3 tier d).
+  Records gain a `plate_id` field (nearest-particle sampling; ids are not averaged), a
+  plate time series and `events.json`.
+- **Initial condition fix:** the Voronoi damage bands didn't actually separate plates.
+  Bonds crossing a border with their midpoint just outside the damaged core kept
+  damage < 0.5, so seed 1 was one global plate. Bonds joining different Voronoi cells
+  now start fully damaged: 12 plates for every seed tried.
+- **Kinematics** are fitted to each particle's displacement over the labelling interval
+  (a finite rotation), not the one-step velocity, which at ~1 cm/yr is comparable to the
+  solver's per-step tolerance.
+- **The coarse rigid-body solve doesn't fit the drag-as-mass XPBD formulation.**
+  Positions always satisfy x − x̃ = W Bᵀλ, and central bond forces exert no net torque,
+  so every plate's drag-weighted net rotation is *already exact at every iteration*.
+  What converges slowly is the distribution of force within a plate (the multipliers).
+  Moving positions rigidly without a matching λ would change the physics, and a
+  matching λ requires the global solve we are trying to accelerate. Chebyshev (32
+  iterations, ~3 MPa residual) has taken the coarse level's convergence job at 220 km.
+- **Measured (seed 1, early run):** plates move at ~0.5 mm/yr rms, because the mantle
+  pattern hasn't developed. The non-rigid part is 0.1–0.3 mm/yr, about 50 m per
+  0.25 Myr, consistent with elastic flexing at MPa stresses, and evenly spread over
+  intact interiors and damaged edges (not floppy edges). Rigidity can't be judged
+  until the mantle actually drives the plates.
+- **Options for the coarse level**, if it is needed at 50 km where iterations grow
+  as √(κ·dt) (~4× more):
+  1. a primal (position-based) formulation, e.g. vertex block descent (Chen et al.
+     2024), where a plate-rigid initial guess and coarse corrections are legitimate;
+  2. hierarchical constraints (Müller 2008), coarser particles linked to fine ones;
+  3. keep Chebyshev and spend iterations; measure at 50 km before deciding.
 
 ### Chebyshev acceleration (between phases 2 and 5)
 

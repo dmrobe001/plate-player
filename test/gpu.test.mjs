@@ -303,6 +303,12 @@ test('record ZIP is complete and self-consistent', { timeout: 300_000 }, async (
   for (let k = 0; k < manifest.mesh.nodes; k++) if (support[k] > 0.5) (height[k] > 0 ? land++ : sea++);
   assert.ok(land > 0.1 * (land + sea) && sea > 0.4 * (land + sea), `step-0 land/sea split ${land}/${sea}`);
 
+  const platesSeries = JSON.parse(new TextDecoder().decode(files.get(manifest.plates.file)));
+  assert.ok(platesSeries.length >= 1 && platesSeries.at(-1).plates.length >= 5, 'plate series missing or too few plates');
+  const plateIds = new Set(field('plate_id').filter((v) => v > 0));
+  assert.ok(plateIds.size >= 5, `only ${plateIds.size} plate ids in the plate_id field`);
+  assert.ok(Array.isArray(JSON.parse(new TextDecoder().decode(files.get(manifest.events.file)))));
+
   assert.ok(manifest.snapshots.length >= 1);
   for (const snap of manifest.snapshots) {
     for (const { file, bytes } of Object.values(snap.buffers)) assert.equal(files.get(file)?.length, bytes, file);

@@ -5,6 +5,8 @@
 // intensive (point-value) estimate; it does not conserve integrals exactly.
 // `support` = sum(w) / (2 pi sigma^2) is ~1 under continuous crust and falls
 // toward 0 in gaps, so consumers can tell "thin crust" from "no crust".
+// Categorical channels (ids) are not averaged: each node takes the value of
+// its most heavily weighted particle.
 
 import { CellList } from '../init/cell-list.js';
 
@@ -15,7 +17,7 @@ import { CellList } from '../init/cell-list.js';
  * @param sigma     kernel width (unit sphere)
  * @returns {support: Float32Array, [name]: Float32Array per node (NaN where no particle within cutoff)}
  */
-export function sampleToMesh(nodes, particles, channels, sigma) {
+export function sampleToMesh(nodes, particles, channels, sigma, nearestChannels = {}) {
   const nNodes = nodes.length / 3;
   const nParticles = particles.position.length / 3;
   const cutoff = 3 * sigma;
@@ -30,6 +32,9 @@ export function sampleToMesh(nodes, particles, channels, sigma) {
   const wsum = Object.fromEntries(names.map((n) => [n, new Float64Array(nNodes)]));
   const support = new Float64Array(nNodes);
   const inv2s2 = 1 / (2 * sigma * sigma);
+  const nearestNames = Object.keys(nearestChannels);
+  const nearestW = new Float64Array(nNodes);
+  const nearestP = new Int32Array(nNodes).fill(-1);
 
   new CellList(all, cutoff).forEachPair((i, j, dx, dy, dz, d) => {
     const iIsNode = i >= nParticles, jIsNode = j >= nParticles;
@@ -38,6 +43,7 @@ export function sampleToMesh(nodes, particles, channels, sigma) {
     const p = iIsNode ? j : i;
     const w = particles.area[p] * Math.exp(-d * d * inv2s2);
     support[node] += w;
+    if (w > nearestW[node]) { nearestW[node] = w; nearestP[node] = p; }
     for (const n of names) {
       const v = channels[n][p];
       if (Number.isNaN(v)) continue;
@@ -48,6 +54,8 @@ export function sampleToMesh(nodes, particles, channels, sigma) {
 
   const out = { support: Float32Array.from(support, (s) => s / (2 * Math.PI * sigma * sigma)) };
   for (const n of names) out[n] = Float32Array.from(sum[n], (s, k) => (wsum[n][k] > 0 ? s / wsum[n][k] : NaN));
+  // Categorical channels (ids) take the value of the most heavily weighted particle.
+  for (const n of nearestNames) out[n] = Float32Array.from(nearestP, (p) => (p >= 0 ? nearestChannels[n][p] : NaN));
   return out;
 }
 

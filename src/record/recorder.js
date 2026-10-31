@@ -25,6 +25,7 @@ export const FIELDS = [
   { name: 'velocity_north', units: 'mm yr-1', long_name: 'northward surface velocity', kind: 'intensive' },
   { name: 'bond_damage', units: '1', long_name: 'mean damage of bonds attached to the crust', kind: 'intensive' },
   { name: 'slab_fraction', units: '1', long_name: 'fraction of nearby crust that is subducting slab', kind: 'intensive' },
+  { name: 'plate_id', units: '1', long_name: 'plate id (0 = not part of a plate); see plates/plates.json', kind: 'categorical' },
   { name: 'support', units: '1', long_name: 'crust coverage: ~1 under continuous crust, 0 in gaps', kind: 'diagnostic' },
 ];
 
@@ -35,8 +36,9 @@ export const RECORD_DEFAULTS = {
 };
 
 export class Recorder {
-  constructor(sim, options = {}) {
+  constructor(sim, options = {}, plates = null) {
     this.sim = sim;
+    this.plates = plates; // PlateTracker, optional
     this.options = { ...RECORD_DEFAULTS, ...options };
     const ico = createIcosphere(this.options.meshSubdivisions);
     this.mesh = {
@@ -76,10 +78,10 @@ export class Recorder {
     };
   }
 
-  /** Read back GPU state and store the requested tiers. */
-  async capture({ fields = true, snapshot = false }) {
+  /** Read back GPU state (unless `snap` is given) and store the requested tiers. */
+  async capture({ fields = true, snapshot = false }, snap = null) {
     if (!fields && !snapshot) return;
-    const snap = await this.sim.snapshot(); // one readback serves both tiers
+    snap ??= await this.sim.snapshot(); // one readback serves both tiers
     if (snapshot) this.snapshots.push(snap);
     if (fields) this.samples.push({ step: snap.step, timeMyr: snap.timeMyr, fields: this.#sampleFields(snap.buffers) });
   }
@@ -102,7 +104,9 @@ export class Recorder {
     const n = active.length;
     const position = new Float32Array(3 * n);
     const area = new Float32Array(n);
-    const ch = Object.fromEntries(FIELDS.filter((f) => f.name !== 'support').map((f) => [f.name, new Float32Array(n)]));
+    const ch = Object.fromEntries(FIELDS.filter((f) => f.kind !== 'diagnostic' && f.kind !== 'categorical').map((f) => [f.name, new Float32Array(n)]));
+    const plateIds = this.plates?.state?.ids;
+    const plateChannel = new Float32Array(n);
     active.forEach((i, k) => {
       const x = P.position[4 * i], y = P.position[4 * i + 1], z = P.position[4 * i + 2];
       position.set([x, y, z], 3 * k);
@@ -120,9 +124,10 @@ export class Recorder {
       ch.velocity_north[k] = nan((vx * north[0] + vy * north[1] + vz * north[2]) * EARTH_RADIUS_KM);
       ch.bond_damage[k] = surface && bondCount[i] > 0 ? damageSum[i] / bondCount[i] : NaN;
       ch.slab_fraction[k] = surface ? 0 : 1;
+      plateChannel[k] = plateIds ? plateIds[i] : 0;
     });
     // Kernel width = one base particle spacing (~ the record mesh spacing).
-    return sampleToMesh(this.mesh.positions, { position, area }, ch, 2 * params.base_apothem);
+    return sampleToMesh(this.mesh.positions, { position, area }, ch, 2 * params.base_apothem, { plate_id: plateChannel });
   }
 
   manifest() {
@@ -173,6 +178,14 @@ export class Recorder {
         step: { file: 'fields/step.u32', dtype: 'uint32', shape: [T] },
         variables: FIELDS.map((f) => ({ ...f, file: `fields/${f.name}.f32`, dtype: 'float32', shape: [T, nNodes] })),
       },
+      plates: this.plates && {
+        file: 'plates/plates.json',
+        description: 'plates are connected components of intact bonds (damage < 0.5) between surface particles; ids persist across relabelling',
+        interval_myr: this.plates.intervalMyr,
+        columns: { size: 'particles', pole_lat_deg: 'Euler pole', pole_lon_deg: 'Euler pole', rate_deg_per_myr: 'rotation rate about the pole', rigidity_residual: 'rms(v - omega x r) / rms(v): 0 = perfectly rigid', rms_speed_mm_per_yr: 'rms particle speed', rms_nonrigid_speed_mm_per_yr: 'rms of v - omega x r' },
+        kinematics: 'poles and rates fitted to each particle\'s displacement since the previous labelling (finite rotation over interval_myr)',
+      },
+      events: this.plates && { file: 'events.json', types: ['plate_split', 'plate_merge', 'plate_lost'] },
       snapshots: this.snapshots.map((s) => ({
         step: s.step,
         time_myr: s.timeMyr,
@@ -201,6 +214,10 @@ export class Recorder {
       const series = new Float32Array(this.samples.length * nNodes);
       this.samples.forEach((s, t) => series.set(s.fields[f.name], t * nNodes));
       entries.push({ name: `fields/${f.name}.f32`, data: series });
+    }
+    if (this.plates) {
+      entries.push({ name: 'plates/plates.json', data: JSON.stringify(this.plates.series) });
+      entries.push({ name: 'events.json', data: JSON.stringify(this.plates.events, null, 1) });
     }
     for (const s of this.snapshots) {
       for (const b of STATE_BUFFERS) entries.push({ name: `${snapshotDir(s.step)}/${b}.bin`, data: s.buffers[b] });

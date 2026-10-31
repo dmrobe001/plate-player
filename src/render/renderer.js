@@ -25,14 +25,14 @@ export class Renderer {
 
     const visibility = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
     const storageLayout = device.createBindGroupLayout({
-      entries: [0, 1, 2].map((binding) => ({ binding, visibility, buffer: { type: 'read-only-storage' } })),
+      entries: [0, 1, 2, 3].map((binding) => ({ binding, visibility, buffer: { type: 'read-only-storage' } })),
     });
     const uniformLayout = device.createBindGroupLayout({
       entries: [0, 1].map((binding) => ({ binding, visibility, buffer: { type: 'uniform' } })),
     });
     this.storageBindGroup = device.createBindGroup({
       layout: storageLayout,
-      entries: [sim.buffers.particles, sim.buffers.constraints, sim.buffers.grid]
+      entries: [sim.buffers.particles, sim.buffers.constraints, sim.buffers.grid, sim.buffers.plateIds]
         .map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
     this.uniformBindGroup = device.createBindGroup({
@@ -77,7 +77,7 @@ export class Renderer {
     f.set(view.viewProj, 0);
     f.set([...view.lightDir, 0], 16);
     f[20] = view.stressRefMPa;
-    u[21] = (view.showNormal ? 1 : 0) | (view.showShear ? 2 : 0);
+    u[21] = (view.showNormal ? 1 : 0) | (view.showShear ? 2 : 0) | (view.colorByPlate ? 4 : 0);
     this.device.queue.writeBuffer(this.viewBuffer, 0, this.viewData);
 
     const pass = encoder.beginRenderPass({

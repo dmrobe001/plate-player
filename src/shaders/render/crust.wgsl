@@ -19,6 +19,18 @@ fn elevation_color(h: f32) -> vec3f {
     return mix(c, vec3f(0.95, 0.95, 0.97), smoothstep(3.0, 4.5, h));
 }
 
+// Distinct colour per plate id: golden-angle hue steps (same as plateColor in
+// src/plates/plates.js); grey for "not a plate".
+fn plate_color(id: u32) -> vec3f {
+    if (id == 0u) { return vec3f(0.35); }
+    let h = (f32(id) * 137.508) % 360.0;
+    let s = 0.55;
+    let l = 0.55;
+    let a = s * min(l, 1.0 - l);
+    let k = (vec3f(0.0, 8.0, 4.0) + h / 30.0) % vec3f(12.0);
+    return l - a * max(vec3f(-1.0), min(min(k - 3.0, 9.0 - k), vec3f(1.0)));
+}
+
 // Orthonormal tangent vectors at unit normal n.
 fn tangent_frame(n: vec3f) -> mat2x3f {
     let helper = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n.y) > 0.9);
@@ -48,6 +60,7 @@ fn vs_disc(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Di
     out.uv = uv;
 
     var color = elevation_color(p.elevation - sim.sea_level);
+    if ((view.flags & 4u) != 0u) { color = plate_color(plate_ids[i]) * mix(0.75, 1.1, smoothstep(-6.0, 4.0, p.elevation - sim.sea_level)); }
     if (p.state == 2u) { color *= 0.45; } // subducting slab: darkened
     let light = 0.55 + 0.45 * max(dot(n, view.light_dir.xyz), 0.0);
     out.color = color * light;

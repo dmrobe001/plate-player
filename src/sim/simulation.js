@@ -55,6 +55,7 @@ export class Simulation {
       hashGrid: device.createBuffer({ label: 'hash grid', size: hashGridDim ** 3 * 4, usage: S }),
       deltas: device.createBuffer({ label: 'particle deltas', size: maxParticles * 16, usage: S }),
       solver: device.createBuffer({ label: 'solver state', size: (4 + MAX_SOLVER_ITERATIONS) * 4, usage: S }),
+      plateIds: device.createBuffer({ label: 'plate ids (drawing only)', size: maxParticles * 4, usage: S }),
       params: device.createBuffer({ label: 'sim params', size: SIM_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
     };
 
@@ -285,6 +286,11 @@ export class Simulation {
     pass.end();
     this.steps++;
     this.timeMyr += this.params.dt_crust_myr;
+  }
+
+  /** Plate id per particle slot, from PlateTracker; used only for drawing. */
+  setPlateIds(ids) {
+    this.device.queue.writeBuffer(this.buffers.plateIds, 0, ids);
   }
 
   /** Copy named GPU buffers to the CPU. Resolves to {name: ArrayBuffer}. */

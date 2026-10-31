@@ -11,6 +11,7 @@ import { Simulation } from './sim/simulation.js';
 import { Renderer } from './render/renderer.js';
 import { OrbitCamera } from './render/camera.js';
 import { Recorder, snapshotFromZip } from './record/recorder.js';
+import { PlateTracker } from './plates/tracker.js';
 import { BUILD_INFO } from './build-info.js';
 
 const MANTLE_SUBDIVISIONS = 3; // 642 mantle nodes
@@ -46,7 +47,8 @@ async function main() {
   const sim = new Simulation(device, icosphere, reportError);
   const renderer = new Renderer(device, context, format, sim, reportError);
   const camera = new OrbitCamera(canvas);
-  const recorder = new Recorder(sim);
+  const plates = new PlateTracker(sim);
+  const recorder = new Recorder(sim, {}, plates);
 
   const query = new URLSearchParams(location.search);
   const urlSeed = Number.parseInt(query.get('seed'), 10);
@@ -76,11 +78,16 @@ async function main() {
   $('snapshotInterval').addEventListener('change', syncRecorderOptions);
   syncRecorderOptions();
 
+  // One readback serves plate labelling and recording when either is due.
   async function captureIfDue(force = {}) {
-    if (!$('recordOn').checked && !force.snapshot) return;
-    const due = $('recordOn').checked ? recorder.due() : { fields: false, snapshot: false };
+    const recording = $('recordOn').checked;
+    const due = recording ? recorder.due() : { fields: false, snapshot: false };
     const want = { fields: due.fields || !!force.fields, snapshot: due.snapshot || !!force.snapshot };
-    if (want.fields || want.snapshot) await recorder.capture(want);
+    const platesDue = plates.due() || want.fields;
+    if (!platesDue && !want.fields && !want.snapshot) return;
+    const snap = await sim.snapshot();
+    if (platesDue) plates.update(snap);
+    if (want.fields || want.snapshot) await recorder.capture(want, snap);
   }
 
   function regenerate(seed = Number.parseInt($('seed').value, 10) || 0, options = {}) {
@@ -92,6 +99,7 @@ async function main() {
       sim.load(state);
       initStats = { ...state.stats, seed, ms: performance.now() - t0 };
       recorder.reset({ seed, init_options: initOptions, init_stats: state.stats, restarted_from: null });
+      plates.reset();
       await captureIfDue({ fields: true, snapshot: true });
     });
   }
@@ -107,6 +115,7 @@ async function main() {
         ...manifest.run,
         restarted_from: { source: sourceName, build: manifest.model.build, step: snapshot.step, time_myr: snapshot.timeMyr },
       });
+      plates.reset(); // plate ids restart from 1 after a resume
       await captureIfDue({ fields: true, snapshot: true });
     });
   }
@@ -117,6 +126,7 @@ async function main() {
       sim.load(state);
       initStats = { ...(state.stats ?? {}), seed: run.seed, ms: 0 };
       recorder.reset({ ...run, restarted_from: null });
+      plates.reset();
     });
   }
 
@@ -161,7 +171,7 @@ async function main() {
   showStressRef();
 
   window.plate = {
-    sim, recorder, device, BUILD_INFO,
+    sim, recorder, plates, device, BUILD_INFO,
     regenerate, loadState, runSteps, restoreFromZip,
     setParams: (overrides) => exclusive(() => sim.setParams(overrides)),
     snapshot: () => exclusive(() => sim.snapshot()),
@@ -190,6 +200,7 @@ async function main() {
       viewProj: camera.viewProjection(w / h),
       lightDir: camera.lightDirection(),
       showMantle: $('showMantle').checked,
+      colorByPlate: $('colorByPlate').checked,
       showNormal: $('showNormal').checked,
       showShear: $('showShear').checked,
       stressRefMPa: stressRef(),
@@ -212,6 +223,10 @@ async function main() {
         ['Steps', sim.steps],
         ['Simulated time', `${sim.timeMyr.toFixed(2)} Myr`],
         ['Mantle substeps', sim.mantleSubsteps],
+        ['Plates', `${plates.summary.length} (${plates.summary.filter((p) => p.size >= 100).length} with ≥100 particles)`],
+        ['Plate speed (median rms)', Number.isFinite(plates.median('rms_speed_mm_per_yr')) ? `${plates.median('rms_speed_mm_per_yr').toFixed(2)} mm/yr` : '–'],
+        ['Non-rigid part', Number.isFinite(plates.median('rms_nonrigid_speed_mm_per_yr')) ? `${plates.median('rms_nonrigid_speed_mm_per_yr').toFixed(2)} mm/yr` : '–'],
+        ['Plate events', plates.events.length],
         ['Recorded', `${recorder.samples.length} fields, ${recorder.snapshots.length} snapshots`],
         ['Record size', `${(recorder.sizeBytes / 2 ** 20).toFixed(1)} MiB`],
         ['Build', `${String(BUILD_INFO.commit).slice(0, 7)}${BUILD_INFO.dirty ? '+' : ''}`],

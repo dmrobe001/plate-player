@@ -41,6 +41,7 @@ the seed in the URL: `plate-player.html?seed=42`.
 | White line between centres | Bond in **tension**. Width ∝ normal stress |
 | Black tick across a bond's midpoint | **Shear** stress on the bond. Width ∝ shear stress; length = one hexagon edge (the "face" between the two particles) |
 | Background sphere | Mantle grid, coloured by flow divergence: orange = upwelling, blue = downwelling |
+| **Colour by plate** | Each plate in its own colour; grey particles belong to no plate (fragments under 20 particles, or slabs) |
 
 Line width = mean apothem × |σ| / σ_ref, capped at one apothem. σ_ref is the
 **Line scale** slider (log scale, default ≈ the 150 MPa yield stress).
@@ -81,6 +82,13 @@ after the solve. With the default physical
 values a single bond relaxes in ~40 years, so every step (16 kyr) is effectively
 quasi-static: what limits rigidity at plate scale is solver convergence, not E (see
 design.md, phase 2).
+
+**Plates** (`src/plates/`). A plate is a connected component of intact bonds
+(damage < 0.5) between surface particles, found exactly on the CPU every 0.25 Myr from a
+readback. Plate ids persist from one labelling to the next (each component inherits the
+id most of its particles had), so splits and merges show up as events. Each plate gets
+an Euler pole fitted to its particles' displacement over the interval, plus its rms
+speed and the rms of the non-rigid part.
 
 **Growth and subduction** (`growth.wgsl`, `solver.wgsl`, `thermal.wgsl`). Particles
 over strong divergence grow in area. Past 3× the base area they split, and the
@@ -134,6 +142,9 @@ plate-player/
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
+│   ├── plates/
+│   │   ├── plates.js          plate labelling (union-find), persistent ids, Euler-pole fit
+│   │   └── tracker.js         relabels during a run; plate series and event log for records
 │   ├── record/
 │   │   ├── recorder.js        record schedule, manifest, snapshots, ZIP export / resume
 │   │   ├── sampling.js        particles -> fixed mesh (Gaussian kernel), geographic frame
@@ -315,6 +326,11 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       |ψ| falls from 0.05 to 0.009 in the first 1.6 Myr) and plates drift at
       ~1–2 cm/yr. (Inherited from the Phase 5 constants.) Either start ψ from a
       developed pattern or raise `mantle_time_per_myr`.
+- [ ] **Plates barely move for the first hundreds of Myr** (rms ~0.5 mm/yr, because of
+      the slow mantle spin-up above), so plate kinematics and rigidity can't be judged
+      yet. Note also that a developed pattern (|ψ| ~ 0.5, k₀ = 4) times
+      `sh_grad_to_cm_yr` = 25 would give ~50 cm/yr, so the spin-up and the velocity
+      scale should be fixed together.
 - [ ] **Mantle has no toroidal (rotational) flow.** Velocity = −∇ψ is curl-free, so
       transform-style motion arises only from crust interactions.
 - [x] ~~Mantle time had no stated relation to Myr, and the explicit step size was
