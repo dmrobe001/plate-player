@@ -748,6 +748,37 @@ solving mantle fluid dynamics.
 - *Not yet coupled:* crust → mantle feedback (continents warm the mantle beneath them;
   slabs should become the dominant cold downwellings, replacing random drips).
 
+**Measured: driven plates, and what deforms them** (seed 1, 70 GPa, 8 warm-up + 16
+measured steps; non-rigid = rms of v − ω×r per plate; interiors = 5+ bonds from a broken
+bond; one-off, SwiftShader):
+
+| configuration | median plate speed | non-rigid, all | non-rigid, interiors | damaged bonds (start 9.4%) |
+|---|---|---|---|---|
+| Chebyshev 32 iterations, growth on | 2.5 cm/yr | 1.20 cm/yr | 0.47 cm/yr | 11.1% |
+| Chebyshev 32, **growth off** | 1.0 cm/yr | 0.38 cm/yr | 0.13 cm/yr | 9.4% (none new) |
+| plain Jacobi 32, growth off | 2.4 cm/yr | 1.09 cm/yr | 0.94 cm/yr | 10.6% |
+| plain Jacobi 64, growth on | 2.1 cm/yr | 1.02 cm/yr | 0.80 cm/yr | 10.6% |
+
+- **The spreading proxy is the main source of deformation and damage.** It grows
+  particles *inside* plates over upwellings; bonds keep their rest lengths while
+  collisions push to the new apothem sum, injecting strain (~0.4% per 0.4 Myr, i.e.
+  ~250 MPa at 70 GPa). That is also why more Chebyshev iterations looked *worse* in an
+  earlier run (128 iterations: non-rigid 2.8 cm/yr, damage 19.6% after 48 steps): a
+  better-converged solve resolves the conflict harder. Real crust is not created inside
+  plates, only where plates separate.
+- **Chebyshev does pay off:** without growth, interiors are ~7× more rigid than with
+  plain Jacobi at the same iteration count.
+- **Remaining non-rigidity** (~1 mm/yr in interiors, against ~0.1 mm/yr expected for
+  elastic plates at MPa stresses) is under-convergence: the measurement to repeat at
+  higher resolution (above).
+- **Plate speeds** with the 4 cm/yr mantle: 1–6 cm/yr per plate (median ~1 cm/yr
+  without the growth artefact). Earth's rms is ~4 cm/yr, but the fast plates are
+  slab-driven, and slab pull is not in the model yet.
+- **Decision needed:** how new crust is made. Options: (1) restrict growth to particles
+  at opening plate boundaries (next to broken bonds under tension), with bonded pairs
+  exempt from collisions (part of phase 3); (2) proper gap filling at divergent
+  boundaries (phase 8: new particles placed in gaps, no inflation at all).
+
 **Spreading proxy, regrounded.** Crust over diverging mantle grows in area at the
 divergence rate (above 0.002/Myr, capped at 5%/Myr). Upwelling divergence is ~1%/Myr,
 so global crust production is ~0.5%/Myr of the surface, against Earth's ~0.6%/Myr

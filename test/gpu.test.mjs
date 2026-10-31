@@ -120,17 +120,21 @@ test('a 10x time step stays finite and bounded', { timeout: 300_000 }, async () 
   await page.close();
 
   const P = checkFreeLists(state);
-  let maxSpeed = 0;
+  const speeds = [];
   for (let i = 0; i < MAX_PARTICLES; i++) {
     if (!P.is_active[i]) continue;
     const r = Math.hypot(P.position[4 * i], P.position[4 * i + 1], P.position[4 * i + 2]);
     assert.ok(Math.abs(r - 1) < 1e-4, `particle ${i} left the sphere (r = ${r})`);
     const v = Math.hypot(P.velocity[4 * i], P.velocity[4 * i + 1], P.velocity[4 * i + 2]);
     assert.ok(Number.isFinite(v), `particle ${i} velocity is not finite`);
-    maxSpeed = Math.max(maxSpeed, v);
+    speeds.push(v * 637.1); // cm/yr
   }
-  console.log(`  max particle speed ${(maxSpeed * 637.1).toFixed(1)} cm/yr`);
-  assert.ok(maxSpeed * 637.1 < 100, 'plate speed above 100 cm/yr');
+  // Splits move a particle ~1 apothem within a step, which reads as a large
+  // one-step "velocity" for that particle; a blow-up would move many particles.
+  speeds.sort((a, b) => a - b);
+  const p99 = speeds[Math.floor(0.99 * (speeds.length - 1))];
+  console.log(`  particle speed p99 ${p99.toFixed(1)} cm/yr, max ${speeds.at(-1).toFixed(1)} cm/yr`);
+  assert.ok(p99 < 30, `p99 particle speed ${p99} cm/yr`);
 });
 
 test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { timeout: 300_000 }, async () => {

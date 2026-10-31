@@ -340,9 +340,14 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [ ] **Crust → mantle feedback** is not coupled: continents should blanket (warm)
       the mantle beneath them, and slabs should be the main cold downwellings,
       replacing the random cold drips.
-- [ ] **Plates deform far more than real plates** under the realistic mantle forcing:
-      see design.md, "Mantle and basal drag", for the measurements. This is the
-      plate-scale convergence question, and it gates the solver decision.
+- [ ] **The spreading proxy tears plates.** It inflates particles *inside* plates over
+      upwellings, and bonds and collisions then fight, so damage spreads. With it off,
+      driven plates gain no new damage and interiors are ~7× more rigid (design.md,
+      "Mantle and basal drag", measurements). New crust should only appear where plates
+      separate; this is a design decision (options listed there).
+- [ ] **Residual non-rigidity** of plate interiors (~1 mm/yr against ~0.1 mm/yr for
+      ideal elastic plates) is solver under-convergence: measure at higher resolution
+      before changing the solver.
 - [x] ~~Mantle flow is curl-free (no toroidal flow).~~ That is correct for the flow
       *beneath* the plates (buoyancy drives poloidal flow); Earth's toroidal surface
       motion comes from the plates themselves, through rigidity and boundaries.
