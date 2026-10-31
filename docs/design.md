@@ -162,12 +162,10 @@ is derived from the relative velocity across the edge, not stored.
 
 ### 3.4 Mantle
 
-The Swift–Hohenberg (SH) pattern on the icosphere stays for now. Architecturally it
-becomes a **basal-forcing generator** (section 8.4). It supplies v_mantle(x, t) and
-basal heat flux to the plate model, and it keeps its current feedback from crust
-(thermal blanket, slab cooling). Its time integration moves to a stable scheme:
-semi-implicit for the linear operator, or substeps sized by an explicit stability
-check.
+The mantle is a **basal-forcing generator** (section 8.4) on the CPU: the "lava lamp"
+model in `src/mantle/`, described with its grounding in section 9, "Mantle and basal
+drag". It supplies v_mantle(x, t) and its divergence; crust → mantle feedback
+(blanketing, slabs as cold sinks) is not yet coupled.
 
 ---
 
@@ -674,6 +672,87 @@ sweeps.
   spacing and at larger dt.
 
 ---
+
+### Before changing the solver again: measure at higher resolution
+
+Agreed: no further solver redesign (primal formulation, hierarchical constraints)
+until the work needed at higher resolution has been measured. Measure, at particle
+spacings of 220, 110 and 50 km (≈10k, 40k, 240k particles):
+
+- iterations per step needed to hold the residual bond stress (median, p99) below a
+  few MPa, with Chebyshev acceleration;
+- plate rigidity under the lava-lamp mantle forcing: rms non-rigid speed of plate
+  interiors, against the ~0.1 mm/yr scale that elastic plates at MPa stresses imply;
+- wall-clock cost per simulated Myr on a real (not software) GPU.
+
+Expectations to check: the bond-to-drag ratio κ scales as 1/spacing² (drag ∝ particle
+area, bond stiffness independent of spacing), so κ·dt is ~19× larger at 50 km, and
+Chebyshev iterations grow as √(κ·dt), about 4.4×. Particle count grows 22×. If the cost
+per Myr is acceptable, keep the solver; if not, that measurement decides between
+the options in "Phase 5 findings".
+
+### Mantle and basal drag
+
+Goal: ground each piece in something measurable, and say what is established
+and what is a modelling choice.
+
+**What the plates feel: Couette shear across the asthenosphere.** Each particle is
+dragged by traction η·(v_mantle − v_plate)/h. Here h is the thickness of the
+low-viscosity channel between the plate's base (the lithosphere–asthenosphere boundary,
+LAB) and the depth where viscosity rises again. In the solver this is the per-particle
+drag γ = A·η/h, so plate speed is *not* slaved to the mantle. It comes out of the force
+balance between drag, the bonds holding the plate, collisions, and later slab pull and
+ridge push.
+
+| Ingredient | Value | Status |
+|---|---|---|
+| Asthenosphere viscosity η | 10¹⁹ Pa·s (range 10¹⁸–10²⁰) | established range; **the effective drag coefficient to tune** |
+| Base of the low-viscosity layer | 300 km | established order (~200–400 km); modelling choice |
+| Oceanic LAB depth | 2.32√(κ·age), κ = 10⁻⁶ m²/s, capped at 100 km | established (half-space cooling, plate-model cap) |
+| Continental LAB depth | 150 km (cratons reach ~250) | established order; one value for now |
+| Couette (linear shear) profile | | modelling choice; the qualitative consequence, that deep keels couple more strongly, is a common argument in the literature |
+| Plate speeds today | 1–10 cm/yr, rms ~4 cm/yr; fast plates are those with slabs (Forsyth & Uyeda 1975) | established; the second point needs slab pull (phase 7) |
+
+**The mantle: a "lava lamp".** The requirements were to be alive (evolving, never
+locking into one flow map), to have realistic flow speeds where they matter (beneath
+the plates), and to start from a settled state rather than an artificial one, without
+solving mantle fluid dynamics.
+
+- *Why Swift–Hohenberg went:* it is a gradient system (it minimises a Lyapunov
+  functional), so it relaxes to a stationary pattern by construction. That is
+  exactly the "locked-in" behaviour to avoid.
+- *State:* a buoyancy field b (mid-mantle temperature anomaly) on a 2562-node
+  icosphere (~480 km spacing).
+- *Flow:* poloidal, v = s∇Φ with (∇² − 1/ℓ²)Φ = b: hot regions diverge (upwell), cold
+  regions converge. Flow beneath plates being poloidal is physical: buoyancy drives
+  poloidal flow, and Earth's toroidal surface motion comes from the plates' rigidity
+  and boundaries (established). The screening length ℓ is the mantle depth (2900 km),
+  because flow driven by an anomaly in a layer of depth H dies off over ~H (modelling
+  choice). Without screening, the flow was dominated by the planet-wide imbalance of
+  plume positions, and the rms speed wandered by factors of 3 between seeds.
+- *Evolution:* semi-Lagrangian advection of b by its own flow (upwellings broaden,
+  downwellings narrow, as in convection), a small effective diffusion, decay with a
+  plume lifetime of 120 Myr, and Poisson births of hot plumes and cold drips (0.3/Myr
+  each, so ~35 active, like Earth's ~40 hotspots; order of magnitude).
+- *Speed calibration:* the scale s comes from the plume statistics, not tuning. The
+  expected mean-square flow is Σ rate·(lifetime/2)·E/(4π), where E is one plume's flow
+  energy (one screened solve per plume kind at start-up). Advection sharpens
+  downwellings, so the realised speed is higher by a measured factor of 1.69 (6
+  seeds × 400 Myr), which is divided out. Target: long-run rms 4 cm/yr. Realised: 5.8–7.6
+  cm/yr per seed before the correction, so roughly ±20% around the target after it;
+  the instantaneous rms fluctuates ~2× over 100 Myr.
+- *Spin-up:* 400 Myr (over three plume lifetimes) alone before the crust starts, in
+  ~2 s.
+- *Alive:* the buoyancy pattern decorrelates in ~100 Myr (correlation 0.35 after 50
+  Myr, ~0 after 100). Unit-tested as correlation < 0.5 after 250 Myr.
+- *Not yet coupled:* crust → mantle feedback (continents warm the mantle beneath them;
+  slabs should become the dominant cold downwellings, replacing random drips).
+
+**Spreading proxy, regrounded.** Crust over diverging mantle grows in area at the
+divergence rate (above 0.002/Myr, capped at 5%/Myr). Upwelling divergence is ~1%/Myr,
+so global crust production is ~0.5%/Myr of the surface, against Earth's ~0.6%/Myr
+(~3 km²/yr). This is still a proxy until phase 8 ties creation to where plates actually
+separate.
 
 ## 10. Open questions
 

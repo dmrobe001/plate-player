@@ -15,11 +15,11 @@ fn crust_accumulation(@builtin(global_invocation_id) id: vec3<u32>) {
     let pos = particles[idx].position.xyz;
     let node = particles[idx].mantle_node;
 
-    // velocity = -grad(psi), so div(velocity) = -lap(psi)
-    let div = -grid[node].laplacian_psi;
-    if (div > sim.divergence_threshold) {
-        let rate = min(div * sim.area_growth_coeff, sim.max_area_growth_rate);
-        particles[idx].surface_area += rate * sim.dt_crust_myr;
+    // Spreading proxy: over diverging mantle, area grows at the divergence rate.
+    let div = grid[node].divergence * sim.mantle_drive;
+    if (div > sim.spreading_divergence_threshold) {
+        let rate = min(div * sim.spreading_efficiency, sim.max_spreading_rate);
+        particles[idx].surface_area *= exp(rate * sim.dt_crust_myr);
         particles[idx].apothem = sqrt(particles[idx].surface_area / 3.4641);
     }
 

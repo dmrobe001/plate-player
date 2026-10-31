@@ -16,8 +16,20 @@ fn base_area() -> f32 {
     return 3.4641 * sim.base_apothem * sim.base_apothem;
 }
 
+// Depth of the plate's base (lithosphere-asthenosphere boundary), km.
+// Oceanic: half-space cooling, 2.32 sqrt(kappa age), capped; continental: fixed keel.
+fn lithosphere_thickness_km(i: u32) -> f32 {
+    if (particles[i].composition_density < 2850.0) { return sim.continental_lithosphere_km; }
+    let age_s = max(particles[i].age, 0.0) * 3.15576e13;
+    return min(2.32 * sqrt(sim.thermal_diffusivity_m2_s * age_s) / 1000.0, sim.oceanic_lithosphere_max_km);
+}
+
+// Couette shear across the asthenosphere: drag per area = viscosity / h, with
+// h from the plate's base to the base of the low-viscosity layer. Returned
+// relative to a base-size particle over the reference channel (w = 1).
 fn inverse_drag(i: u32) -> f32 {
-    return base_area() / particles[i].surface_area;
+    let channel = max(sim.asthenosphere_base_km - lithosphere_thickness_km(i), sim.min_channel_km);
+    return (base_area() / particles[i].surface_area) * (channel / sim.drag_reference_channel_km);
 }
 
 @compute @workgroup_size(64)
@@ -27,7 +39,7 @@ fn crust_predict(@builtin(global_invocation_id) id: vec3<u32>) {
     let pos = particles[idx].position.xyz;
     let node = particles[idx].mantle_node;
 
-    let grid_vel = grid[node].velocity.xyz * sim.sh_grad_to_cm_yr * sim.cm_yr_to_sim_vel;
+    let grid_vel = grid[node].velocity.xyz * sim.mantle_drive;
     var target_vel = grid_vel;
 
     // Slab pull, as an extra velocity (force / drag).

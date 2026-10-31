@@ -112,12 +112,10 @@ export const Constraint = defineStruct('Constraint', [
   ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
 ]);
 
-/** One vertex of the icosphere that carries the mantle convection field. */
+/** One node of the mantle grid; written from the CPU mantle model (src/mantle/). */
 export const GridNode = defineStruct('GridNode', [
   ['position', 'vec4f'],
-  ['velocity', 'vec4f'],
-  ['psi', 'f32'],               // Swift-Hohenberg order parameter
-  ['laplacian_psi', 'f32'],
-  ['thermal_blanket', 'f32'],
-  ['thermal_atomic', 'i32'],    // atomic<i32> in compute shaders
+  ['velocity', 'vec4f'],        // flow beneath the plates, rad/Myr, tangent
+  ['buoyancy', 'f32'],          // mid-mantle temperature anomaly (positive = hot), model units
+  ['divergence', 'f32'],        // of the flow, 1/Myr (positive over upwellings)
 ]);

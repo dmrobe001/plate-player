@@ -92,7 +92,7 @@ test('free lists account for every slot; cached mantle node matches brute force'
   // The node is located at the start of a step and the particle then moves
   // a little, so compare against brute force with a small tolerance and
   // require nearly all to match exactly.
-  const vertices = createIcosphere(3).vertices;
+  const vertices = createIcosphere(4).vertices;
   let exact = 0, total = 0, worst = 0;
   for (let i = 0; i < MAX_PARTICLES; i++) {
     if (!P.is_active[i]) continue;
@@ -129,10 +129,7 @@ test('a 10x time step stays finite and bounded', { timeout: 300_000 }, async () 
     assert.ok(Number.isFinite(v), `particle ${i} velocity is not finite`);
     maxSpeed = Math.max(maxSpeed, v);
   }
-  const psi = new Float32Array(state.grid).filter((_, w) => w % 12 === 8); // GridNode.psi at word 8 of 12
-  const maxPsi = Math.max(...psi.map(Math.abs));
-  assert.ok(Number.isFinite(maxPsi) && maxPsi < 10, `mantle psi out of bounds: ${maxPsi}`);
-  console.log(`  max speed ${(maxSpeed * 637.1).toFixed(1)} cm/yr, max |psi| ${maxPsi.toFixed(3)}`);
+  console.log(`  max particle speed ${(maxSpeed * 637.1).toFixed(1)} cm/yr`);
   assert.ok(maxSpeed * 637.1 < 100, 'plate speed above 100 cm/yr');
 });
 
@@ -143,7 +140,7 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
   const page = await openPage();
   const results = await page.evaluate(async () => {
     const a = 0.0175, L = 3 * a, eps = 0.1;
-    await plate.setParams({ blanket_forcing: 0, mantle_time_per_myr: 0, crust_youngs_modulus_gpa: 70 });
+    await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70 });
     const kappa70 = plate.sim.params.bond_rate_myr_inv;
     await plate.setParams({ crust_youngs_modulus_gpa: 70 * 0.5 / kappa70 }); // kappa = 0.5/Myr, tau = 1/(2 kappa) = 1 Myr
     const tau = 1 / (2 * plate.sim.params.bond_rate_myr_inv);
@@ -153,10 +150,10 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
         count: 2,
         position: Float32Array.from([-Math.sin(half), 0, Math.cos(half), Math.sin(half), 0, Math.cos(half)]),
         thickness: Float32Array.of(7, 7), compositionDensity: Float32Array.of(3000, 3000),
-        temperature: Float32Array.of(278, 278), age: Float32Array.of(0, 0), apothem: Float32Array.of(a, a),
+        // Age 100 Myr: oceanic lithosphere at its 100 km cap, so the drag equals the reference (w = 1).
+        temperature: Float32Array.of(278, 278), age: Float32Array.of(100, 100), apothem: Float32Array.of(a, a),
       },
       bonds: { count: 1, a: Uint32Array.of(0), b: Uint32Array.of(1), restLength: Float32Array.of(L), damage: Float32Array.of(0) },
-      mantlePsi: new Float32Array(plate.sim.numNodes),
       yieldStressMPa: 1e6,
     });
     const stretch = async () => {
@@ -191,12 +188,12 @@ test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi 
   const page = await openPage();
   const runs = await page.evaluate(async ([chain, builderSrc, K]) => {
     const build = eval(`(${builderSrc})`);
-    await plate.setParams({ blanket_forcing: 0, mantle_time_per_myr: 0, crust_youngs_modulus_gpa: 70 });
+    await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70 });
     await plate.setParams({ dt_crust_myr: K / plate.sim.params.bond_rate_myr_inv, solver_iterations: 128 });
     const out = {};
     for (const [name, rho] of [['plain', 0], ['chebyshev', 0.999]]) {
       await plate.setParams({ chebyshev_rho: rho });
-      await plate.loadState(build(chain, plate.sim.numNodes));
+      await plate.loadState(build(chain));
       await plate.runSteps(1);
       const f = new Float32Array((await plate.readBuffers(['particles'])).particles);
       const w = f.length / 25000;

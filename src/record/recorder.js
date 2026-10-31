@@ -25,6 +25,9 @@ export const FIELDS = [
   { name: 'velocity_north', units: 'mm yr-1', long_name: 'northward surface velocity', kind: 'intensive' },
   { name: 'bond_damage', units: '1', long_name: 'mean damage of bonds attached to the crust', kind: 'intensive' },
   { name: 'slab_fraction', units: '1', long_name: 'fraction of nearby crust that is subducting slab', kind: 'intensive' },
+  { name: 'mantle_velocity_east', units: 'mm yr-1', long_name: 'eastward mantle flow beneath the plates (basal forcing)', kind: 'mantle' },
+  { name: 'mantle_velocity_north', units: 'mm yr-1', long_name: 'northward mantle flow beneath the plates (basal forcing)', kind: 'mantle' },
+  { name: 'mantle_buoyancy', units: '1', long_name: 'mid-mantle temperature anomaly, model units (positive = hot, upwelling)', kind: 'mantle' },
   { name: 'plate_id', units: '1', long_name: 'plate id (0 = not part of a plate); see plates/plates.json', kind: 'categorical' },
   { name: 'support', units: '1', long_name: 'crust coverage: ~1 under continuous crust, 0 in gaps', kind: 'diagnostic' },
 ];
@@ -104,7 +107,7 @@ export class Recorder {
     const n = active.length;
     const position = new Float32Array(3 * n);
     const area = new Float32Array(n);
-    const ch = Object.fromEntries(FIELDS.filter((f) => f.kind !== 'diagnostic' && f.kind !== 'categorical').map((f) => [f.name, new Float32Array(n)]));
+    const ch = Object.fromEntries(FIELDS.filter((f) => f.kind === 'intensive').map((f) => [f.name, new Float32Array(n)]));
     const plateIds = this.plates?.state?.ids;
     const plateChannel = new Float32Array(n);
     active.forEach((i, k) => {
@@ -127,7 +130,22 @@ export class Recorder {
       plateChannel[k] = plateIds ? plateIds[i] : 0;
     });
     // Kernel width = one base particle spacing (~ the record mesh spacing).
-    return sampleToMesh(this.mesh.positions, { position, area }, ch, 2 * params.base_apothem, { plate_id: plateChannel });
+    const fields = sampleToMesh(this.mesh.positions, { position, area }, ch, 2 * params.base_apothem, { plate_id: plateChannel });
+
+    // Basal forcing: the mantle flow itself, interpolated from the mantle grid.
+    const nodes = this.mesh.positions.length / 3;
+    const ve = new Float32Array(nodes), vn = new Float32Array(nodes), bu = new Float32Array(nodes);
+    let hint = 0;
+    for (let k = 0; k < nodes; k++) {
+      const x = [this.mesh.positions[3 * k], this.mesh.positions[3 * k + 1], this.mesh.positions[3 * k + 2]];
+      const s = this.sim.mantle.sample(x, hint);
+      hint = s.node;
+      const [east, north] = this.mesh.frames[k];
+      ve[k] = (s.velocity[0] * east[0] + s.velocity[1] * east[1] + s.velocity[2] * east[2]) * EARTH_RADIUS_KM;
+      vn[k] = (s.velocity[0] * north[0] + s.velocity[1] * north[1] + s.velocity[2] * north[2]) * EARTH_RADIUS_KM;
+      bu[k] = s.buoyancy;
+    }
+    return { ...fields, mantle_velocity_east: ve, mantle_velocity_north: vn, mantle_buoyancy: bu };
   }
 
   manifest() {
@@ -144,7 +162,7 @@ export class Recorder {
         sim_params: sim.params,
         param_overrides: sim.overrides,
         capacity: CAPACITY,
-        mantle: { subdivisions_nodes: sim.numNodes, substeps_per_step: sim.mantleSubsteps, stability: sim.mantleStability },
+        mantle: { model: 'lava-lamp buoyancy + screened poloidal flow (src/mantle/mantle.js)', nodes: sim.numNodes, options: sim.mantle.options, velocity_scale: sim.mantle.scale },
       },
       conventions: {
         position: 'unit sphere, radius 1 = 6371 km, body-fixed',
@@ -191,6 +209,7 @@ export class Recorder {
         time_myr: s.timeMyr,
         param_overrides: s.overrides,
         buffers: Object.fromEntries(STATE_BUFFERS.map((b) => [b, { file: `${snapshotDir(s.step)}/${b}.bin`, bytes: s.buffers[b].byteLength }])),
+        mantle: `${snapshotDir(s.step)}/mantle.json`,
       })),
       structs: {
         Particle: describe(Particle),
@@ -221,6 +240,7 @@ export class Recorder {
     }
     for (const s of this.snapshots) {
       for (const b of STATE_BUFFERS) entries.push({ name: `${snapshotDir(s.step)}/${b}.bin`, data: s.buffers[b] });
+      entries.push({ name: `${snapshotDir(s.step)}/mantle.json`, data: JSON.stringify(s.mantle) });
     }
     return writeZip(entries);
   }
@@ -258,8 +278,10 @@ export function snapshotFromZip(bytes, which = 'latest') {
     if (!view) throw new Error(`record is missing ${file}`);
     buffers[name] = view.slice().buffer; // own, aligned copy
   }
+  const mantleBytes = files.get(entry.mantle);
+  if (!mantleBytes) throw new Error(`record is missing ${entry.mantle}`);
   return {
     manifest,
-    snapshot: { step: entry.step, timeMyr: entry.time_myr, overrides: entry.param_overrides, buffers },
+    snapshot: { step: entry.step, timeMyr: entry.time_myr, overrides: entry.param_overrides, buffers, mantle: JSON.parse(new TextDecoder().decode(mantleBytes)) },
   };
 }

@@ -51,13 +51,26 @@ Line width = mean apothem × |σ| / σ_ref, capped at one apothem. σ_ref is the
 Units: lengths are on the unit sphere (1 = Earth radius, 6371 km) unless suffixed
 `_km`; time in Myr (millions of years); temperature in K; density in kg/m³.
 
-**Mantle** (`shaders/compute/mantle.wgsl`). A scalar field ψ on the 642 vertices of
-a subdivided icosahedron evolves by a Swift–Hohenberg equation,
-∂ψ/∂t = rψ − (∇² + k₀²)²ψ − ψ³ + F·blanket. This is a pattern-forming
-equation that settles into cells of preferred wavelength 2π/k₀, standing in for
-convection cells. The crust's surface velocity target is −∇ψ, projected onto
-the sphere. The "thermal blanket" term lets thick continental crust warm the
-mantle beneath it and slabs cool it.
+**Mantle** (`src/mantle/`). A cheap, living stand-in for convection, run on the CPU
+on a 2562-node icosphere. A buoyancy field (the mid-mantle temperature anomaly) drives a
+poloidal flow beneath the plates: hot regions upwell and diverge, cold regions converge.
+The field is advected by its own flow, decays with a plume lifetime (~120 Myr), and is
+replenished by randomly born hot plumes and cold drips (~0.3 per Myr each, so ~35 are
+active, like Earth's ~40 hotspots). The pattern therefore never settles; it decorrelates
+over ~100 Myr, like a lava lamp. The flow from an anomaly is screened over the mantle's
+depth (2900 km). The velocity scale is set so the long-run rms speed is ~4 cm/yr,
+about Earth's rms plate speed. The mantle runs alone for 400 Myr before the crust
+starts. It does not yet feel the crust (no blanketing under continents, no slabs as
+cold sinks). Details and grounding: `docs/design.md`, "Mantle and basal drag".
+
+**Basal drag** (`inverse_drag` in `solver.wgsl`). Each particle feels Couette shear
+across the asthenosphere: traction per area = η·(v_mantle − v_plate)/h. Here η is the
+asthenosphere viscosity, and h is the channel from the plate's base (oceanic: 2.32√(κ·age),
+capped at 100 km; continental: 150 km) down to the base of the low-viscosity layer
+(300 km). Deep keels drag hard and young ocean drags weakly. A plate's speed is not
+imposed: it comes out of the force balance between this drag, the bonds holding the
+plate together, and collisions with other plates (slab pull and ridge push come later).
+η is the effective drag coefficient to tune.
 
 **Crust particles** (`Particle` in `src/gpu/layout.js`). Each one is a hexagonal
 column with thickness, composition density, temperature, age, and area
@@ -111,7 +124,7 @@ thins until it melts. Its index then returns to a free list for reuse.
 5. Bond damage comes from domain-warped Voronoi (Worley) noise around 12 random
    plate centres. Bonds near cell borders are damaged, which seeds a network of
    weak plate boundaries with triple junctions.
-6. Velocities start at zero, and ψ starts as small random noise.
+6. Velocities start at zero; the mantle is spun up separately (above).
 
 All parameters are in `INIT_DEFAULTS` and `CRUST` at the top of that file.
 
@@ -142,6 +155,9 @@ plate-player/
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
+│   ├── mantle/
+│   │   ├── mantle.js          lava-lamp mantle: buoyancy, screened poloidal flow, plumes, spin-up
+│   │   └── sphere-mesh.js     cotangent Laplacian, CG Poisson solver, gradients, interpolation
 │   ├── plates/
 │   │   ├── plates.js          plate labelling (union-find), persistent ids, Euler-pole fit
 │   │   └── tracker.js         relabels during a run; plate series and event log for records
@@ -153,7 +169,7 @@ plate-player/
 │   │   ├── renderer.js        render pipelines and draw calls
 │   │   └── camera.js          orbit camera
 │   └── shaders/
-│       ├── compute/           bindings.wgsl, locate, mantle, thermal, growth, solver
+│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver
 │       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
 ├── test/
 │   ├── unit.test.mjs          CPU tests (Node only)
@@ -186,7 +202,7 @@ plate-player/
 To **add a simulation parameter**, add a line to `SIM_PARAMS` in `params.js` and
 use it as `sim.<name>` in any shader. To **add a compute stage**, write an
 `@compute` function in one of the `shaders/compute/*.wgsl` files and add its name
-to `entryPoints` and to the schedule in `encodeStep` (`simulation.js`).
+to `entryPoints` and to the schedule in `step` (`simulation.js`).
 
 ### Tests
 
@@ -300,10 +316,8 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       solver residual at 70 GPa, spurious yield). Chebyshev acceleration with 32
       iterations brings it to ~3 MPa with no spurious yield (design.md, Chebyshev
       findings). The plate level (design phase 5) is next.
-- [ ] **Long steps can trip the browser's GPU watchdog.** One step is one GPU
-      submission; with many iterations on a slow GPU (128 iterations under the
-      SwiftShader software renderer) it exceeds Chromium's time limit and the device
-      is lost. Split long steps into several submissions if this bites on real GPUs.
+- [x] ~~Long steps tripped the browser's GPU watchdog.~~ Steps are submitted in
+      pieces of 16 solver iterations, waiting for each.
 - [ ] **Growth recreates bond/contact conflicts.** The initial state is now
       stress-free (apothems are shrunk so no pair overlaps; with the mantle off, the
       stress is exactly zero), but a growing particle's bonds keep their rest length
@@ -320,24 +334,18 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [ ] **Subduction choice.** The lower disc of any deeply overlapping pair
       subducts, including continent under continent. The polarity is decided per
       pair, so a trench can flip polarity along its length.
-- [ ] **The mantle pattern takes hundreds of Myr to emerge.** Pattern time advances
-      at 0.0156 units per Myr and the growth rate is r = 0.2, so one e-folding of
-      the fastest mode takes ~320 Myr. Meanwhile off-wavelength noise decays (max
-      |ψ| falls from 0.05 to 0.009 in the first 1.6 Myr) and plates drift at
-      ~1–2 cm/yr. (Inherited from the Phase 5 constants.) Either start ψ from a
-      developed pattern or raise `mantle_time_per_myr`.
-- [ ] **Plates barely move for the first hundreds of Myr** (rms ~0.5 mm/yr, because of
-      the slow mantle spin-up above), so plate kinematics and rigidity can't be judged
-      yet. Note also that a developed pattern (|ψ| ~ 0.5, k₀ = 4) times
-      `sh_grad_to_cm_yr` = 25 would give ~50 cm/yr, so the spin-up and the velocity
-      scale should be fixed together.
-- [ ] **Mantle has no toroidal (rotational) flow.** Velocity = −∇ψ is curl-free, so
-      transform-style motion arises only from crust interactions.
-- [x] ~~Mantle time had no stated relation to Myr, and the explicit step size was
-      hand-tuned.~~ Pattern time now advances at `mantle_time_per_myr`, and the
-      substep is derived from a power-iteration estimate of the operator's largest
-      eigenvalue (half the explicit-Euler limit). For the record: the old step sat at
-      λ_max·dt ≈ 0.75 against a limit of 2, not the ≈ 1.5 this list first claimed.
+- [x] ~~The Swift–Hohenberg mantle took hundreds of Myr to emerge, locked into a
+      fixed pattern once it did, and its velocity scale was arbitrary.~~ Replaced by
+      the lava-lamp mantle: spun up alone, never settles, speed calibrated to ~4 cm/yr.
+- [ ] **Crust → mantle feedback** is not coupled: continents should blanket (warm)
+      the mantle beneath them, and slabs should be the main cold downwellings,
+      replacing the random cold drips.
+- [ ] **Plates deform far more than real plates** under the realistic mantle forcing:
+      see design.md, "Mantle and basal drag", for the measurements. This is the
+      plate-scale convergence question, and it gates the solver decision.
+- [x] ~~Mantle flow is curl-free (no toroidal flow).~~ That is correct for the flow
+      *beneath* the plates (buoyancy drives poloidal flow); Earth's toroidal surface
+      motion comes from the plates themselves, through rigidity and boundaries.
 
 **Correctness / GPU**
 - [x] ~~Race in `crust_solve_collisions` on the subduction state flip.~~ The flip is

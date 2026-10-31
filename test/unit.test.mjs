@@ -42,16 +42,16 @@ test('cell list finds exactly the pairs brute force finds', () => {
 });
 
 test('initial state is a pure function of the seed', () => {
-  const a = generateInitialState(642, { seed: 3 });
-  const b = generateInitialState(642, { seed: 3 });
-  const c = generateInitialState(642, { seed: 4 });
+  const a = generateInitialState({ seed: 3 });
+  const b = generateInitialState({ seed: 3 });
+  const c = generateInitialState({ seed: 4 });
   assert.deepEqual(a.particles.position, b.particles.position);
   assert.deepEqual(a.bonds.damage, b.bonds.damage);
   assert.notDeepEqual(a.particles.position, c.particles.position);
 });
 
 test('sampling reproduces constant and linear fields, and support ~ coverage', () => {
-  const state = generateInitialState(642, { seed: 1 });
+  const state = generateInitialState({ seed: 1 });
   const P = state.particles;
   const area = Float32Array.from(P.apothem, (a) => 2 * Math.sqrt(3) * a * a);
   const constant = new Float32Array(P.count).fill(5);
@@ -154,4 +154,44 @@ test('plates: Euler pole recovers a rigid rotation, and the residual measures no
   // Add a non-rigid stretch: the residual grows accordingly.
   for (let i = 0; i < n; i++) P.velocity[4 * i] += 1e-3 * (i / n - 0.5);
   assert.ok(eulerPole(P, plate.members).rigidityResidual > 0.05);
+});
+
+// --- mantle -----------------------------------------------------------------
+import { SphereMesh } from '../src/mantle/sphere-mesh.js';
+import { Mantle } from '../src/mantle/mantle.js';
+
+test('sphere mesh: Laplacian, Poisson solve and gradient match a degree-2 harmonic', () => {
+  const mesh = new SphereMesh(4);
+  const f = Float64Array.from({ length: mesh.n }, (_, i) => 3 * mesh.pos[3 * i + 2] ** 2 - 1); // l = 2: lap f = -6 f
+  const rel = (a, b) => Math.sqrt(a.reduce((s, v, i) => s + (v - b[i]) ** 2, 0) / b.reduce((s, v) => s + v * v, 0));
+  assert.ok(rel(mesh.laplacian(f), f.map((v) => -6 * v)) < 0.02);
+  const phi = new Float64Array(mesh.n);
+  mesh.solvePoisson(f, phi);
+  assert.ok(rel(phi, f.map((v) => -v / 6)) < 0.01);
+  const z = Float64Array.from({ length: mesh.n }, (_, i) => mesh.pos[3 * i + 2]); // grad z = e_z - z r
+  const expected = new Float64Array(3 * mesh.n);
+  for (let i = 0; i < mesh.n; i++) { const r = mesh.point(i); expected.set([-r[2] * r[0], -r[2] * r[1], 1 - r[2] * r[2]], 3 * i); }
+  assert.ok(rel(mesh.gradient(z), expected) < 0.01);
+});
+
+test('mantle: same seed same state, resumes exactly from saved state, and keeps evolving', () => {
+  const opts = { subdivisions: 3, spinUpMyr: 60 }; // small and short, for speed
+  const a = new Mantle(7, opts), b = new Mantle(7, opts);
+  a.spinUp(); b.spinUp();
+  assert.deepEqual(a.b, b.b);
+
+  a.advanceTo(10);
+  const saved = JSON.parse(JSON.stringify(a.getState()));
+  const c = new Mantle(7, opts);
+  c.setState(saved);
+  a.advanceTo(20); c.advanceTo(20);
+  assert.deepEqual(a.b, c.b);
+
+  // "Lava lamp": the buoyancy pattern decorrelates over a few plume lifetimes.
+  const start = Float64Array.from(a.b);
+  a.advanceTo(260);
+  const dot = (x, y) => x.reduce((s, v, i) => s + v * y[i], 0);
+  const corr = dot(start, a.b) / Math.sqrt(dot(start, start) * dot(a.b, a.b));
+  assert.ok(Math.abs(corr) < 0.5, `correlation after 250 Myr ${corr}`);
+  assert.ok(a.rmsSpeedCmYr() > 0.5 && a.rmsSpeedCmYr() < 30, `rms speed ${a.rmsSpeedCmYr()}`);
 });

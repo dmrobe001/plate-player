@@ -1,5 +1,4 @@
-// Crust thermal state, isostasy, bond healing, and the crust -> mantle
-// "thermal blanket" feedback.
+// Crust thermal state, isostasy and bond healing.
 
 @compute @workgroup_size(64)
 fn crust_thermo_isostasy(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -57,30 +56,4 @@ fn crust_constraint_healing(@builtin(global_invocation_id) id: vec3<u32>) {
     if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
     let rate = 100000.0 * arrhenius(bond_temperature(constraints[c_idx]));
     constraints[c_idx].damage = clamp(constraints[c_idx].damage - rate * sim.dt_crust_myr, 0.0, 1.0);
-}
-
-@compute @workgroup_size(64)
-fn grid_clear_thermal(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
-    if (idx >= sim.num_nodes) { return; }
-    atomicStore(&grid[idx].thermal_atomic, 0i);
-    grid[idx].thermal_blanket = 0.0;
-}
-
-// Thick crust insulates (warms) the mantle beneath it; slabs cool it.
-@compute @workgroup_size(64)
-fn crust_apply_thermal(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
-    if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
-    let node = particles[idx].mantle_node;
-    var heat = i32(particles[idx].thickness_km * 5.0);
-    if (particles[idx].state == 2u) { heat = -i32(particles[idx].thickness_km * 20.0); }
-    atomicAdd(&grid[node].thermal_atomic, heat);
-}
-
-@compute @workgroup_size(64)
-fn grid_finalize_thermal(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
-    if (idx >= sim.num_nodes) { return; }
-    grid[idx].thermal_blanket = clamp(f32(atomicLoad(&grid[idx].thermal_atomic)) * 0.001, -1.5, 1.5);
 }

@@ -3,7 +3,7 @@
 //
 // N particles at angles phi_i = (i - (N-1)/2) s, bonds to neighbours with rest
 // length (1 + eps) times the current spacing, so the chain wants to expand,
-// and no mantle flow. One overdamped implicit step minimises
+// and no mantle flow (tests set mantle_drive = 0). One overdamped implicit step minimises
 //   sum_i (gamma/2dt) u_i^2 + sum_j (k/2) C_j^2,   C_j = u_{j+1} - u_j - delta,
 // with u the arc displacement and delta the arc rest-length excess. In units
 // of the base drag that is the tridiagonal system
@@ -13,7 +13,7 @@
 export const CHAIN = { n: 61, spacing: 0.04, eps: 0.01, apothem: 0.0175 };
 
 /** Page-side state builder; pass its source to page.evaluate. */
-export function chainState({ n, spacing, eps, apothem }, numNodes) {
+export function chainState({ n, spacing, eps, apothem }) {
   const phi = (i) => (i - (n - 1) / 2) * spacing;
   const position = new Float32Array(3 * n);
   for (let i = 0; i < n; i++) position.set([Math.sin(phi(i)), 0, Math.cos(phi(i))], 3 * i);
@@ -22,7 +22,7 @@ export function chainState({ n, spacing, eps, apothem }, numNodes) {
   return {
     particles: {
       count: n, position, thickness: fill(7), compositionDensity: fill(3000),
-      temperature: fill(278), age: fill(0), apothem: fill(apothem),
+      temperature: fill(278), age: fill(100), apothem: fill(apothem), // old ocean: reference drag
     },
     bonds: {
       count: n - 1,
@@ -31,7 +31,6 @@ export function chainState({ n, spacing, eps, apothem }, numNodes) {
       restLength: fill(rest, n - 1),
       damage: fill(0, n - 1),
     },
-    mantlePsi: new Float32Array(numNodes),
     yieldStressMPa: 1e9,
   };
 }

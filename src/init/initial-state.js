@@ -18,7 +18,8 @@
 //   5. Bond damage: a domain-warped Voronoi ("Worley") pattern of plate
 //      centres. Bonds near Voronoi cell borders are damaged, which seeds a
 //      network of weak plate boundaries with triple junctions.
-//   6. Velocities zero; the mantle field starts as small random noise.
+//   6. Velocities zero. (The mantle is a separate model, src/mantle/, spun up
+//      on its own before the crust starts.)
 //
 // The returned state is plain typed arrays (structure of arrays); the
 // Simulation packs it into GPU buffers.
@@ -40,7 +41,6 @@ export const INIT_DEFAULTS = {
   bondCutoff: 1.3,            // bond partners within this many contact distances
   maxBondsPerParticle: 6,
   yieldStressMPa: 150,
-  mantleNoise: 0.1,
 };
 
 export const CRUST = {
@@ -48,7 +48,7 @@ export const CRUST = {
   oceanic: { density: 3000, thickness: [7, 7], temperature: 278, age: 60 },
 };
 
-export function generateInitialState(numMantleNodes, options = {}) {
+export function generateInitialState(options = {}) {
   const opt = { ...INIT_DEFAULTS, ...options };
   const rng = mulberry32(opt.seed);
   const contact = 2 * opt.apothem;
@@ -124,14 +124,10 @@ export function generateInitialState(numMantleNodes, options = {}) {
     damaged += bonds.damage[k] > 0.5;
   }
 
-  // 6. Mantle: small random perturbation from which the pattern grows.
-  const mantlePsi = new Float32Array(numMantleNodes);
-  for (let i = 0; i < numMantleNodes; i++) mantlePsi[i] = (rng() - 0.5) * opt.mantleNoise;
 
   return {
     particles,
     bonds,
-    mantlePsi,
     yieldStressMPa: opt.yieldStressMPa,
     stats: {
       particles: n,

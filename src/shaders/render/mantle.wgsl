@@ -1,5 +1,5 @@
-// The mantle icosphere, coloured by flow divergence (-lap psi):
-// blue = downwelling, orange = upwelling.
+// The mantle grid, coloured by buoyancy: orange = hot (upwelling),
+// blue = cold (downwelling).
 
 struct MantleOut {
     @builtin(position) clip: vec4f,
@@ -12,7 +12,7 @@ fn vs_mantle(@builtin(vertex_index) idx: u32) -> MantleOut {
     var out: MantleOut;
     out.clip = view.view_proj * grid[idx].position;
     out.world = grid[idx].position.xyz;
-    out.divergence = grid[idx].laplacian_psi * -15.0;
+    out.divergence = grid[idx].buoyancy * 1.5;
     return out;
 }
 

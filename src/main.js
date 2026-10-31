@@ -5,7 +5,8 @@
 // browser console); see test/gpu.test.mjs.
 
 import { initDevice } from './gpu/device.js';
-import { createIcosphere } from './geometry/icosphere.js';
+import { SphereMesh } from './mantle/sphere-mesh.js';
+import { Mantle, MANTLE_DEFAULTS } from './mantle/mantle.js';
 import { generateInitialState, INIT_DEFAULTS } from './init/initial-state.js';
 import { Simulation } from './sim/simulation.js';
 import { Renderer } from './render/renderer.js';
@@ -14,7 +15,6 @@ import { Recorder, snapshotFromZip } from './record/recorder.js';
 import { PlateTracker } from './plates/tracker.js';
 import { BUILD_INFO } from './build-info.js';
 
-const MANTLE_SUBDIVISIONS = 3; // 642 mantle nodes
 
 const $ = (id) => document.getElementById(id);
 
@@ -43,8 +43,8 @@ function download(bytes, filename) {
 async function main() {
   const canvas = $('gpuCanvas');
   const { device, context, format } = await initDevice(canvas, reportError);
-  const icosphere = createIcosphere(MANTLE_SUBDIVISIONS);
-  const sim = new Simulation(device, icosphere, reportError);
+  const mantleMesh = new SphereMesh(MANTLE_DEFAULTS.subdivisions);
+  const sim = new Simulation(device, mantleMesh, reportError);
   const renderer = new Renderer(device, context, format, sim, reportError);
   const camera = new OrbitCamera(canvas);
   const plates = new PlateTracker(sim);
@@ -95,8 +95,11 @@ async function main() {
       $('seed').value = seed;
       const t0 = performance.now();
       const initOptions = { ...INIT_DEFAULTS, ...options, seed };
-      const state = generateInitialState(icosphere.vertices.length, initOptions);
-      sim.load(state);
+      const state = generateInitialState(initOptions);
+      // The mantle runs alone first, so the crust never sees its artificial start.
+      const mantle = new Mantle(seed, {}, mantleMesh);
+      mantle.spinUp();
+      sim.load(state, mantle);
       initStats = { ...state.stats, seed, ms: performance.now() - t0 };
       recorder.reset({ seed, init_options: initOptions, init_stats: state.stats, restarted_from: null });
       plates.reset();
@@ -123,7 +126,7 @@ async function main() {
   /** Load a hand-built state (same shape as generateInitialState's result). */
   function loadState(state, run = { seed: null, init_options: 'custom' }) {
     return exclusive(async () => {
-      sim.load(state);
+      sim.load(state, sim.mantle);
       initStats = { ...(state.stats ?? {}), seed: run.seed, ms: 0 };
       recorder.reset({ ...run, restarted_from: null });
       plates.reset();
@@ -137,9 +140,7 @@ async function main() {
       // trip the browser's GPU watchdog, which kills the device.
       const inFlight = [];
       for (let i = 0; i < n; i++) {
-        const encoder = device.createCommandEncoder();
-        sim.encodeStep(encoder);
-        device.queue.submit([encoder.finish()]);
+        await sim.step();
         inFlight.push(device.queue.onSubmittedWorkDone());
         if (inFlight.length > 2) await inFlight.shift();
         await captureIfDue();
@@ -193,9 +194,9 @@ async function main() {
     camera.spin = $('spin').checked;
     camera.update();
 
-    const encoder = device.createCommandEncoder();
     const stepping = !$('pause').checked && !isBusy;
-    if (stepping) sim.encodeStep(encoder);
+    if (stepping) exclusive(() => sim.step()).catch((err) => reportError(err.message));
+    const encoder = device.createCommandEncoder();
     renderer.encodeDraw(encoder, {
       viewProj: camera.viewProjection(w / h),
       lightDir: camera.lightDirection(),
@@ -222,7 +223,8 @@ async function main() {
         ['Setup time', `${fmt(initStats.ms, 0)} ms`],
         ['Steps', sim.steps],
         ['Simulated time', `${sim.timeMyr.toFixed(2)} Myr`],
-        ['Mantle substeps', sim.mantleSubsteps],
+        ['Mantle rms flow', `${sim.mantle.rmsSpeedCmYr().toFixed(1)} cm/yr`],
+        ['Mantle plumes / drips born', `${sim.mantle.births.hot} / ${sim.mantle.births.cold}`],
         ['Plates', `${plates.summary.length} (${plates.summary.filter((p) => p.size >= 100).length} with ≥100 particles)`],
         ['Plate speed (median rms)', Number.isFinite(plates.median('rms_speed_mm_per_yr')) ? `${plates.median('rms_speed_mm_per_yr').toFixed(2)} mm/yr` : '–'],
         ['Non-rigid part', Number.isFinite(plates.median('rms_nonrigid_speed_mm_per_yr')) ? `${plates.median('rms_nonrigid_speed_mm_per_yr').toFixed(2)} mm/yr` : '–'],

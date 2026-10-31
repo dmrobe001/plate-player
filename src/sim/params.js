@@ -8,14 +8,22 @@
 // years); temperatures in K; densities in kg/m^3; energies in kJ/mol.
 
 export const SIM_PARAMS = [
-  // --- mantle: Swift-Hohenberg pattern on the icosphere ---
-  ['mantle_rayleigh', 'f32', 0.2],      // control parameter r: growth rate of the convection pattern
-  ['mantle_wavenumber', 'f32', 4.0],    // preferred wavenumber k0 of the pattern
-  ['mantle_time_per_myr', 'f32', 0.015625], // pattern-time units per Myr (= 50 steps of 5e-6 per 0.016 Myr, as in Phase 5)
-  ['dt_mantle', 'f32', null],           // explicit-Euler substep for psi; derived from a stability bound (simulation.js)
-  ['laplacian_weight', 'f32', 45.0],    // 1/h^2-like scale of the graph Laplacian
-  ['blanket_forcing', 'f32', 0.4],      // how strongly crust heat (thermal blanket) forces psi
+  // --- mantle: flow comes from the CPU mantle model (src/mantle/mantle.js) ---
   ['num_nodes', 'u32', null],
+  ['mantle_drive', 'f32', 1.0],         // multiplies the mantle velocity seen by the crust (0 = no flow; tests)
+
+  // --- basal drag: Couette shear across the asthenosphere (design.md, mantle and drag) ---
+  // Traction per area = viscosity * (v_mantle - v_plate) / h, where the channel
+  // h runs from the plate's base (LAB) down to the base of the low-viscosity
+  // layer. Deep keels shear a thin channel and are dragged hard; young, thin
+  // oceanic lithosphere floats on a thick channel and is dragged weakly.
+  ['asthenosphere_viscosity_pa_s', 'f32', 1e19],
+  ['asthenosphere_base_km', 'f32', 300.0],      // depth where viscosity rises again
+  ['min_channel_km', 'f32', 50.0],              // floor on h (keels never touch the base)
+  ['drag_reference_channel_km', 'f32', 200.0],  // h of old ocean; normalises drag in the solver
+  ['continental_lithosphere_km', 'f32', 150.0], // LAB depth under continents (cratons reach ~250)
+  ['oceanic_lithosphere_max_km', 'f32', 100.0], // oceanic LAB: 2.32 sqrt(kappa age), capped here
+  ['thermal_diffusivity_m2_s', 'f32', 1e-6],
 
   // --- crust: overdamped XPBD (see design.md 5.2) ---
   // Each step minimises  sum_i (gamma_i / 2 dt) |x_i - x~_i|^2 + U(x):
@@ -34,18 +42,17 @@ export const SIM_PARAMS = [
   // (design.md, Chebyshev findings); plain Jacobi needed a 2 GPa stop-gap.
   ['crust_youngs_modulus_gpa', 'f32', 70.0],
   ['elastic_thickness_km', 'f32', 30.0],     // thickness that carries in-plane stress
-  ['asthenosphere_viscosity_pa_s', 'f32', 1e19],
-  ['asthenosphere_thickness_km', 'f32', 100.0], // basal drag per area = viscosity / thickness
-  ['bond_rate_myr_inv', 'f32', null],   // derived: bond stiffness / drag of a base-size particle, 1/Myr
+  ['bond_rate_myr_inv', 'f32', null],   // derived: bond stiffness / reference drag of a base-size particle, 1/Myr
   ['yield_stress_mpa', 'f32', 150.0],
-  ['cm_yr_to_sim_vel', 'f32', 10.0 / 6371.0], // 1 cm/yr = 10 km/Myr; / Earth radius -> rad/Myr
-  ['sh_grad_to_cm_yr', 'f32', 25.0],    // grad(psi) -> plate speed in cm/yr
   ['base_apothem', 'f32', 0.0175],      // reference particle apothem
   ['split_area_factor', 'f32', 3.0],    // particle splits when area > factor * base hexagon area
   ['subduction_overlap', 'f32', 0.012], // overlap depth that triggers subduction
-  ['divergence_threshold', 'f32', 1.5], // -lap(psi) above which crust grows in area
-  ['area_growth_coeff', 'f32', 0.005],  // area growth per Myr per unit divergence (unit-sphere area)
-  ['max_area_growth_rate', 'f32', 0.00625], // cap on area growth, unit-sphere area per Myr
+  // Spreading proxy (until design phase 8): crust over diverging mantle grows
+  // in area at the divergence rate. With ~1%/Myr divergence over upwellings,
+  // global crust production is ~0.5%/Myr of the surface (Earth: ~0.6%/Myr).
+  ['spreading_divergence_threshold', 'f32', 0.002], // 1/Myr
+  ['spreading_efficiency', 'f32', 1.0],             // area growth rate / mantle divergence
+  ['max_spreading_rate', 'f32', 0.05],              // cap on fractional area growth, 1/Myr
   ['max_particles', 'u32', null],
   ['max_constraints', 'u32', null],
   ['hash_grid_dim', 'u32', null],
