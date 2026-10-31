@@ -174,7 +174,8 @@ export class Recorder {
       },
       nondeterminism: [
         'Which free slot a splitting particle receives depends on GPU thread timing; physics is unaffected but indices differ between runs after the first split.',
-        'Collision neighbour lists are capped at 50 entries per hash cell, and list order depends on thread timing; the cap is rarely reached.',
+        'Contact neighbour lists are capped at 50 entries per hash cell, and list order depends on thread timing; the cap is rarely reached.',
+        'Contact edges get slots in thread-timing order, which changes the order of floating-point sums in the solve.',
       ],
       mesh: {
         type: 'icosphere',

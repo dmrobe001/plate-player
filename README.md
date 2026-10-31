@@ -37,7 +37,7 @@ the seed in the URL: `plate-player.html?seed=42`.
 | Glyph | Meaning |
 |---|---|
 | Disc | One crust particle. Radius = the particle's apothem; colour = elevation relative to sea level (blues below, greens/browns/white above). Darkened discs are subducting slabs. |
-| Black line between centres | Bond in **compression**. Width ∝ \|normal stress\| |
+| Black line between centres | Bond or contact in **compression**. Width ∝ \|normal stress\| |
 | White line between centres | Bond in **tension**. Width ∝ normal stress |
 | Black tick across a bond's midpoint | **Shear** stress on the bond. Width ∝ shear stress; length = one hexagon edge (the "face" between the two particles) |
 | Background sphere | Mantle grid, coloured by flow divergence: orange = upwelling, blue = downwelling |
@@ -74,24 +74,30 @@ plate together, and collisions with other plates (slab pull and ridge push come 
 
 **Crust particles** (`Particle` in `src/gpu/layout.js`). Each one is a hexagonal
 column with thickness, composition density, temperature, age, and area
-(2√3·apothem²). Its density follows thermal expansion and its elevation follows
-Airy isostasy: thickness × (1 − ρ/ρ_mantle), with extra depression under water.
+(2√3·apothem²). Its density follows thermal expansion. Its elevation (the top of the
+column) is a free coordinate that relaxes toward Airy isostasy, thickness × (1 − ρ/ρ_mantle)
+plus water loading, with the viscous rebound time of a column-sized load
+(~30 kyr). It is not part of `position`, which stays on the unit sphere.
 
-**Bonds** (`Constraint`). Each bond is a central spring with a yield stress and
-damage in [0, 1]. Its rest length is always the sum of the two particles' apothems
+**Edges** (`Constraint`). Bonds and contacts are one kind of object, solved by one
+kernel. A **bond** is a central spring with a yield stress and damage in [0, 1]. A
+**contact** is rebuilt every step between unbonded columns that touch (or nearly
+touch) in map view *and* overlap in depth; it only pushes, carries no cohesion, and is
+never damaged. A bond that reaches full damage is retired, and its pair interacts by
+contact from then on. Its rest length is always the sum of the two particles' apothems
 (computed, not stored), so it follows any change in particle size. Its stiffness comes from the lithosphere's Young's
 modulus and elastic thickness, k = (√3/2)·E·hₑ (the 2D modulus of a triangular spring
-network), with the physical E ≈ 70 GPa. Stress beyond an Arrhenius-weakened yield stress accumulates damage;
+network), with the physical E ≈ 70 GPa; contacts use the same stiffness. Stress beyond an Arrhenius-weakened yield stress accumulates damage;
 damage softens tension (never compression); heat slowly heals it.
 
 **Motion** (`shaders/compute/solver.wgsl`). Overdamped extended position-based
 dynamics (XPBD), with basal drag in the role of mass: each step minimises
 Σ (γᵢ/2dt)|xᵢ − x̃ᵢ|² + U(x), where x̃ is where the mantle flow alone would carry
 each particle, γ = area × asthenosphere viscosity / thickness, and U is the bond
-energy. There is no inertia, and velocity is only a diagnostic. Bonds are solved by
-Jacobi sweeps that keep the multipliers consistent with the displacement, accelerated
-by Chebyshev extrapolation (32 iterations per step); collisions are position
-projections found with a uniform hash grid. Yield and damage are applied once per step,
+energy. There is no inertia, and velocity is only a diagnostic. All edges are solved
+by Jacobi sweeps that keep the multipliers consistent with the displacement,
+accelerated by Chebyshev extrapolation (32 iterations per step); contacts are found
+once per step with a uniform hash grid. Yield and damage are applied once per step,
 after the solve. With the default physical
 values a single bond relaxes in ~40 years, so every step (16 kyr) is effectively
 quasi-static: what limits rigidity at plate scale is solver convergence, not E (see
@@ -107,8 +113,10 @@ speed and the rms of the non-rigid part.
 **Growth and subduction** (`growth.wgsl`, `solver.wgsl`, `thermal.wgsl`). Particles
 over strong divergence grow in area. Past 3× the base area they split, and the
 child is fresh oceanic crust. When two surface discs overlap deeply, the lower one
-becomes a slab (state 2): it slides under with only basal friction, heats up, and
-thins until it melts. Its index then returns to a free list for reuse.
+becomes a slab (state 2): its top drops below the lithosphere, so it no longer touches
+surface columns, and it sinks, heats up, and thins until it melts. Its index then
+returns to a free list for reuse. (Since contacts became stiff, deep overlaps hardly
+occur, so subduction rarely starts; see the to-do list.)
 
 ### Initial conditions (`src/init/initial-state.js`)
 
@@ -316,8 +324,8 @@ floating-point contraction all vary. A resumed or re-run simulation should match
 - A snapshot restores the complete state, so resuming continues the same run. The
   test checks that the continuation matches to within a small tolerance.
 - Known sources of run-to-run variation are listed in each record's manifest (which
-  free slot a splitting particle receives; neighbour-list order in the collision
-  search). We note them; we don't engineer them away.
+  free slot a splitting particle receives; which slot each contact gets, which
+  changes the order of floating-point sums). We note them; we don't engineer them away.
 - The simulation advances one step per displayed frame, so simulated time per
   wall-clock second depends on the monitor's refresh rate and GPU speed. The
   panel reports steps and simulated Myr.
@@ -362,14 +370,18 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       and apothems together so every bond starts at that length (strain < 10⁻⁵).
       To check: whether growth and splitting still tear plates (design.md,
       driven-plate measurements).
-- [ ] **A compressed bonded pair is also a contact.** Both act at the same
-      distance, so they no longer conflict, but compression is resisted twice (an
-      elastic bond plus a hard projection). Design phase 3 unifies them.
-- [ ] **Bonds never form and never die from damage.** A fully damaged bond still
-      resists compression and keeps 10% of its shear stiffness, and colliding
-      plates never weld (no suturing or accretion).
-- [ ] **Water loading factor.** A depth d below sea level should become
-      d·ρ_m/(ρ_m − ρ_w) ≈ 1.43 d; the code gives d·(1 + ρ_w/ρ_m) ≈ 1.30 d.
+- [x] ~~A compressed bonded pair was also a contact.~~ Phase 3: bonds and contacts
+      are one edge array, and contacts skip bonded pairs.
+- [x] ~~Fully damaged bonds never died.~~ They are retired (phase 3) and the pair
+      interacts by contact.
+- [ ] **Plates never weld.** Colliding plates don't suture, and broken bonds no longer
+      heal back (they are retired). Suturing needs persistent contacts (design phase 8).
+- [ ] **Subduction rarely starts.** The trigger is a deep overlap (34% of an apothem
+      sum), which stiff contacts now prevent; converging plates lock instead. Design §6
+      replaces it with a stress-based rule on persistent contacts.
+- [ ] **No contact friction.** Contacts are frictionless; Coulomb friction needs
+      persistent contacts.
+- [x] ~~Water loading factor~~ was d·(1 + ρ_w/ρ_m); now ρ_w/(ρ_m − ρ_w) (phase 3).
 - [ ] **Mass is not conserved at splits.** The parent keeps its thickness at half
       the area, and the child is reset to 7 km oceanic crust, so continental
       material vanishes when a continent rifts.
@@ -382,11 +394,11 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [ ] **Crust → mantle feedback** is not coupled: continents should blanket (warm)
       the mantle beneath them, and slabs should be the main cold downwellings,
       replacing the random cold drips.
-- [ ] **The spreading proxy tears plates.** It inflates particles *inside* plates over
-      upwellings, and bonds and collisions then fight, so damage spreads. With it off,
-      driven plates gain no new damage and interiors are ~7× more rigid (design.md,
-      "Mantle and basal drag", measurements). New crust should only appear where plates
-      separate; this is a design decision (options listed there).
+- [ ] **The spreading proxy stresses plates.** It inflates particles *inside* plates
+      over upwellings. Since bonds and contacts agree on rest length it no longer tears
+      them outright, but stress climbs ~60 MPa per 0.5 Myr with it on and stays ~20 MPa
+      with it off (design.md, phase 3 findings). New crust should only appear where
+      plates separate; this is a design decision (options in design.md).
 - [ ] **Residual non-rigidity** of plate interiors (~1 mm/yr against ~0.1 mm/yr for
       ideal elastic plates) is solver under-convergence: measure at higher resolution
       before changing the solver.

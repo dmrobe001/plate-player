@@ -1,7 +1,9 @@
 # Plate Player — design plan
 
-Status: **phases 0–2 implemented**; the rest is a proposal. This document says where
-the model is going and why.
+Status: **phases 0–3 implemented** (2 and 3 partly, see the phase table), plate
+identification from phase 5, Chebyshev acceleration, and the lava-lamp mantle with
+grounded basal drag. The rest is a proposal. This document says where the model is
+going and why.
 
 **How to use this document.** It is a working plan, not a specification. Don't
 pursue its goals too doggedly: when a phase runs into difficult problems (a method
@@ -107,7 +109,8 @@ crust and tilted for slabs.
 
 | Field | Type | Units | Notes |
 |---|---|---|---|
-| `position` | vec3 | unit sphere | **free radius** (new): \|x\| = 1 + surface height / R |
+| `position` | vec3 | unit sphere | direction of the column |
+| `elevation` | f32 | km | **free radius** (done in phase 3, as a separate coordinate rather than \|x\|; see phase 3 findings) |
 | `director` | vec3 | unit vector | column axis; carries bending (new) |
 | `orientation` | f32 | rad | rotation about the director, from the polar decomposition (new) |
 | `area` | f32 | unit sphere² | hexagon area; apothem = √(area / 2√3) |
@@ -553,7 +556,7 @@ Each phase ends with a check that could fail. Two kinds:
 | 0 ✅ | Housekeeping: exponential integrators for all rates; cache nearest mantle node; fix free-list and state-flip races; mantle substep from a stability bound, mantle time tied to Myr | Every slot free or active exactly once; cached node = nearest; no blow-up at 10× dt. dt sensitivity is *reported*, not asserted: PBD stiffness still depends on dt until phase 2, so that number is the baseline phase 2 must beat |
 | 1 ✅ | **Minimal recording:** manifest + field series + snapshots (tiers a–c), download as zip, resume from zip | Restart from a record ZIP in a fresh page continues the run (bitwise at the time; now checked to a tolerance, since bit-identity is not a goal) |
 | 2 ✅ (partly) | **Overdamped XPBD core:** drag as mass, real compliance. *Changed:* λ-consistent Jacobi instead of graph-coloured Gauss–Seidel (see below) | Two-particle relaxation matches implicit Euler, (1 + dt/τ)⁻ⁿ with τ = γ/2k, to 0.1% at dt/τ = 0.1, 1, 10 (kept as a test). Whole-planet dt-independence **not met**: blocked on plate-scale convergence (findings below) |
-| 3 | **Unified edges + column contacts + free radius & buoyancy** | Thickened block relaxes to Airy height (Generator: thickened block) |
+| 3 ✅ (partly) | **Unified edges + column contacts + free radius & buoyancy.** Done: bonds and per-step one-sided contacts are one edge array solved by one XPBD kernel; contacts need overlap in map view *and* depth; fully damaged bonds retire; the radial coordinate is free and relaxes to Airy height (Haskell rebound time). *Changed:* the radius is a separate per-column coordinate, not \|x\| (findings below). Not done: persistent contacts (friction state, suture timers), the SUBDUCTION edge type, Coulomb friction | Thickened block relaxes to its Airy height as implicit Euler with the rebound time, neighbours unmoved (kept as a test); columns touch only when they overlap in depth (kept as a test) |
 | 4 | **Neighbour-fit strain + orientation**, stress-tensor glyphs | Rigid rotation → strain < 10⁻⁶; uniaxial stretch → set Poisson ratio ±5% |
 | 5 (identification ✅; coarse solve: redesign question) | **Plate coarse level** (labelling, Euler poles) | Labelling, persistent ids, split/merge events and Euler-pole fits are unit-tested on synthetic networks. The coarse *solve* does not fit the XPBD formulation (findings below) |
 | 6 | **Lithosphere column:** thermal age, depth–age, GPE force | Ridge Generator reproduces depth ∝ √age |
@@ -563,7 +566,13 @@ Each phase ends with a check that could fail. Two kinds:
 | 10 | **Patch mode:** run L1 code on a projected patch driven by a Forcing; adapters from records; event log | Patch driven by a global record stays within tolerance of the global fields in its interior over [t₀, t₁] |
 
 The order is chosen so that phases 0–4 already improve the current game output at
-220 km, before 50 km is needed.
+220 km, before 50 km is needed. Done outside the numbered phases: Chebyshev
+acceleration of the Jacobi sweeps, the lava-lamp mantle with grounded basal drag, and
+bond rest length = apothem sum (findings sections below).
+
+**Next decision (open):** how new crust is made. In-plate inflation is now the main
+source of stress and damage (phase 3 findings); see "Mantle and basal drag" for the
+options.
 
 ### Phase 2 findings (measured once, 30 steps = 0.48 Myr, seed 1, SwiftShader)
 
@@ -803,6 +812,68 @@ bond; one-off, SwiftShader):
   mantle drag. So the remaining question is not a solver one: crust creation inside
   plates is an unphysical strain source, however it is accommodated. The options in
   the decision above still apply; the rest-length rule stays either way.
+
+### Phase 3 findings: unified edges, column contacts, free radius
+
+**What was built.**
+- *Edges.* Bonds keep their slots [0, maxBonds), managed by the free list. Contacts
+  fill [maxBonds, maxConstraints) and are rebuilt every step: after the hash build,
+  each touching, unbonded pair that overlaps in depth gets a CONTACT edge. Bonded
+  pairs are skipped using a per-step list of bond partners (≤12 per particle). The
+  same XPBD kernel solves both kinds: the separate collision projection, with its
+  averaging, is gone. Contacts carry no cohesion and are never damaged. A bond that
+  reaches full damage is retired, and the pair interacts by contact from then on.
+- *Column contacts.* A column spans [top − lithosphere thickness, top] in the
+  elevation datum. A new slab's top drops to 160 km down and sinks at 20 km/Myr
+  (stand-ins until phase 7). So slabs pass beneath surface columns instead of being
+  exempted by a special rule, and the old slab "basal friction" rule is gone.
+- *Free radius.* `elevation` is now state: each step it relaxes toward its Airy height
+  by implicit Euler with the Haskell rebound time τ = 4πη/(Δρ g λ), with λ = 4 apothems
+  and η = 10²¹ Pa·s (upper mantle, from post-glacial rebound). That gives τ ≈ 28 kyr
+  against dt = 16 kyr. The water-loading factor is corrected to ρ_w/(ρ_m − ρ_w).
+
+**Changed from the plan: the radius is a separate coordinate.** The plan put the free
+radius in |x|. But in-plane strain must then be measured on directions anyway: a column
+1 km higher has a chord 1/6371 longer, which reads as 11 MPa per km of relief at
+70 GPa. A separate radial coordinate keeps the horizontal solve on the unit sphere
+and loses nothing until bending couples the two (phase 7).
+
+**Contacts must be one-sided and found with a margin.** The first version froze each
+step's contacts at the start and made them act both ways, which keeps the iteration
+linear for Chebyshev. On the planet it ran away: by 2.4 Myr, unbonded overlaps
+reached 46%, p99 speed 200 cm/yr and median |σ| 240 MPa. Hypothesis: the solve pushes
+particles into neighbours that had no contact edge at the step start. Tested: every
+overlap deeper than 5% (14 at 0.48 Myr, 55 at 0.96 Myr) was between a pair *without*
+a contact edge. Fix: create contacts for gaps below 10% of the apothem sum, and clamp
+each contact's multiplier at λ ≥ 0 (push only). Chebyshev tolerates this nonlinearity
+so far. Same probe, seed 1:
+
+| | t | unbonded overlap p99 / max | speed median / p99 | median / p99 \|σ\| | bonds | damaged |
+|---|---|---|---|---|---|---|
+| frozen two-sided | 0.96 Myr | 7.9% / 20% | 2.6 / 77 cm/yr | 113 / 807 MPa | 22 303 | 4.7% |
+| one-sided + margin, growth on | 0.96 Myr | 1.1% / 1.8% | 2.2 / 7.1 cm/yr | 114 / 643 MPa | 22 928 | 4.1% |
+| one-sided + margin, growth off | 0.48 Myr | 0.11% / 0.17% | 0.8 / 2.4 cm/yr | 16 / 81 MPa | 23 962 | 3.4% |
+| one-sided + margin, growth off | 0.96 Myr | 0.15% / 0.26% | 0.4 / 1.5 cm/yr | 20 / 106 MPa | 23 962 | 3.4% |
+| before phase 3 (growth on) | 0.96 Myr | 2.2% / 3.4% | 3.0 / 52 cm/yr | 99 / 772 MPa | 25 581 active, 17.7% damaged | |
+
+(Initial bonds: 25 581; those starting at full damage are retired in the first step,
+so "damaged" counts only bonds still active.)
+
+**What this says.**
+- With growth off the model is steady: no new damage, overlaps under 0.3%, about
+  20 MPa median stress.
+- With growth on, stress climbs about 60 MPa per 0.5 Myr, with or without phase 3. The
+  climb is the in-plate inflation, now fully transmitted because bonds and contacts
+  agree on the rest length. Interpenetration and runaway speeds were phase 3's own
+  problem, and are fixed.
+- **Subduction no longer initiates.** The trigger is an overlap above 0.012 (34% of an
+  apothem sum), and stiff one-sided contacts keep overlaps near 1%. With growth off,
+  converging plates lock and slow (median speed 0.8 → 0.4 cm/yr). The overlap trigger
+  was always a proxy; design §6 calls for a stress-based initiation rule (sustained
+  compressive normal stress on a contact with a negatively buoyant side), which needs
+  persistent contacts. That moves forward from phase 7.
+- Healing no longer re-welds fully broken bonds, because they are retired. Suturing
+  (phase 8) is the intended replacement.
 
 **Spreading proxy, regrounded.** Crust over diverging mantle grows in area at the
 divergence rate (above 0.002/Myr, capped at 5%/Myr). Upwelling divergence is ~1%/Myr,

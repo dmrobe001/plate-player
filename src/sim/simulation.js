@@ -15,7 +15,7 @@ export const CAPACITY = {
   maxBonds: 65536,       // bond slots [0, maxBonds), managed by the constraint free list
   maxContacts: 65536,    // contact slots follow, rebuilt every step
   get maxConstraints() { return this.maxBonds + this.maxContacts; },
-  hashGridDim: 32,       // collision grid cells per axis over [-1.5, 1.5]
+  hashGridDim: 32,       // contact-search grid cells per axis over [-1.5, 1.5]
   adjacencyWidth: 6,     // neighbours stored per mantle node
 };
 

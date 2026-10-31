@@ -30,7 +30,7 @@ export const SIM_PARAMS = [
   // basal drag gamma plays the role of mass. Bond stiffness and drag come from
   // the physical values below; only their ratio enters (bond_rate_myr_inv).
   ['dt_crust_myr', 'f32', 0.016],
-  ['solver_iterations', 'u32', 32],     // constraint + collision iterations per step (read by simulation.js)
+  ['solver_iterations', 'u32', 32],     // edge (bond + contact) iterations per step (read by simulation.js)
   // Chebyshev semi-iterative acceleration of the Jacobi sweeps (Wang 2015).
   // rho is the spectral radius of one plain sweep: negative = derive it
   // (simulation.js, jacobiSpectralRadius), 0 = off (plain Jacobi), else as given.
