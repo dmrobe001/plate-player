@@ -786,6 +786,23 @@ bond; one-off, SwiftShader):
   plates still *pushes* (an inflating particle now pushes through its bonds as well as
   its contacts), so some deformation is expected; the question is whether it breaks
   bonds. To be measured.
+- **Measured after the change** (same benchmark: seed 1, 8 warm-up + 16 measured steps;
+  the refitted initial state starts with 9.5% damaged bonds):
+
+  | configuration | median plate speed | non-rigid, all | non-rigid, interiors | damaged bonds |
+  |---|---|---|---|---|
+  | Chebyshev 32, growth on | 3.1 cm/yr | 1.60 cm/yr | 0.64 cm/yr | 10.0% |
+  | Chebyshev 32, growth off | 0.6 cm/yr | 0.27 cm/yr | 0.11 cm/yr | 9.5% |
+
+  Tearing is mostly gone: growth now adds 0.5 points of damage over the window instead
+  of 1.7. Deformation is not gone, and that is expected rather than numerical:
+  inflation *is* a prescribed areal strain rate, about the upwelling divergence
+  (~1%/Myr), and a plate ~1000 km across that inflates at 1%/Myr has edge velocities
+  relative to a rigid fit of ~10 km/Myr = 1 cm/yr, the size measured. Inflation also
+  drives the plates (median speed 0.6 -> 3.1 cm/yr), which is a growth artefact, not
+  mantle drag. So the remaining question is not a solver one: crust creation inside
+  plates is an unphysical strain source, however it is accommodated. The options in
+  the decision above still apply; the rest-length rule stays either way.
 
 **Spreading proxy, regrounded.** Crust over diverging mantle grows in area at the
 divergence rate (above 0.002/Myr, capped at 5%/Myr). Upwelling divergence is ~1%/Myr,
