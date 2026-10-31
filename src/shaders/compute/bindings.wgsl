@@ -24,6 +24,15 @@ struct ParticleDelta { dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count:
 @group(0) @binding(6) var<storage, read_write> hash_grid: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> particle_deltas: array<ParticleDelta>;
 
+// Solver iteration counter and the Chebyshev weight for each iteration
+// (written by simulation.js; see chebyshevWeights).
+struct SolverState { iteration: u32, pad1: u32, pad2: u32, pad3: u32, omega: array<f32> }
+@group(0) @binding(8) var<storage, read_write> solver: SolverState;
+
+fn chebyshev_omega() -> f32 {
+    return solver.omega[min(solver.iteration, arrayLength(&solver.omega) - 1u)];
+}
+
 @group(1) @binding(1) var<uniform> sim: SimParams;
 
 fn to_fixed(v: vec3f) -> vec3i {

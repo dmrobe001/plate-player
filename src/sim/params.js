@@ -22,12 +22,17 @@ export const SIM_PARAMS = [
   // basal drag gamma plays the role of mass. Bond stiffness and drag come from
   // the physical values below; only their ratio enters (bond_rate_myr_inv).
   ['dt_crust_myr', 'f32', 0.016],
-  ['solver_iterations', 'u32', 4],      // constraint + collision iterations per step (read by simulation.js)
-  // Stop-gap: real lithosphere is ~70 GPa, but until plate-scale stress
-  // converges (design phase 5), Jacobi residual strain times 70 GPa reads as
-  // >150 MPa in ~13% of bonds and spreads spurious damage. 2 GPa (the Phase 5
-  // prototype's value) keeps residual stresses at a few MPa. See design.md, phase 2.
-  ['crust_youngs_modulus_gpa', 'f32', 2.0],
+  ['solver_iterations', 'u32', 32],     // constraint + collision iterations per step (read by simulation.js)
+  // Chebyshev semi-iterative acceleration of the Jacobi sweeps (Wang 2015).
+  // rho is the spectral radius of one plain sweep: negative = derive it
+  // (simulation.js, jacobiSpectralRadius), 0 = off (plain Jacobi), else as given.
+  // The first `delay` iterations are plain Jacobi. Read by simulation.js.
+  ['chebyshev_rho', 'f32', -1],
+  ['chebyshev_delay', 'u32', 3],
+  // Lithosphere Young's modulus. With 32 Chebyshev-accelerated iterations the
+  // solve converges well enough that residual stresses stay at a few MPa
+  // (design.md, Chebyshev findings); plain Jacobi needed a 2 GPa stop-gap.
+  ['crust_youngs_modulus_gpa', 'f32', 70.0],
   ['elastic_thickness_km', 'f32', 30.0],     // thickness that carries in-plane stress
   ['asthenosphere_viscosity_pa_s', 'f32', 1e19],
   ['asthenosphere_thickness_km', 'f32', 100.0], // basal drag per area = viscosity / thickness

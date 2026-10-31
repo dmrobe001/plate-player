@@ -66,8 +66,7 @@ Airy isostasy: thickness × (1 − ρ/ρ_mantle), with extra depression under wa
 **Bonds** (`Constraint`). Each bond is a central spring with a rest length, a yield
 stress, and damage in [0, 1]. Its stiffness comes from the lithosphere's Young's
 modulus and elastic thickness, k = (√3/2)·E·hₑ (the 2D modulus of a triangular spring
-network). The default E is a stop-gap 2 GPa rather than the physical ~70 GPa; see the
-to-do list. Stress beyond an Arrhenius-weakened yield stress accumulates damage;
+network), with the physical E ≈ 70 GPa. Stress beyond an Arrhenius-weakened yield stress accumulates damage;
 damage softens tension (never compression); heat slowly heals it.
 
 **Motion** (`shaders/compute/solver.wgsl`). Overdamped extended position-based
@@ -75,8 +74,10 @@ dynamics (XPBD), with basal drag in the role of mass: each step minimises
 Σ (γᵢ/2dt)|xᵢ − x̃ᵢ|² + U(x), where x̃ is where the mantle flow alone would carry
 each particle, γ = area × asthenosphere viscosity / thickness, and U is the bond
 energy. There is no inertia, and velocity is only a diagnostic. Bonds are solved by
-Jacobi sweeps that keep the multipliers consistent with the displacement; collisions
-are position projections found with a uniform hash grid. With the default physical
+Jacobi sweeps that keep the multipliers consistent with the displacement, accelerated
+by Chebyshev extrapolation (32 iterations per step); collisions are position
+projections found with a uniform hash grid. Yield and damage are applied once per step,
+after the solve. With the default physical
 values a single bond relaxes in ~40 years, so every step (16 kyr) is effectively
 quasi-static: what limits rigidity at plate scale is solver convergence, not E (see
 design.md, phase 2).
@@ -284,12 +285,14 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       shear ticks are blank.
 - [x] ~~Young's modulus had no dynamical effect.~~ Phase 2: bond stiffness and drag
       are physical, and the two-particle relaxation matches τ = γ/2k (tested).
-- [ ] **Plate-scale stress doesn't converge.** Jacobi sweeps move information about
-      one bond per iteration, so a few iterations per step leave residual strain from
-      the mantle's velocity gradients. With a physical E = 70 GPa that residual reads
-      as a median 56 MPa, with 13% of bonds over yield (4 iterations; 16 iterations
-      only reaches 38 MPa and 5.5%), and damage spreads spuriously. Until design
-      phase 5 (plates as a coarse level) fixes convergence, the default E is 2 GPa.
+- [x] ~~Plate-scale stress didn't converge with plain Jacobi~~ (median 56 MPa of
+      solver residual at 70 GPa, spurious yield). Chebyshev acceleration with 32
+      iterations brings it to ~3 MPa with no spurious yield (design.md, Chebyshev
+      findings). The plate level (design phase 5) is next.
+- [ ] **Long steps can trip the browser's GPU watchdog.** One step is one GPU
+      submission; with many iterations on a slow GPU (128 iterations under the
+      SwiftShader software renderer) it exceeds Chromium's time limit and the device
+      is lost. Split long steps into several submissions if this bites on real GPUs.
 - [ ] **Growth recreates bond/contact conflicts.** The initial state is now
       stress-free (apothems are shrunk so no pair overlaps; with the mantle off, the
       stress is exactly zero), but a growing particle's bonds keep their rest length

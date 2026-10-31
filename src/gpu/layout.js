@@ -79,6 +79,8 @@ export const Particle = defineStruct('Particle', [
   ['position', 'vec4f'],        // unit-sphere position (w unused)
   ['predicted_pos', 'vec4f'],   // position-based-dynamics predicted position
   ['velocity', 'vec4f'],        // radians / Myr, tangent to sphere
+  ['iter_start', 'vec4f'],      // solver iterate x_k at the start of the current iteration (Chebyshev)
+  ['iter_prev', 'vec4f'],       // solver iterate x_{k-1} (Chebyshev)
   ['thickness_km', 'f32'],
   ['composition_density', 'f32'], // kg/m^3 at mantle temperature
   ['temperature', 'f32'],       // K
@@ -107,7 +109,7 @@ export const Constraint = defineStruct('Constraint', [
   ['damage', 'f32'],            // 0 intact .. 1 fully damaged
   ['stress_normal_mpa', 'f32'], // diagnostic: + tension, - compression
   ['stress_shear_mpa', 'f32'],  // diagnostic: magnitude
-  ['_pad', 'f32'],
+  ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
 ]);
 
 /** One vertex of the icosphere that carries the mantle convection field. */

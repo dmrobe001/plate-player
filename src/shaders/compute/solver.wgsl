@@ -4,7 +4,8 @@
 //   1. predict:   x~ = where the mantle flow alone would carry the particle
 //   2. hash:      bin predicted positions into a uniform grid for collisions
 //   3. iterate:   bonds (XPBD, with accumulated multipliers lambda), then
-//                 collisions (position projection), each applied as a Jacobi sweep
+//                 collisions (position projection), each applied as a Jacobi sweep;
+//                 the result is extrapolated by Chebyshev acceleration
 //   4. integrate: velocity = (x - x_old) / dt, a diagnostic only
 //
 // Units inside the solver: drag is relative to a base-size particle
@@ -71,6 +72,7 @@ fn crust_begin_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
     if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
     constraints[c_idx].lambda = 0.0;
+    constraints[c_idx].lambda_prev = 0.0;
     atomicAdd(&particle_deltas[constraints[c_idx].particle_a].count, 1i);
     atomicAdd(&particle_deltas[constraints[c_idx].particle_b].count, 1i);
 }
@@ -80,6 +82,37 @@ fn crust_store_bond_count(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     particles[idx].bond_count = u32(atomicLoad(&particle_deltas[idx].count));
+    particles[idx].iter_start = particles[idx].predicted_pos;
+    particles[idx].iter_prev = particles[idx].predicted_pos;
+}
+
+@compute @workgroup_size(1)
+fn solver_begin() {
+    solver.iteration = 0u;
+}
+
+@compute @workgroup_size(1)
+fn solver_next_iteration() {
+    solver.iteration += 1u;
+}
+
+// Chebyshev semi-iterative acceleration (Wang 2015): with x^ the result of
+// one plain sweep from x_k,  x_{k+1} = omega_k (x^ - x_{k-1}) + x_{k-1}.
+// The multipliers get the same combination in crust_solve_constraints, so
+// x - x~ stays consistent with lambda.
+@compute @workgroup_size(64)
+fn crust_chebyshev_combine(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+    let omega = chebyshev_omega();
+    var x = particles[idx].predicted_pos;
+    if (omega != 1.0) {
+        let prev = particles[idx].iter_prev.xyz;
+        x = vec4f(normalize(omega * (x.xyz - prev) + prev), 1.0);
+        particles[idx].predicted_pos = x;
+    }
+    particles[idx].iter_prev = particles[idx].iter_start;
+    particles[idx].iter_start = x;
 }
 
 // One XPBD update per bond, C = |x_b - x_a| - rest_length:
@@ -109,17 +142,39 @@ fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = dir / dist;
     let C = dist - c.rest_length; // + stretched, - compressed
 
-    // Damage softens tension, never compression.
-    let stiffness_factor = select(1.0, max(1.0 - c.damage, 1e-4), C > 0.0);
+    // Damage softens tension, never compression. Whether the bond counts as
+    // in tension is decided by last step's stress, not the current iterate:
+    // switching stiffness mid-solve makes the iteration nonlinear, and
+    // Chebyshev acceleration then diverges (design.md, Chebyshev findings).
+    let stiffness_factor = select(1.0, max(1.0 - c.damage, 1e-4), c.stress_normal_mpa > 0.0);
     let alpha = 1.0 / (sim.bond_rate_myr_inv * stiffness_factor * sim.dt_crust_myr);
     let wA = inverse_drag(pA);
     let wB = inverse_drag(pB);
     let degree = f32(max(max(particles[pA].bond_count, particles[pB].bond_count), 1u));
     let dlambda = (-C - alpha * c.lambda) / (wA + wB + alpha) / degree;
-    constraints[c_idx].lambda = c.lambda + dlambda;
+    let omega = chebyshev_omega();
+    constraints[c_idx].lambda = omega * (c.lambda + dlambda - c.lambda_prev) + c.lambda_prev;
+    constraints[c_idx].lambda_prev = c.lambda;
 
-    // Stress (MPa) for yielding and display. Central bonds carry no shear;
-    // a real shear measure arrives with the per-particle strain fit (phase 4).
+    // count 0: bond corrections are applied in full (see crust_apply_deltas).
+    add_delta(pA, -wA * dlambda * n, 0i);
+    add_delta(pB, wB * dlambda * n, 0i);
+}
+
+// After the solve: stress from the converged positions, then yield. Damage
+// is an irreversible change between solves (design.md 4.7); updating it
+// inside the iterations lets transient overshoot (which Chebyshev
+// acceleration produces on purpose) soften bonds and run away.
+@compute @workgroup_size(64)
+fn crust_bond_stress(@builtin(global_invocation_id) id: vec3<u32>) {
+    let c_idx = id.x;
+    if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
+    let c = constraints[c_idx];
+    let C = distance(particles[c.particle_b].predicted_pos.xyz, particles[c.particle_a].predicted_pos.xyz) - c.rest_length;
+    let stiffness_factor = select(1.0, max(1.0 - c.damage, 1e-4), C > 0.0);
+
+    // Central bonds carry no shear; a real shear measure arrives with the
+    // per-particle strain fit (design phase 4).
     let sigma_n = sim.crust_youngs_modulus_gpa * 1000.0 * stiffness_factor * C / c.rest_length;
     constraints[c_idx].stress_normal_mpa = sigma_n;
     constraints[c_idx].stress_shear_mpa = 0.0;
@@ -130,10 +185,6 @@ fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     if (abs(sigma_n) > y) {
         constraints[c_idx].damage = min(c.damage + ((abs(sigma_n) - y) / y) * 50.0 * sim.dt_crust_myr, 1.0);
     }
-
-    // count 0: bond corrections are applied in full (see crust_apply_deltas).
-    add_delta(pA, -wA * dlambda * n, 0i);
-    add_delta(pB, wB * dlambda * n, 0i);
 }
 
 @compute @workgroup_size(64)

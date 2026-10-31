@@ -597,11 +597,47 @@ The order is chosen so that phases 0–4 already improve the current game output
 - **Practical:** queuing many slow steps tripped Chromium's GPU watchdog (device lost);
   `runSteps` now keeps at most two steps in flight.
 
-**Proposed re-ordering (for discussion):** do phase 5 (plates as a coarse level)
-before phases 3–4, since it decides whether stresses mean anything. A cheaper
-intermediate is Chebyshev semi-iterative acceleration of the Jacobi sweeps (Wang 2015,
-for projective and position-based dynamics), a few lines on the GPU, often an order of
-magnitude in convergence; it may be enough at 220 km but not at 50 km.
+**Re-ordering (agreed):** Chebyshev acceleration of the Jacobi sweeps first, then
+phase 5 (plates as a coarse level), then phases 3–4.
+
+### Chebyshev acceleration (between phases 2 and 5)
+
+Semi-iterative acceleration (Wang 2015): x_{k+1} = ω_k (x̂ − x_{k−1}) + x_{k−1}, where
+x̂ is one plain sweep, applied with the same weights to the multipliers so that
+x − x̃ stays consistent with λ. ω follows Wang's recurrence, starting after 3 plain
+sweeps.
+
+- **The spectral radius can be derived, not tuned.** The sweep acts on the
+  multipliers as I − (BWBᵀ + α̃)/(d(w_a + w_b + α̃)), where B is the bond–particle
+  incidence. Self-equilibrated bond-force patterns (null space of Bᵀ) are slowest:
+  ρ = 1 − α̃/(d(2 + α̃)), with α̃ = 1/(κ·dt) and d = 6. That is 0.9996 at 70 GPa and
+  dt = 16 kyr: plain Jacobi needs ~6000 sweeps per 10× error reduction, Chebyshev ~110.
+  The chain test's empirical optimum (0.999 at d = 2) matches the formula (0.99875).
+- **Mechanism test (kept):** a 61-particle pre-compressed chain at κ·dt = 200 against
+  the exact tridiagonal solution. After 128 sweeps the error is 0.5% with Chebyshev and
+  76% with plain Jacobi; plain Jacobi still has 14% after 1024 sweeps.
+- **Two things broke acceleration on the planet**, both nonlinearities inside the
+  iteration. Each made 64-iteration runs diverge (all bonds damaged, ~280 MPa):
+  1. damage updated inside the iterations, so Chebyshev's intentional overshoot
+     softened bonds; moved to a single pass after the solve (which design §4.7 wanted
+     anyway);
+  2. damaged bonds switching stiffness between tension and compression mid-solve; the
+     switch is now decided by the previous step's stress, so the operator is linear
+     within a step (a one-step lag when a damaged bond goes from compression to
+     tension). Collisions are the same kind of switch and have not caused trouble so
+     far; they may in strongly convergent zones.
+- **Planet benchmark** (70 GPa, 20 steps, initial damage present): median |σ|, p99,
+  share over yield. Plain Jacobi 16 iterations: 32 MPa, 185, 2.6%. Chebyshev 32: 3.0
+  MPa, 19, 0%. Chebyshev 64: 1.3 MPa, 7, 0%. Without initial damage, Chebyshev 64 gives
+  1.1 MPa, which is the expected converged level at 1–2 cm/yr. **E is back to 70 GPa**
+  with 32 iterations as the default; the 2 GPa stop-gap is gone.
+- **Cost:** iterations scale as √(κ·dt) per step, so the cost *per Myr* scales as
+  1/√dt. Longer steps are cheaper per Myr, up to the point where per-step topology
+  changes (splits, subduction) need finer time resolution.
+- **What is left for the plate level:** the slowest modes are near-rigid motions of
+  large patches (drag-dominated, little elastic energy), which a per-plate rigid-body
+  solve removes directly; and the √(κ·dt) iteration count, which grows at 50 km
+  spacing and at larger dt.
 
 ---
 

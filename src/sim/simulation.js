@@ -22,6 +22,7 @@ const EARTH_RADIUS_M = 6.371e6;
 const SECONDS_PER_MYR = 3.15576e13;
 const MANTLE_STABILITY = 0.5;  // fraction of the explicit-Euler stability limit used per substep
 const FREE_LIST_HEADER_WORDS = 4;
+const MAX_SOLVER_ITERATIONS = 1024; // size of the Chebyshev weight table
 const WORKGROUP = 64;
 
 /** Buffers that together are the complete simulation state (snapshot / restore). */
@@ -53,6 +54,7 @@ export class Simulation {
       constraintPool: device.createBuffer({ label: 'constraint free list', size: (FREE_LIST_HEADER_WORDS + maxConstraints) * 4, usage: S }),
       hashGrid: device.createBuffer({ label: 'hash grid', size: hashGridDim ** 3 * 4, usage: S }),
       deltas: device.createBuffer({ label: 'particle deltas', size: maxParticles * 16, usage: S }),
+      solver: device.createBuffer({ label: 'solver state', size: (4 + MAX_SOLVER_ITERATIONS) * 4, usage: S }),
       params: device.createBuffer({ label: 'sim params', size: SIM_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
     };
 
@@ -90,7 +92,12 @@ export class Simulation {
       max_constraints: CAPACITY.maxConstraints,
       hash_grid_dim: CAPACITY.hashGridDim,
     });
+    if (this.params.solver_iterations > MAX_SOLVER_ITERATIONS) throw new Error(`solver_iterations > ${MAX_SOLVER_ITERATIONS}`);
     this.device.queue.writeBuffer(this.buffers.params, 0, packSimParams(this.params));
+    const rho = this.params.chebyshev_rho < 0 ? jacobiSpectralRadius(this.params) : this.params.chebyshev_rho;
+    this.chebyshevRho = rho;
+    const omega = chebyshevWeights(rho, this.params.chebyshev_delay, MAX_SOLVER_ITERATIONS);
+    this.device.queue.writeBuffer(this.buffers.solver, 16, omega);
   }
 
   #createPipelines(onError) {
@@ -98,7 +105,7 @@ export class Simulation {
     const code = [structsWGSL({ atomicGrid: true }), bindingsWGSL, locateWGSL, mantleWGSL, thermalWGSL, growthWGSL, solverWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
-    const order = ['grid', 'adjacency', 'particles', 'constraints', 'particlePool', 'constraintPool', 'hashGrid', 'deltas'];
+    const order = ['grid', 'adjacency', 'particles', 'constraints', 'particlePool', 'constraintPool', 'hashGrid', 'deltas', 'solver'];
     const memoryLayout = device.createBindGroupLayout({
       entries: order.map((name, binding) => ({
         binding,
@@ -129,6 +136,7 @@ export class Simulation {
       'crust_accumulation', 'crust_commit_splits', 'crust_rewire_bonds', 'crust_clean_split',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
       'crust_begin_constraints', 'crust_store_bond_count',
+      'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine', 'crust_bond_stress',
       'crust_clear_deltas', 'crust_solve_constraints', 'crust_solve_collisions', 'crust_apply_deltas',
       'crust_integrate',
     ];
@@ -261,6 +269,7 @@ export class Simulation {
     run('crust_clear_deltas', crust);
     run('crust_begin_constraints', bonds); // reset lambda, count bonds per particle
     run('crust_store_bond_count', crust);
+    run('solver_begin', 1);
     for (let i = 0; i < this.params.solver_iterations; i++) {
       run('crust_clear_deltas', crust);
       run('crust_solve_constraints', bonds);
@@ -268,7 +277,10 @@ export class Simulation {
       run('crust_clear_deltas', crust);
       run('crust_solve_collisions', crust);
       run('crust_apply_deltas', crust);
+      run('crust_chebyshev_combine', crust);
+      run('solver_next_iteration', 1);
     }
+    run('crust_bond_stress', bonds);
     run('crust_integrate', crust);
     pass.end();
     this.steps++;
@@ -325,6 +337,31 @@ function freeList(used, capacity) {
   for (let i = used; i < capacity; i++) data[FREE_LIST_HEADER_WORDS + n++] = i;
   data[0] = n;
   return data;
+}
+
+/**
+ * Spectral radius of one plain Jacobi sweep of the bond solve. The sweep
+ * acts on the multipliers with matrix I - (B W B^T + a I) / (d (w_a + w_b + a)),
+ * where B is the bond-particle incidence, a = 1 / (bond_rate dt) the scaled
+ * compliance and d the largest bond count. B W B^T has eigenvalues in
+ * [0, 2d] (for unit drag weights), so the slowest factor is
+ * 1 - a / (d (2 + a)), from bond-force patterns that exert no net force.
+ */
+export function jacobiSpectralRadius(p, maxDegree = 6) {
+  const a = 1 / (p.bond_rate_myr_inv * p.dt_crust_myr);
+  return 1 - a / (maxDegree * (2 + a));
+}
+
+/**
+ * Chebyshev weights omega_k for iteration k (Wang 2015): 1 for the first
+ * `delay` iterations, then 2 / (2 - rho^2), then 4 / (4 - rho^2 omega_{k-1}).
+ * rho = 0 gives plain Jacobi (all ones).
+ */
+export function chebyshevWeights(rho, delay, n) {
+  const w = new Float32Array(n).fill(1);
+  const r2 = rho * rho;
+  for (let k = delay; k < n && rho > 0; k++) w[k] = k === delay ? 2 / (2 - r2) : 4 / (4 - r2 * w[k - 1]);
+  return w;
 }
 
 /**

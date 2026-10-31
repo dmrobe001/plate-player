@@ -19,6 +19,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Constraint, Particle, unpack } from '../src/gpu/layout.js';
 import { readZip } from '../src/record/zip.js';
 import { createIcosphere } from '../src/geometry/icosphere.js';
+import { CHAIN, chainExact, chainState } from './support/chain.mjs';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
@@ -180,6 +181,40 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
   }
   assert.deepEqual(page.errors, []);
   await page.close();
+});
+
+test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi does not', { timeout: 600_000 }, async () => {
+  // A pre-compressed chain with kappa * dt = 200 (the stiff regime of a 70 GPa
+  // lithosphere): the exact implicit step is a tridiagonal solve. Plain Jacobi
+  // propagates the end displacement about one bond per sweep.
+  const K = 200;
+  const page = await openPage();
+  const runs = await page.evaluate(async ([chain, builderSrc, K]) => {
+    const build = eval(`(${builderSrc})`);
+    await plate.setParams({ blanket_forcing: 0, mantle_time_per_myr: 0, crust_youngs_modulus_gpa: 70 });
+    await plate.setParams({ dt_crust_myr: K / plate.sim.params.bond_rate_myr_inv, solver_iterations: 128 });
+    const out = {};
+    for (const [name, rho] of [['plain', 0], ['chebyshev', 0.999]]) {
+      await plate.setParams({ chebyshev_rho: rho });
+      await plate.loadState(build(chain, plate.sim.numNodes));
+      await plate.runSteps(1);
+      const f = new Float32Array((await plate.readBuffers(['particles'])).particles);
+      const w = f.length / 25000;
+      out[name] = Array.from({ length: chain.n }, (_, i) => Math.atan2(f[w * i], f[w * i + 2]));
+    }
+    return out;
+  }, [CHAIN, chainState.toString(), K]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+
+  const exact = chainExact(CHAIN, K);
+  const phi0 = (i) => (i - (CHAIN.n - 1) / 2) * CHAIN.spacing;
+  const norm = Math.hypot(...exact);
+  const error = (phi) => Math.hypot(...phi.map((p, i) => p - phi0(i) - exact[i])) / norm;
+  const plain = error(runs.plain), cheb = error(runs.chebyshev);
+  console.log(`  128 sweeps: relative error plain Jacobi ${plain.toFixed(3)}, Chebyshev ${cheb.toFixed(4)}`);
+  assert.ok(cheb < 0.02, `Chebyshev error ${cheb}`);
+  assert.ok(plain > 10 * cheb, `plain ${plain} vs Chebyshev ${cheb}`);
 });
 
 test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 }, async () => {

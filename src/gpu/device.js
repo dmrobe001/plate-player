@@ -1,10 +1,18 @@
 // WebGPU device setup and error reporting.
 
+export const REQUIRED_STORAGE_BUFFERS = 9; // compute bindings in shaders/compute/bindings.wgsl
+
 export async function initDevice(canvas, onError) {
   if (!navigator.gpu) throw new Error('WebGPU is not supported in this browser (try a recent Chrome or Edge).');
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('No WebGPU adapter found.');
-  const device = await adapter.requestDevice();
+  // The compute stage binds more storage buffers than WebGPU's default
+  // limit of 8; desktop GPUs support many more, so ask for what the adapter has.
+  const storageBuffers = adapter.limits.maxStorageBuffersPerShaderStage;
+  if (storageBuffers < REQUIRED_STORAGE_BUFFERS) {
+    throw new Error(`This GPU allows ${storageBuffers} storage buffers per shader stage; the simulation needs ${REQUIRED_STORAGE_BUFFERS}.`);
+  }
+  const device = await adapter.requestDevice({ requiredLimits: { maxStorageBuffersPerShaderStage: storageBuffers } });
   device.addEventListener('uncapturederror', (e) => onError(`GPU error: ${e.error.message}`));
   device.lost.then((info) => onError(`GPU device lost: ${info.message}`));
 
