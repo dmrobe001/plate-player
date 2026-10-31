@@ -98,11 +98,11 @@ export const Particle = defineStruct('Particle', [
   ['bond_count', 'u32'],        // active bonds this step; scales Jacobi updates
 ]);
 
-/** A bond between two particles. */
+/** A bond between two particles. Its rest length is not stored: it is always
+ * the sum of the two apothems (rest_length() in bindings.wgsl). */
 export const Constraint = defineStruct('Constraint', [
   ['particle_a', 'u32'],
   ['particle_b', 'u32'],
-  ['rest_length', 'f32'],
   ['lambda', 'f32'],            // XPBD multiplier accumulated over this step's iterations
   ['yield_stress_mpa', 'f32'],
   ['is_active', 'u32'],

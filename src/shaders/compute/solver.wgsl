@@ -127,7 +127,7 @@ fn crust_chebyshev_combine(@builtin(global_invocation_id) id: vec3<u32>) {
     particles[idx].iter_start = x;
 }
 
-// One XPBD update per bond, C = |x_b - x_a| - rest_length:
+// One XPBD update per bond, C = |x_b - x_a| - (apothem_a + apothem_b):
 //   dlambda = (-C - a~ lambda) / (w_a + w_b + a~),  a~ = 1 / (stiffness * dt)
 //   dx_a = -w_a n dlambda,  dx_b = +w_b n dlambda
 // Bonds are updated simultaneously (Jacobi), so each dlambda is scaled by
@@ -152,7 +152,7 @@ fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     let dir = particles[pB].predicted_pos.xyz - particles[pA].predicted_pos.xyz;
     let dist = max(length(dir), 1e-6);
     let n = dir / dist;
-    let C = dist - c.rest_length; // + stretched, - compressed
+    let C = dist - rest_length(c); // + stretched, - compressed
 
     // Damage softens tension, never compression. Whether the bond counts as
     // in tension is decided by last step's stress, not the current iterate:
@@ -182,12 +182,13 @@ fn crust_bond_stress(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
     if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
     let c = constraints[c_idx];
-    let C = distance(particles[c.particle_b].predicted_pos.xyz, particles[c.particle_a].predicted_pos.xyz) - c.rest_length;
+    let rest = rest_length(c);
+    let C = distance(particles[c.particle_b].predicted_pos.xyz, particles[c.particle_a].predicted_pos.xyz) - rest;
     let stiffness_factor = select(1.0, max(1.0 - c.damage, 1e-4), C > 0.0);
 
     // Central bonds carry no shear; a real shear measure arrives with the
     // per-particle strain fit (design phase 4).
-    let sigma_n = sim.crust_youngs_modulus_gpa * 1000.0 * stiffness_factor * C / c.rest_length;
+    let sigma_n = sim.crust_youngs_modulus_gpa * 1000.0 * stiffness_factor * C / rest;
     constraints[c_idx].stress_normal_mpa = sigma_n;
     constraints[c_idx].stress_shear_mpa = 0.0;
 

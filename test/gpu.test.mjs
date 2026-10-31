@@ -144,7 +144,8 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
   const page = await openPage();
   const results = await page.evaluate(async () => {
     const a = 0.0175, L = 3 * a, eps = 0.1;
-    await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70 });
+    // base_apothem = L/2: these particles have the reference drag (w = 1).
+    await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: L / 2 });
     const kappa70 = plate.sim.params.bond_rate_myr_inv;
     await plate.setParams({ crust_youngs_modulus_gpa: 70 * 0.5 / kappa70 }); // kappa = 0.5/Myr, tau = 1/(2 kappa) = 1 Myr
     const tau = 1 / (2 * plate.sim.params.bond_rate_myr_inv);
@@ -155,9 +156,9 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
         position: Float32Array.from([-Math.sin(half), 0, Math.cos(half), Math.sin(half), 0, Math.cos(half)]),
         thickness: Float32Array.of(7, 7), compositionDensity: Float32Array.of(3000, 3000),
         // Age 100 Myr: oceanic lithosphere at its 100 km cap, so the drag equals the reference (w = 1).
-        temperature: Float32Array.of(278, 278), age: Float32Array.of(100, 100), apothem: Float32Array.of(a, a),
+        temperature: Float32Array.of(278, 278), age: Float32Array.of(100, 100), apothem: Float32Array.of(L / 2, L / 2), // rest length = apothem sum
       },
-      bonds: { count: 1, a: Uint32Array.of(0), b: Uint32Array.of(1), restLength: Float32Array.of(L), damage: Float32Array.of(0) },
+      bonds: { count: 1, a: Uint32Array.of(0), b: Uint32Array.of(1), damage: Float32Array.of(0) },
       yieldStressMPa: 1e6,
     });
     const stretch = async () => {
@@ -185,14 +186,14 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
 });
 
 test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi does not', { timeout: 600_000 }, async () => {
-  // A pre-compressed chain with kappa * dt = 200 (the stiff regime of a 70 GPa
+  // A pre-stretched chain with kappa * dt = 200 (the stiff regime of a 70 GPa
   // lithosphere): the exact implicit step is a tridiagonal solve. Plain Jacobi
   // propagates the end displacement about one bond per sweep.
   const K = 200;
   const page = await openPage();
   const runs = await page.evaluate(async ([chain, builderSrc, K]) => {
     const build = eval(`(${builderSrc})`);
-    await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70 });
+    await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: chain.apothem });
     await plate.setParams({ dt_crust_myr: K / plate.sim.params.bond_rate_myr_inv, solver_iterations: 128 });
     const out = {};
     for (const [name, rho] of [['plain', 0], ['chebyshev', 0.999]]) {

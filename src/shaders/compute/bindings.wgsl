@@ -79,6 +79,13 @@ fn arrhenius(temp: f32) -> f32 {
     return select(0.0, exp(exponent), exponent > -50.0);
 }
 
+// A bond's rest length is always the sum of its particles' apothems, whatever
+// changed them (growth, splitting, ...), so bonds and contacts agree on the
+// distance at which two particles touch.
+fn rest_length(c: Constraint) -> f32 {
+    return particles[c.particle_a].apothem + particles[c.particle_b].apothem;
+}
+
 fn bond_temperature(c: Constraint) -> f32 {
     return max((particles[c.particle_a].temperature + particles[c.particle_b].temperature) * 0.5, 1.0);
 }

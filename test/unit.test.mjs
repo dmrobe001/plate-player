@@ -74,8 +74,8 @@ test('sampling reproduces constant and linear fields, and support ~ coverage', (
   assert.ok(rms < 0.1 * spacing, `linear field rms error ${rms}`);
   assert.ok(worst < 0.6 * spacing, `linear field worst error (support > 0.5) ${worst}`);
   const meanSupport = out.support.reduce((s, v) => s + v, 0) / out.support.length;
-  // Hexagons cover 85% of the sphere; the 3-sigma cutoff drops ~1% of the kernel.
-  assert.ok(Math.abs(meanSupport - 0.85) < 0.03, `mean support ${meanSupport}`);
+  // Mean support is the hexagons' coverage of the sphere; the 3-sigma cutoff drops ~1% of the kernel.
+  assert.ok(Math.abs(meanSupport - state.stats.coverage) < 0.03, `mean support ${meanSupport} vs coverage ${state.stats.coverage}`);
 });
 
 test('east/north frame is orthonormal and tangent', () => {
@@ -194,4 +194,23 @@ test('mantle: same seed same state, resumes exactly from saved state, and keeps 
   const corr = dot(start, a.b) / Math.sqrt(dot(start, start) * dot(a.b, a.b));
   assert.ok(Math.abs(corr) < 0.5, `correlation after 250 Myr ${corr}`);
   assert.ok(a.rmsSpeedCmYr() > 0.5 && a.rmsSpeedCmYr() < 30, `rms speed ${a.rmsSpeedCmYr()}`);
+});
+
+test('initial bonds are stress-free with rest length = apothem sum, and unbonded pairs do not overlap', () => {
+  const { particles: P, bonds: B, stats } = generateInitialState({ seed: 2 });
+  const p = P.position, a = P.apothem;
+  let worst = 0;
+  const bonded = new Set();
+  for (let k = 0; k < B.count; k++) {
+    const i = B.a[k], j = B.b[k];
+    bonded.add(Math.min(i, j) * P.count + Math.max(i, j));
+    const d = Math.hypot(p[3 * i] - p[3 * j], p[3 * i + 1] - p[3 * j + 1], p[3 * i + 2] - p[3 * j + 2]);
+    worst = Math.max(worst, Math.abs(d - a[i] - a[j]) / (a[i] + a[j]));
+  }
+  assert.ok(worst < 2e-5, `worst bond strain ${worst} (fit reported ${stats.maxBondStrain})`);
+  let overlap = 0;
+  new CellList(p, 2 * Math.max(...a)).forEachPair((i, j, dx, dy, dz, d) => {
+    if (!bonded.has(Math.min(i, j) * P.count + Math.max(i, j))) overlap = Math.max(overlap, (a[i] + a[j] - d) / (a[i] + a[j]));
+  });
+  assert.ok(overlap < 2e-5, `worst unbonded overlap ${overlap}`);
 });

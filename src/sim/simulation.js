@@ -189,7 +189,6 @@ export class Simulation {
       const base = k * Constraint.words;
       cu[base + co.particle_a] = B.a[k];
       cu[base + co.particle_b] = B.b[k];
-      cf[base + co.rest_length] = B.restLength[k];
       cf[base + co.yield_stress_mpa] = state.yieldStressMPa;
       cu[base + co.is_active] = 1;
       cf[base + co.damage] = B.damage[k];

@@ -5,16 +5,18 @@
 //   1. Scatter N points uniformly on the sphere.
 //   2. Relax them with pure pairwise repulsion (no bonds yet). N is chosen so
 //      the hexagons would cover a fraction `coverage` < 1 of the sphere, which
-//      leaves room to remove nearly every overlap; the few that remain are
-//      removed by shrinking those particles' apothems to half the distance to
-//      their nearest neighbour (typically by well under 1%). Otherwise bonds
-//      (holding the current distance) and contacts (pushing to the apothem sum)
-//      would fight from the first step.
+//      leaves room to remove nearly every overlap.
 //   3. Crust type: threshold a fractal-noise field so that a fraction
 //      `continentalFraction` of particles is continental. Continental
 //      thickness rises from coast to interior.
-//   4. Bond each particle to its nearest neighbours (max 6), rest length =
-//      current distance, so the starting lattice is stress-free.
+//   4. Bond each particle to its nearest neighbours (max 6). A bond's rest
+//      length is always the sum of its particles' apothems (the simulation
+//      derives it, it is not stored), so to start stress-free, positions and
+//      apothems are fitted together until every bond has length a_i + a_j
+//      and no unbonded pair overlaps. With ~3 bonds per particle and 3
+//      unknowns per particle (2 position, 1 apothem) this is solvable; the
+//      fit typically leaves strains below 1e-5 and apothems within ~0.65-1.45
+//      of the nominal value, and fills some of the gaps (coverage rises).
 //   5. Bond damage: a domain-warped Voronoi ("Worley") pattern of plate
 //      centres. Bonds near Voronoi cell borders are damaged, which seeds a
 //      network of weak plate boundaries with triple junctions.
@@ -33,6 +35,8 @@ export const INIT_DEFAULTS = {
   apothem: 0.0175,            // unit-sphere length; matches sim param base_apothem
   coverage: 0.85,             // fraction of the sphere the hexagons would tile
   relaxIterations: 100,
+  fitTolerance: 1e-5,         // largest bond strain left by the apothem fit (x 70 GPa = 0.7 MPa)
+  fitIterations: 500,
   continentalFraction: 0.35,
   continentFrequency: 1.4,    // noise frequency on the unit sphere (higher = smaller continents)
   plateCount: 12,
@@ -59,17 +63,6 @@ export function generateInitialState(options = {}) {
   const position = new Float32Array(3 * n);
   for (let i = 0; i < n; i++) position.set(randomOnSphere(rng), 3 * i);
   const relaxResidual = relax(position, contact, opt.relaxIterations);
-  const apothem = new Float32Array(n).fill(opt.apothem);
-  new CellList(position, contact).forEachPair((i, j, dx, dy, dz, d) => {
-    const fit = (d / 2) * (1 - 1e-5); // margin for float32 rounding on the GPU
-    apothem[i] = Math.min(apothem[i], fit);
-    apothem[j] = Math.min(apothem[j], fit);
-  });
-  let shrunk = 0, minApothem = opt.apothem;
-  for (let i = 0; i < n; i++) {
-    if (apothem[i] < opt.apothem) shrunk++;
-    minApothem = Math.min(minApothem, apothem[i]);
-  }
 
   // 3. Crust type from thresholded fractal noise.
   const continentNoise = createPerlin3(rng);
@@ -90,7 +83,7 @@ export function generateInitialState(options = {}) {
     compositionDensity: new Float32Array(n),
     temperature: new Float32Array(n),
     age: new Float32Array(n),
-    apothem,
+    apothem: null, // set by the fit in step 4
   };
   let continental = 0;
   for (let i = 0; i < n; i++) {
@@ -104,8 +97,10 @@ export function generateInitialState(options = {}) {
     continental += isContinent;
   }
 
-  // 4. Bonds to nearest neighbours.
+  // 4. Bonds to nearest neighbours, then fit positions and apothems to them.
   const bonds = buildBonds(position, opt.bondCutoff * contact, opt.maxBondsPerParticle);
+  const fit = fitApothems(position, opt.apothem, bonds, opt.fitTolerance, opt.fitIterations);
+  particles.apothem = fit.apothem;
 
   // 5. Damage along warped Voronoi borders, evaluated at bond midpoints.
   //    Any bond joining particles in different cells is fully damaged, so
@@ -136,8 +131,10 @@ export function generateInitialState(options = {}) {
       continentalFraction: continental / n,
       damagedBondFraction: damaged / bonds.count,
       relaxResidual,
-      shrunkFraction: shrunk / n,
-      minApothemRatio: minApothem / opt.apothem,
+      fitIterations: fit.iterations,
+      maxBondStrain: fit.maxStrain,
+      apothemRange: [fit.min / opt.apothem, fit.max / opt.apothem],
+      coverage: fit.coverage,
     },
   };
 }
@@ -176,6 +173,64 @@ function relax(position, contact, iterations) {
   return worst / contact;
 }
 
+/**
+ * Make every bond length equal the sum of its particles' apothems, and keep
+ * unbonded pairs from overlapping. Gauss-Seidel over bonds, each correcting
+ * C = d - a_i - a_j by moving both positions and both apothems (equal
+ * weights); then each overlapping unbonded pair shrinks both apothems. Stops
+ * when the largest |C| / (a_i + a_j) is below `tolerance`. Modifies
+ * `position` (renormalised onto the sphere); returns the apothems.
+ */
+function fitApothems(position, apothem0, bonds, tolerance, iterations) {
+  const p = position, n = p.length / 3;
+  const a = new Float64Array(n).fill(apothem0);
+  const key = (i, j) => (i < j ? i * n + j : j * n + i);
+  const bonded = new Set();
+  for (let k = 0; k < bonds.count; k++) bonded.add(key(bonds.a[k], bonds.b[k]));
+  // Unbonded pairs that could touch, refreshed every few sweeps (with a margin).
+  let near = [];
+  const findNear = () => {
+    let amax = 0;
+    for (let i = 0; i < n; i++) amax = Math.max(amax, a[i]);
+    near = [];
+    new CellList(p, 2.2 * amax).forEachPair((i, j) => { if (!bonded.has(key(i, j))) near.push(i, j); });
+  };
+  let it = 0, maxStrain = Infinity;
+  for (; it < iterations && maxStrain > tolerance; it++) {
+    if (it % 10 === 0) findNear();
+    maxStrain = 0;
+    for (let k = 0; k < bonds.count; k++) {
+      const i = bonds.a[k], j = bonds.b[k];
+      const dx = p[3 * j] - p[3 * i], dy = p[3 * j + 1] - p[3 * i + 1], dz = p[3 * j + 2] - p[3 * i + 2];
+      const d = Math.hypot(dx, dy, dz);
+      const C = d - a[i] - a[j];
+      maxStrain = Math.max(maxStrain, Math.abs(C) / (a[i] + a[j]));
+      const lambda = C / 4; // -C / (sum of squared gradients: 2 positions + 2 apothems)
+      const s = lambda / d;
+      p[3 * i] += dx * s; p[3 * i + 1] += dy * s; p[3 * i + 2] += dz * s;
+      p[3 * j] -= dx * s; p[3 * j + 1] -= dy * s; p[3 * j + 2] -= dz * s;
+      a[i] += lambda; a[j] += lambda;
+    }
+    for (let i = 0; i < n; i++) {
+      const len = Math.hypot(p[3 * i], p[3 * i + 1], p[3 * i + 2]);
+      p[3 * i] /= len; p[3 * i + 1] /= len; p[3 * i + 2] /= len;
+    }
+    for (let k = 0; k < near.length; k += 2) {
+      const i = near[k], j = near[k + 1];
+      const C = Math.hypot(p[3 * i] - p[3 * j], p[3 * i + 1] - p[3 * j + 1], p[3 * i + 2] - p[3 * j + 2]) - a[i] - a[j];
+      if (C >= 0) continue;
+      maxStrain = Math.max(maxStrain, -C / (a[i] + a[j]));
+      a[i] += C / 2; a[j] += C / 2;
+    }
+  }
+  let min = Infinity, max = 0, area = 0;
+  for (let i = 0; i < n; i++) {
+    min = Math.min(min, a[i]); max = Math.max(max, a[i]);
+    area += 2 * Math.sqrt(3) * a[i] ** 2;
+  }
+  return { apothem: Float32Array.from(a), iterations: it, maxStrain, min, max, coverage: area / (4 * Math.PI) };
+}
+
 /** Bond the closest pairs first, skipping any particle that already has maxBonds. */
 function buildBonds(position, cutoff, maxBonds) {
   const pairs = [];
@@ -184,17 +239,16 @@ function buildBonds(position, cutoff, maxBonds) {
 
   const n = position.length / 3;
   const count = new Uint8Array(n);
-  const a = [], b = [], rest = [];
-  for (const [i, j, d] of pairs) {
+  const a = [], b = [];
+  for (const [i, j] of pairs) {
     if (count[i] >= maxBonds || count[j] >= maxBonds) continue;
-    a.push(i); b.push(j); rest.push(d);
+    a.push(i); b.push(j);
     count[i]++; count[j]++;
   }
   return {
     count: a.length,
     a: Uint32Array.from(a),
     b: Uint32Array.from(b),
-    restLength: Float32Array.from(rest),
     damage: new Float32Array(a.length),
   };
 }

@@ -54,7 +54,6 @@ fn crust_accumulation(@builtin(global_invocation_id) id: vec3<u32>) {
 
     constraints[bond].particle_a = idx;
     constraints[bond].particle_b = child;
-    constraints[bond].rest_length = particles[idx].apothem * 2.0;
     constraints[bond].lambda = 0.0;
     constraints[bond].yield_stress_mpa = sim.yield_stress_mpa;
     constraints[bond].is_active = 1u;
@@ -94,10 +93,7 @@ fn crust_rewire_bonds(@builtin(global_invocation_id) id: vec3<u32>) {
             pB = childB; constraints[c_idx].particle_b = childB; rewired = true;
         }
     }
-    if (rewired) {
-        constraints[c_idx].rest_length = particles[pA].apothem + particles[pB].apothem;
-        constraints[c_idx].damage = 0.0;
-    }
+    if (rewired) { constraints[c_idx].damage = 0.0; }
 }
 
 @compute @workgroup_size(64)

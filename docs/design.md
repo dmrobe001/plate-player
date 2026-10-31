@@ -778,6 +778,14 @@ bond; one-off, SwiftShader):
   at opening plate boundaries (next to broken bonds under tension), with bonded pairs
   exempt from collisions (part of phase 3); (2) proper gap filling at divergent
   boundaries (phase 8: new particles placed in gaps, no inflation at all).
+- **Change made first (user's call):** a bond's rest length is now always the sum of
+  its apothems, whatever changes a particle's area, so the conflict above cannot arise.
+  The initial state fits positions and apothems jointly to keep the start stress-free.
+  Hypothesis to test: growth no longer tears plate interiors. Predicted: with growth on,
+  interior non-rigid speed and new damage approach the growth-off row. Growth inside
+  plates still *pushes* (an inflating particle now pushes through its bonds as well as
+  its contacts), so some deformation is expected; the question is whether it breaks
+  bonds. To be measured.
 
 **Spreading proxy, regrounded.** Crust over diverging mantle grows in area at the
 divergence rate (above 0.002/Myr, capped at 5%/Myr). Upwelling divergence is ~1%/Myr,

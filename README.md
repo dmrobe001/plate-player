@@ -77,8 +77,9 @@ column with thickness, composition density, temperature, age, and area
 (2√3·apothem²). Its density follows thermal expansion and its elevation follows
 Airy isostasy: thickness × (1 − ρ/ρ_mantle), with extra depression under water.
 
-**Bonds** (`Constraint`). Each bond is a central spring with a rest length, a yield
-stress, and damage in [0, 1]. Its stiffness comes from the lithosphere's Young's
+**Bonds** (`Constraint`). Each bond is a central spring with a yield stress and
+damage in [0, 1]. Its rest length is always the sum of the two particles' apothems
+(computed, not stored), so it follows any change in particle size. Its stiffness comes from the lithosphere's Young's
 modulus and elastic thickness, k = (√3/2)·E·hₑ (the 2D modulus of a triangular spring
 network), with the physical E ≈ 70 GPa. Stress beyond an Arrhenius-weakened yield stress accumulates damage;
 damage softens tension (never compression); heat slowly heals it.
@@ -119,8 +120,11 @@ thins until it melts. Its index then returns to a free list for reuse.
    noise at the quantile that makes 35% of particles continental. Continental
    thickness rises from 30 km at the coast to 45 km in the interior.
 4. Each particle bonds to its nearest neighbours within 1.3 contact distances
-   (closest pairs first, at most 6 bonds each). Rest length is the current
-   distance, so the bond lattice starts stress-free.
+   (closest pairs first, at most 6 bonds each). A bond's rest length is always
+   the sum of its two apothems, so positions and apothems are then fitted together
+   (Gauss–Seidel) until every bond is at that length and no unbonded pair overlaps.
+   The lattice starts stress-free (strain < 10⁻⁵); apothems end up within about
+   0.65–1.45× nominal, and coverage rises to about 90%.
 5. Bond damage comes from domain-warped Voronoi (Worley) noise around 12 random
    plate centres. Bonds near cell borders are damaged, which seeds a network of
    weak plate boundaries with triple junctions.
@@ -232,6 +236,38 @@ They need lots of compute and pin down behaviour that is supposed to keep changi
 Measure those once when a phase lands, write the number in `docs/design.md`, and
 move on.
 
+## Debugging: treat causes as hypotheses
+
+This project stacks many layers of numerical processing: noise fields, a packing
+relaxation, a mantle solve, drag laws, a constraint solver with acceleration,
+damage, thermal relaxation, sampling onto meshes. The distribution of intermediate
+values at runtime is hard to predict, and intuition about it can be arbitrarily
+wrong, whether from a bug, a subtlety of the math, or the particulars of a state.
+Several findings in `docs/design.md` overturned the obvious explanation (for
+example, more solver iterations made plates *weaker*, because a better-converged
+solve enforced a conflict that a sloppy one ignored).
+
+So when something looks wrong:
+
+1. **State the suspected root cause as a hypothesis**, together with what it
+   predicts you would see in the data, including what would refute it.
+2. **Harvest runtime data to test it, with as little computation as possible.**
+   Read the relevant buffers and look at distributions (quantiles, histograms,
+   the worst few cases with their indices), not just means or the picture.
+   `plate.readBuffers([...])` in the browser console returns raw GPU buffers;
+   `unpack` in `src/gpu/layout.js` turns them into named arrays.
+3. **Skip the warm-up.** Capture a snapshot of the state where the problem
+   shows (`plate.snapshot()`, **Snapshot now**, or a record ZIP) and restart from it
+   (`plate.restore(...)`, **Resume from record**) for every experiment, instead of
+   re-running the minutes that lead up to it.
+4. **Test pipeline stages in isolation.** Feed one stage harvested data and look
+   at what it does: a CPU stage can be called directly from Node with arrays saved
+   from a run; a GPU stage can be driven by `plate.loadState` with a small
+   hand-built state (as the two-particle and chain tests do) or by a snapshot with
+   one parameter changed.
+5. **Write down what was measured,** including refuted hypotheses, in the findings
+   sections of `docs/design.md`.
+
 ## Recording
 
 Every run is recorded unless **Record this run** is unchecked (design.md §8.3 has
@@ -318,11 +354,17 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       findings). The plate level (design phase 5) is next.
 - [x] ~~Long steps tripped the browser's GPU watchdog.~~ Steps are submitted in
       pieces of 16 solver iterations, waiting for each.
-- [ ] **Growth recreates bond/contact conflicts.** The initial state is now
-      stress-free (apothems are shrunk so no pair overlaps; with the mantle off, the
-      stress is exactly zero), but a growing particle's bonds keep their rest length
-      while collisions push to the new apothem sum. Design phase 3 stops bonded pairs
-      from colliding.
+- [x] ~~Growth recreated bond/contact conflicts~~ (a growing particle's bonds
+      kept their rest length while collisions pushed to the new apothem sum). A
+      bond's rest length is now *always* the sum of its particles' apothems,
+      derived rather than stored, so bonds and contacts agree on the touching
+      distance whatever changes a particle's area. The initial state fits positions
+      and apothems together so every bond starts at that length (strain < 10⁻⁵).
+      To check: whether growth and splitting still tear plates (design.md,
+      driven-plate measurements).
+- [ ] **A compressed bonded pair is also a contact.** Both act at the same
+      distance, so they no longer conflict, but compression is resisted twice (an
+      elastic bond plus a hard projection). Design phase 3 unifies them.
 - [ ] **Bonds never form and never die from damage.** A fully damaged bond still
       resists compression and keeps 10% of its shear stiffness, and colliding
       plates never weld (no suturing or accretion).
