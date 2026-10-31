@@ -60,6 +60,7 @@ fn crust_accumulation(@builtin(global_invocation_id) id: vec3<u32>) {
     constraints[bond].damage = 0.0;
     constraints[bond].stress_normal_mpa = 0.0;
     constraints[bond].stress_shear_mpa = 0.0;
+    constraints[bond].kind = BOND;
 }
 
 // Single thread: pop the slots claimed in crust_accumulation.
@@ -76,7 +77,7 @@ fn crust_commit_splits() {
 @compute @workgroup_size(64)
 fn crust_rewire_bonds(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
-    if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
+    if (c_idx >= sim.max_bonds || constraints[c_idx].is_active == 0u) { return; }
     var pA = constraints[c_idx].particle_a;
     var pB = constraints[c_idx].particle_b;
     var rewired = false;

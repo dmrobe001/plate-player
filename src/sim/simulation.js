@@ -12,7 +12,9 @@ import solverWGSL from '../shaders/compute/solver.wgsl';
 
 export const CAPACITY = {
   maxParticles: 25000,
-  maxConstraints: 100000,
+  maxBonds: 65536,       // bond slots [0, maxBonds), managed by the constraint free list
+  maxContacts: 65536,    // contact slots follow, rebuilt every step
+  get maxConstraints() { return this.maxBonds + this.maxContacts; },
   hashGridDim: 32,       // collision grid cells per axis over [-1.5, 1.5]
   adjacencyWidth: 6,     // neighbours stored per mantle node
 };
@@ -57,9 +59,9 @@ export class Simulation {
       particles: device.createBuffer({ label: 'particles', size: maxParticles * Particle.byteSize, usage: S }),
       constraints: device.createBuffer({ label: 'constraints', size: maxConstraints * Constraint.byteSize, usage: S }),
       particlePool: device.createBuffer({ label: 'particle free list', size: (FREE_LIST_HEADER_WORDS + maxParticles) * 4, usage: S }),
-      constraintPool: device.createBuffer({ label: 'constraint free list', size: (FREE_LIST_HEADER_WORDS + maxConstraints) * 4, usage: S }),
+      constraintPool: device.createBuffer({ label: 'bond free list', size: (FREE_LIST_HEADER_WORDS + CAPACITY.maxBonds) * 4, usage: S }),
       hashGrid: device.createBuffer({ label: 'hash grid', size: hashGridDim ** 3 * 4, usage: S }),
-      deltas: device.createBuffer({ label: 'particle deltas', size: maxParticles * 16, usage: S }),
+      deltas: device.createBuffer({ label: 'particle deltas', size: maxParticles * 80, usage: S }), // ParticleDelta in bindings.wgsl
       solver: device.createBuffer({ label: 'solver state', size: (4 + MAX_SOLVER_ITERATIONS) * 4, usage: S }),
       plateIds: device.createBuffer({ label: 'plate ids (drawing only)', size: maxParticles * 4, usage: S }),
       params: device.createBuffer({ label: 'sim params', size: SIM_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
@@ -86,6 +88,7 @@ export class Simulation {
       num_nodes: this.numNodes,
       max_particles: CAPACITY.maxParticles,
       max_constraints: CAPACITY.maxConstraints,
+      max_bonds: CAPACITY.maxBonds,
       hash_grid_dim: CAPACITY.hashGridDim,
     });
     if (this.params.solver_iterations > MAX_SOLVER_ITERATIONS) throw new Error(`solver_iterations > ${MAX_SOLVER_ITERATIONS}`);
@@ -129,9 +132,9 @@ export class Simulation {
       'crust_thermo_isostasy', 'crust_refresh_derived', 'crust_constraint_healing',
       'crust_accumulation', 'crust_commit_splits', 'crust_rewire_bonds', 'crust_clean_split',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
-      'crust_begin_constraints', 'crust_store_bond_count',
+      'crust_begin_constraints', 'crust_clear_contacts', 'crust_find_contacts', 'crust_store_edge_count',
       'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine', 'crust_bond_stress',
-      'crust_clear_deltas', 'crust_solve_constraints', 'crust_solve_collisions', 'crust_apply_deltas',
+      'crust_clear_deltas', 'crust_solve_constraints', 'crust_apply_deltas',
       'crust_integrate',
     ];
     this.pipelines = Object.fromEntries(entryPoints.map((entryPoint) => [
@@ -146,10 +149,10 @@ export class Simulation {
    */
   load(state, mantle) {
     const { device, buffers } = this;
-    const { maxParticles, maxConstraints } = CAPACITY;
+    const { maxParticles, maxConstraints, maxBonds } = CAPACITY;
     const { particles: P, bonds: B } = state;
     if (P.count > maxParticles) throw new Error(`initial particles ${P.count} exceed capacity ${maxParticles}`);
-    if (B.count > maxConstraints) throw new Error(`initial bonds ${B.count} exceed capacity ${maxConstraints}`);
+    if (B.count > maxBonds) throw new Error(`initial bonds ${B.count} exceed capacity ${maxBonds}`);
     if (mantle.mesh !== this.mantleMesh) throw new Error('mantle must use the simulation\'s mantle mesh');
     this.mantle = mantle;
     this.uploadMantle();
@@ -175,6 +178,7 @@ export class Simulation {
       pu[base + po.is_active] = 1;
       pu[base + po.next_idx] = NONE;
       pf[base + po.density] = P.compositionDensity[i];
+      pf[base + po.elevation] = P.elevation ? P.elevation[i] : NaN; // NaN: start at the Airy height
       pu[base + po.split_child] = NONE;
       pu[base + po.mantle_node] = nearestVertex(this.icosphere.vertices, x, y, z);
     }
@@ -197,7 +201,7 @@ export class Simulation {
 
     // Free lists hold every slot not used by the initial state.
     device.queue.writeBuffer(buffers.particlePool, 0, freeList(P.count, maxParticles));
-    device.queue.writeBuffer(buffers.constraintPool, 0, freeList(B.count, maxConstraints));
+    device.queue.writeBuffer(buffers.constraintPool, 0, freeList(B.count, maxBonds));
     this.steps = 0;
     this.timeMyr = 0;
 
@@ -236,10 +240,10 @@ export class Simulation {
     if (this.mantle.advanceTo(this.timeMyr)) this.uploadMantle();
 
     const { device } = this;
-    const { maxParticles, maxConstraints, hashGridDim } = CAPACITY;
+    const { maxParticles, maxConstraints, maxBonds, maxContacts, hashGridDim } = CAPACITY;
     const groups = (n) => Math.ceil(n / WORKGROUP);
-    const crust = groups(maxParticles);
-    const bonds = groups(maxConstraints), cells = groups(hashGridDim ** 3);
+    const crust = groups(maxParticles), cells = groups(hashGridDim ** 3);
+    const bonds = groups(maxBonds), contacts = groups(maxContacts), edges = groups(maxConstraints);
 
     let encoder, pass;
     const open = () => {
@@ -266,15 +270,17 @@ export class Simulation {
     run('crust_clean_split', crust);
 
     // Crust motion: overdamped XPBD. Predict where the mantle alone would
-    // carry each particle, then iterate bonds and collisions toward the
+    // carry each particle, find contacts, then iterate all edges toward the
     // minimum of drag + elastic energy.
     run('crust_predict', crust);
     run('crust_hash_clear', cells);
     run('crust_hash_build', crust);
     run('crust_clear_deltas', crust);
-    run('crust_begin_constraints', bonds); // reset lambda, count bonds per particle
-    run('crust_store_bond_count', crust);
     run('solver_begin', 1);
+    run('crust_begin_constraints', bonds); // reset lambda, count edges, list bond partners
+    run('crust_clear_contacts', contacts);
+    run('crust_find_contacts', crust);
+    run('crust_store_edge_count', crust);
     for (let i = 0; i < this.params.solver_iterations; i++) {
       if (i > 0 && i % ITERATIONS_PER_SUBMIT === 0) {
         submit();
@@ -282,15 +288,12 @@ export class Simulation {
         open();
       }
       run('crust_clear_deltas', crust);
-      run('crust_solve_constraints', bonds);
-      run('crust_apply_deltas', crust);
-      run('crust_clear_deltas', crust);
-      run('crust_solve_collisions', crust);
+      run('crust_solve_constraints', edges);
       run('crust_apply_deltas', crust);
       run('crust_chebyshev_combine', crust);
       run('solver_next_iteration', 1);
     }
-    run('crust_bond_stress', bonds);
+    run('crust_bond_stress', edges);
     run('crust_integrate', crust);
     submit();
     this.steps++;

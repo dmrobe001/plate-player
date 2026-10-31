@@ -16,7 +16,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { Constraint, Particle, unpack } from '../src/gpu/layout.js';
+import { Constraint, EDGE, Particle, unpack } from '../src/gpu/layout.js';
 import { readZip } from '../src/record/zip.js';
 import { createIcosphere } from '../src/geometry/icosphere.js';
 import { CHAIN, chainExact, chainState } from './support/chain.mjs';
@@ -26,7 +26,8 @@ const { chromium } = require('playwright');
 
 const PAGE = pathToFileURL(fileURLToPath(new URL('../dist/plate-player.html', import.meta.url))).href + '?paused';
 const MAX_PARTICLES = 25000;
-const MAX_CONSTRAINTS = 100000;
+const MAX_BONDS = 65536;          // CAPACITY in src/sim/simulation.js
+const MAX_CONSTRAINTS = 2 * MAX_BONDS; // bonds, then contacts
 const ARGS = process.env.PLATE_GPU === 'hardware'
   ? ['--enable-unsafe-webgpu']
   : ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--use-webgpu-adapter=swiftshader', '--disable-vulkan-surface'];
@@ -64,7 +65,7 @@ function checkFreeLists(state) {
   const C = unpack(Constraint, state.constraints, MAX_CONSTRAINTS);
   for (const [name, pool, active, cap] of [
     ['particle', new Uint32Array(state.particlePool), P.is_active, MAX_PARTICLES],
-    ['constraint', new Uint32Array(state.constraintPool), C.is_active, MAX_CONSTRAINTS],
+    ['bond', new Uint32Array(state.constraintPool), C.is_active.subarray(0, MAX_BONDS), MAX_BONDS],
   ]) {
     const count = pool[0];
     assert.equal(pool[1], 0, `${name} pool: split requests not cleared`);
@@ -80,6 +81,21 @@ function checkFreeLists(state) {
     for (let i = 0; i < cap; i++) activeCount += active[i] ? 1 : 0;
     assert.equal(activeCount + count, cap, `${name}: ${activeCount} active + ${count} free != ${cap}`);
   }
+  // Edge kinds match their slot ranges, and no contact duplicates a bond.
+  const bondPairs = new Set();
+  for (let k = 0; k < MAX_BONDS; k++) {
+    if (!C.is_active[k]) continue;
+    assert.equal(C.kind[k], EDGE.BOND, `slot ${k} in the bond range is not a bond`);
+    bondPairs.add(`${Math.min(C.particle_a[k], C.particle_b[k])},${Math.max(C.particle_a[k], C.particle_b[k])}`);
+  }
+  let contacts = 0;
+  for (let k = MAX_BONDS; k < MAX_CONSTRAINTS; k++) {
+    if (!C.is_active[k]) continue;
+    contacts++;
+    assert.equal(C.kind[k], EDGE.CONTACT, `slot ${k} in the contact range is not a contact`);
+    assert.ok(!bondPairs.has(`${C.particle_a[k]},${C.particle_b[k]}`), `contact ${k} duplicates a bond`);
+  }
+  assert.ok(contacts > 0, 'no contacts found');
   return P;
 }
 
@@ -217,6 +233,104 @@ test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi 
   console.log(`  128 sweeps: relative error plain Jacobi ${plain.toFixed(3)}, Chebyshev ${cheb.toFixed(4)}`);
   assert.ok(cheb < 0.02, `Chebyshev error ${cheb}`);
   assert.ok(plain > 10 * cheb, `plain ${plain} vs Chebyshev ${cheb}`);
+});
+
+test('a thickened block relaxes to its Airy height (free radius); its neighbours stay put', { timeout: 300_000 }, async () => {
+  // Phase 3 acceptance (design 9). A row of bonded columns of old ocean; the
+  // middle three are instantly thickened to 35 km of continental crust while
+  // still at the ocean's elevation. Each column's top relaxes toward its own
+  // Airy height by implicit Euler with the Haskell rebound time. With no
+  // flexural rigidity yet (phase 7), columns are independent.
+  const page = await openPage();
+  const out = await page.evaluate(async () => {
+    const a = 0.0175, n = 9, half = Math.asin(a); // chord between neighbours = 2a
+    await plate.setParams({ mantle_drive: 0 });
+    const p = plate.sim.params;
+    // Independent Airy height and rebound time (same formulas as design 4.4).
+    const airy = (H, comp, T) => {
+      const rho = comp * (1 + p.thermal_expansion_coeff * (p.mantle_temp - T));
+      const e0 = H * (1 - rho / p.mantle_density);
+      return e0 >= p.sea_level ? e0 : e0 - (p.sea_level - e0) * p.water_density / (p.mantle_density - p.water_density);
+    };
+    const tauMyr = (eq) => {
+      const drho = eq < p.sea_level ? p.mantle_density - p.water_density : p.mantle_density;
+      return (4 * Math.PI * p.isostatic_viscosity_pa_s) / (drho * 9.81 * 4 * a * 6.371e6) / 3.15576e13;
+    };
+    const block = (i) => i >= 3 && i <= 5;
+    const T = 278; // at ocean temperature, so densities stay constant
+    const ocean = airy(7, 3000, T);
+    const position = new Float32Array(3 * n);
+    for (let i = 0; i < n; i++) { const phi = (i - (n - 1) / 2) * 2 * half; position.set([Math.sin(phi), 0, Math.cos(phi)], 3 * i); }
+    const fill = (f) => Float32Array.from({ length: n }, (_, i) => f(i));
+    await plate.loadState({
+      particles: {
+        count: n, position,
+        thickness: fill((i) => (block(i) ? 35 : 7)), compositionDensity: fill((i) => (block(i) ? 2700 : 3000)),
+        temperature: fill(() => T), age: fill(() => 100), apothem: fill(() => a),
+        elevation: fill(() => ocean),
+      },
+      bonds: { count: n - 1, a: Uint32Array.from({ length: n - 1 }, (_, j) => j), b: Uint32Array.from({ length: n - 1 }, (_, j) => j + 1), damage: new Float32Array(n - 1) },
+      yieldStressMPa: 1e6,
+    });
+    const read = async () => {
+      const f = new Float32Array((await plate.readBuffers(['particles'])).particles);
+      const w = f.length / 25000, off = plate.layout.Particle.offsets;
+      return { e: Array.from({ length: n }, (_, i) => f[w * i + off.elevation]), x: Array.from({ length: n }, (_, i) => f[w * i]) };
+    };
+    const start = await read();
+    const steps = [];
+    for (let s = 0; s < 6; s++) { await plate.runSteps(1); steps.push((await read()).e); }
+    const end = await read();
+    return { start, steps, end, dt: p.dt_crust_myr, ocean, thick: airy(35, 2700, T), tau: tauMyr(airy(35, 2700, T)), sea: p.sea_level };
+  });
+  assert.deepEqual(page.errors, []);
+  await page.close();
+
+  const { dt, ocean, thick, tau } = out;
+  console.log(`  ocean ${(ocean - out.sea).toFixed(2)} km, block Airy ${(thick - out.sea).toFixed(2)} km rel. sea level; tau ${(tau * 1000).toFixed(1)} kyr, dt ${(dt * 1000).toFixed(0)} kyr`);
+  let e = ocean;
+  out.steps.forEach((row, s) => {
+    const k = dt / tau;
+    e = (e + k * thick) / (1 + k);
+    for (let i = 3; i <= 5; i++) assert.ok(Math.abs(row[i] - e) < 1e-3 * Math.abs(thick - ocean), `step ${s + 1}, column ${i}: ${row[i]} vs ${e}`);
+    for (const i of [0, 1, 2, 6, 7, 8]) assert.ok(Math.abs(row[i] - ocean) < 1e-4, `ocean column ${i} moved to ${row[i]}`);
+  });
+  for (let i = 0; i < 9; i++) assert.ok(Math.abs(out.end.x[i] - out.start.x[i]) < 1e-6, `column ${i} moved sideways`);
+});
+
+test('columns touch only if they overlap in map view and in depth', { timeout: 300_000 }, async () => {
+  // Two unbonded pairs overlapping by the same amount in map view. In one
+  // pair both columns are at the surface: a contact pushes them apart. In the
+  // other, one column's top starts 400 km down, below the other's
+  // lithosphere: no contact, so neither moves.
+  const page = await openPage();
+  const out = await page.evaluate(async () => {
+    const a = 0.0175, overlap = 0.005, half = Math.asin((2 * a - overlap) / 2);
+    await plate.setParams({ mantle_drive: 0 });
+    // Each pair straddles the equator at longitude lon, along its meridian (chord = 2 sin(half)).
+    const pair = (lon) => [-half, half].map((t) => [Math.sin(lon) * Math.cos(t), Math.sin(t), Math.cos(lon) * Math.cos(t)]);
+    const pts = [...pair(0), ...pair(1)];
+    const fill = (v) => new Float32Array(4).fill(v);
+    await plate.loadState({
+      particles: {
+        count: 4, position: Float32Array.from(pts.flat()),
+        thickness: fill(7), compositionDensity: fill(3000), temperature: fill(278), age: fill(100), apothem: fill(a),
+        elevation: Float32Array.of(NaN, NaN, NaN, -400),
+      },
+      bonds: { count: 0, a: new Uint32Array(0), b: new Uint32Array(0), damage: new Float32Array(0) },
+      yieldStressMPa: 1e6,
+    });
+    await plate.runSteps(1);
+    const f = new Float32Array((await plate.readBuffers(['particles'])).particles);
+    const w = f.length / 25000;
+    const d = (i, j) => Math.hypot(f[w * i] - f[w * j], f[w * i + 1] - f[w * j + 1], f[w * i + 2] - f[w * j + 2]);
+    return { before: 2 * a - overlap, surface: d(0, 1), deep: d(2, 3), overlap };
+  });
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  console.log(`  separation after one step: surface pair +${((out.surface - out.before) / out.overlap * 100).toFixed(0)}% of the overlap, deep pair +${((out.deep - out.before) / out.overlap * 100).toFixed(2)}%`);
+  assert.ok(out.surface - out.before > 0.5 * out.overlap, `surface pair not pushed apart: ${out.surface}`);
+  assert.ok(Math.abs(out.deep - out.before) < 1e-6, `deep pair moved: ${out.deep}`);
 });
 
 test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 }, async () => {

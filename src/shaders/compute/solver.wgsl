@@ -3,10 +3,11 @@
 // basal drag gamma_i plays the role of mass, and there is no inertia.
 //   1. predict:   x~ = where the mantle flow alone would carry the particle
 //   2. hash:      bin predicted positions into a uniform grid for collisions
-//   3. iterate:   bonds (XPBD, with accumulated multipliers lambda), then
-//                 collisions (position projection), each applied as a Jacobi sweep;
-//                 the result is extrapolated by Chebyshev acceleration
-//   4. integrate: velocity = (x - x_old) / dt, a diagnostic only
+//   3. contacts:  touching, unbonded columns that overlap in depth get a
+//                 CONTACT edge for this step (design 3.2, 4.5)
+//   4. iterate:   all edges (XPBD, with accumulated multipliers lambda) as one
+//                 Jacobi sweep, extrapolated by Chebyshev acceleration
+//   5. integrate: velocity = (x - x_old) / dt, a diagnostic only
 //
 // Units inside the solver: drag is relative to a base-size particle
 // (w_i = base_area / area_i is the inverse drag), and bond stiffness is
@@ -74,26 +75,119 @@ fn crust_clear_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
         atomicStore(&particle_deltas[idx].dy, 0i);
         atomicStore(&particle_deltas[idx].dz, 0i);
         atomicStore(&particle_deltas[idx].count, 0i);
+        atomicStore(&particle_deltas[idx].partner_count, 0u);
     }
 }
 
-// Start of the solve: reset multipliers, and count each particle's bonds
-// (into particle_deltas.count, copied to bond_count by the next pass).
+// Start of the solve: reset bond multipliers, count each particle's edges
+// (into particle_deltas.count, copied to edge_count once contacts are added),
+// and list each particle's bond partners.
 @compute @workgroup_size(64)
 fn crust_begin_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
-    if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
+    if (c_idx >= sim.max_bonds || constraints[c_idx].is_active == 0u) { return; }
     constraints[c_idx].lambda = 0.0;
     constraints[c_idx].lambda_prev = 0.0;
-    atomicAdd(&particle_deltas[constraints[c_idx].particle_a].count, 1i);
-    atomicAdd(&particle_deltas[constraints[c_idx].particle_b].count, 1i);
+    let a = constraints[c_idx].particle_a;
+    let b = constraints[c_idx].particle_b;
+    atomicAdd(&particle_deltas[a].count, 1i);
+    atomicAdd(&particle_deltas[b].count, 1i);
+    let slot_a = atomicAdd(&particle_deltas[a].partner_count, 1u);
+    if (slot_a < MAX_PARTNERS) { particle_deltas[a].partners[slot_a] = b; }
+    let slot_b = atomicAdd(&particle_deltas[b].partner_count, 1u);
+    if (slot_b < MAX_PARTNERS) { particle_deltas[b].partners[slot_b] = a; }
+}
+
+// Contact slots are rebuilt every step.
+@compute @workgroup_size(64)
+fn crust_clear_contacts(@builtin(global_invocation_id) id: vec3<u32>) {
+    let c_idx = sim.max_bonds + id.x;
+    if (c_idx < sim.max_constraints) { constraints[c_idx].is_active = 0u; }
+}
+
+fn bonded(i: u32, j: u32) -> bool {
+    let n = min(atomicLoad(&particle_deltas[i].partner_count), MAX_PARTNERS);
+    for (var k = 0u; k < n; k++) {
+        if (particle_deltas[i].partners[k] == j) { return true; }
+    }
+    return false;
+}
+
+// Radial extent of a column, km in the elevation datum: from its top down
+// through the lithosphere that moves with it.
+fn column_top(i: u32) -> f32 { return particles[i].elevation; }
+fn column_bottom(i: u32) -> f32 { return particles[i].elevation - lithosphere_thickness_km(i); }
+
+// Contact detection (design 3.2, 4.5). Two columns touch if they overlap in
+// map view *and* in depth; a slab below the overriding lithosphere passes
+// beneath it. Each touching pair without a bond gets a CONTACT edge for this
+// step, solved together with the bonds. Contacts are linearised per step:
+// a contact found here acts in both directions until the step ends (a
+// contact that opens during the step pulls slightly), which keeps the
+// iteration linear for Chebyshev acceleration (design.md, phase 3 findings).
+//
+// Deep overlap between two surface columns triggers subduction instead: the
+// lower one becomes a slab at the end of the step (no contact between them).
+// Every pair is examined by both of its threads, so each thread only writes
+// its own next_state; the contact is created by the lower index.
+@compute @workgroup_size(64)
+fn crust_find_contacts(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
+    let pos_i = particles[idx].predicted_pos.xyz;
+    let surface_i = particles[idx].state == 1u;
+    let home = hash_cell(pos_i);
+    let dim = i32(sim.hash_grid_dim);
+
+    for (var z = -1; z <= 1; z++) {
+    for (var y = -1; y <= 1; y++) {
+    for (var x = -1; x <= 1; x++) {
+        let nc = home + vec3i(x, y, z);
+        if (any(nc < vec3i(0)) || any(nc >= vec3i(dim))) { continue; }
+        var j = atomicLoad(&hash_grid[hash_index(nc)]);
+        var iter = 0;
+        while (j != NONE && iter < 50) {
+            let next = particles[j].next_idx;
+            iter++;
+            if (j == idx) { j = next; continue; }
+            let overlap = (particles[idx].apothem + particles[j].apothem) - distance(pos_i, particles[j].predicted_pos.xyz);
+            let depth_overlap = min(column_top(idx), column_top(j)) > max(column_bottom(idx), column_bottom(j));
+            if (overlap <= 0.0 || !depth_overlap) { j = next; continue; }
+
+            if (surface_i && particles[j].state == 1u && overlap > sim.subduction_overlap) {
+                let lower = select(j, idx, particles[idx].elevation < particles[j].elevation
+                    || (particles[idx].elevation == particles[j].elevation && idx < j));
+                if (lower == idx) { particles[idx].next_state = 2u; }
+            } else if (idx < j && !bonded(idx, j)) {
+                let slot = atomicAdd(&solver.contact_count, 1u);
+                let c_idx = sim.max_bonds + slot;
+                if (c_idx < sim.max_constraints) {
+                    var c: Constraint;
+                    c.particle_a = idx;
+                    c.particle_b = j;
+                    c.lambda = 0.0;
+                    c.lambda_prev = 0.0;
+                    c.yield_stress_mpa = 0.0;
+                    c.is_active = 1u;
+                    c.damage = 0.0;
+                    c.stress_normal_mpa = 0.0;
+                    c.stress_shear_mpa = 0.0;
+                    c.kind = CONTACT;
+                    constraints[c_idx] = c;
+                    atomicAdd(&particle_deltas[idx].count, 1i);
+                    atomicAdd(&particle_deltas[j].count, 1i);
+                }
+            }
+            j = next;
+        }
+    }}}
 }
 
 @compute @workgroup_size(64)
-fn crust_store_bond_count(@builtin(global_invocation_id) id: vec3<u32>) {
+fn crust_store_edge_count(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
-    particles[idx].bond_count = u32(atomicLoad(&particle_deltas[idx].count));
+    particles[idx].edge_count = u32(atomicLoad(&particle_deltas[idx].count));
     particles[idx].iter_start = particles[idx].predicted_pos;
     particles[idx].iter_prev = particles[idx].predicted_pos;
 }
@@ -101,6 +195,7 @@ fn crust_store_bond_count(@builtin(global_invocation_id) id: vec3<u32>) {
 @compute @workgroup_size(1)
 fn solver_begin() {
     solver.iteration = 0u;
+    atomicStore(&solver.contact_count, 0u);
 }
 
 @compute @workgroup_size(1)
@@ -127,11 +222,11 @@ fn crust_chebyshev_combine(@builtin(global_invocation_id) id: vec3<u32>) {
     particles[idx].iter_start = x;
 }
 
-// One XPBD update per bond, C = |x_b - x_a| - (apothem_a + apothem_b):
+// One XPBD update per edge (bond or contact), C = |x_b - x_a| - (apothem_a + apothem_b):
 //   dlambda = (-C - a~ lambda) / (w_a + w_b + a~),  a~ = 1 / (stiffness * dt)
 //   dx_a = -w_a n dlambda,  dx_b = +w_b n dlambda
-// Bonds are updated simultaneously (Jacobi), so each dlambda is scaled by
-// 1 / max(bonds at either end). Scaling dlambda, not the applied dx, keeps
+// Edges are updated simultaneously (Jacobi), so each dlambda is scaled by
+// 1 / max(edges at either end). Scaling dlambda, not the applied dx, keeps
 // lambda consistent with the displacement it caused, so a converged solve is
 // the true minimum of drag + elastic energy.
 @compute @workgroup_size(64)
@@ -145,7 +240,7 @@ fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     // A bond to a melted particle dies with it.
     if (particles[pA].is_active == 0u || particles[pB].is_active == 0u) {
         constraints[c_idx].is_active = 0u;
-        release(false, c_idx);
+        if (c.kind == BOND) { release(false, c_idx); }
         return;
     }
 
@@ -158,17 +253,17 @@ fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
     // in tension is decided by last step's stress, not the current iterate:
     // switching stiffness mid-solve makes the iteration nonlinear, and
     // Chebyshev acceleration then diverges (design.md, Chebyshev findings).
+    // Contacts are new each step (stress 0) and have full stiffness.
     let stiffness_factor = select(1.0, max(1.0 - c.damage, 1e-4), c.stress_normal_mpa > 0.0);
     let alpha = 1.0 / (sim.bond_rate_myr_inv * stiffness_factor * sim.dt_crust_myr);
     let wA = inverse_drag(pA);
     let wB = inverse_drag(pB);
-    let degree = f32(max(max(particles[pA].bond_count, particles[pB].bond_count), 1u));
+    let degree = f32(max(max(particles[pA].edge_count, particles[pB].edge_count), 1u));
     let dlambda = (-C - alpha * c.lambda) / (wA + wB + alpha) / degree;
     let omega = chebyshev_omega();
     constraints[c_idx].lambda = omega * (c.lambda + dlambda - c.lambda_prev) + c.lambda_prev;
     constraints[c_idx].lambda_prev = c.lambda;
 
-    // count 0: bond corrections are applied in full (see crust_apply_deltas).
     add_delta(pA, -wA * dlambda * n, 0i);
     add_delta(pB, wB * dlambda * n, 0i);
 }
@@ -177,11 +272,18 @@ fn crust_solve_constraints(@builtin(global_invocation_id) id: vec3<u32>) {
 // is an irreversible change between solves (design.md 4.7); updating it
 // inside the iterations lets transient overshoot (which Chebyshev
 // acceleration produces on purpose) soften bonds and run away.
+// A bond at full damage has no cohesion left: it is retired, and the pair
+// interacts through a contact from the next step on (design 3.2).
 @compute @workgroup_size(64)
 fn crust_bond_stress(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
     if (c_idx >= sim.max_constraints || constraints[c_idx].is_active == 0u) { return; }
     let c = constraints[c_idx];
+    if (c.kind == BOND && c.damage >= 1.0) {
+        constraints[c_idx].is_active = 0u;
+        release(false, c_idx);
+        return;
+    }
     let rest = rest_length(c);
     let C = distance(particles[c.particle_b].predicted_pos.xyz, particles[c.particle_a].predicted_pos.xyz) - rest;
     let stiffness_factor = select(1.0, max(1.0 - c.damage, 1e-4), C > 0.0);
@@ -191,6 +293,7 @@ fn crust_bond_stress(@builtin(global_invocation_id) id: vec3<u32>) {
     let sigma_n = sim.crust_youngs_modulus_gpa * 1000.0 * stiffness_factor * C / rest;
     constraints[c_idx].stress_normal_mpa = sigma_n;
     constraints[c_idx].stress_shear_mpa = 0.0;
+    if (c.kind == CONTACT) { return; } // no cohesion, nothing to damage
 
     // Arrhenius-weakened yield stress; overstress accumulates damage.
     let temp = bond_temperature(c);
@@ -201,71 +304,13 @@ fn crust_bond_stress(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 
 @compute @workgroup_size(64)
-fn crust_solve_collisions(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
-    if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
-    let pos_i = particles[idx].predicted_pos.xyz;
-    let state_i = particles[idx].state;
-    // Summed in fixed point pair by pair, so the result does not depend on
-    // the (thread-timing-dependent) order of the hash grid's linked lists.
-    var total_delta = vec3i(0);
-    var coll_count = 0i;
-    let home = hash_cell(pos_i);
-    let dim = i32(sim.hash_grid_dim);
-
-    for (var z = -1; z <= 1; z++) {
-    for (var y = -1; y <= 1; y++) {
-    for (var x = -1; x <= 1; x++) {
-        let nc = home + vec3i(x, y, z);
-        if (any(nc < vec3i(0)) || any(nc >= vec3i(dim))) { continue; }
-        var j = atomicLoad(&hash_grid[hash_index(nc)]);
-        var iter = 0;
-        while (j != NONE && iter < 50) {
-            if (j != idx) {
-                let pos_j = particles[j].predicted_pos.xyz;
-                let state_j = particles[j].state;
-                let dir = pos_i - pos_j;
-                let dist = max(length(dir), 0.0001);
-                let overlap = (particles[idx].apothem + particles[j].apothem) - dist;
-
-                if (overlap > 0.0) {
-                    if (state_i == 1u && state_j == 1u && overlap > sim.subduction_overlap) {
-                        // Deep overlap between surface particles: the lower one subducts.
-                        // Only this thread writes next_state[idx], and other threads read
-                        // `state`, which does not change until crust_apply_deltas.
-                        if (particles[idx].elevation < particles[j].elevation) { particles[idx].next_state = 2u; }
-                    } else if (state_i != state_j) {
-                        // Slab under surface crust: no normal push, only basal friction.
-                        let rel = (pos_i - particles[idx].position.xyz) - (pos_j - particles[j].position.xyz);
-                        total_delta -= to_fixed((rel - dot(rel, dir / dist) * (dir / dist)) * 0.2);
-                        coll_count++;
-                    } else {
-                        // Non-penetration, split in proportion to inverse drag.
-                        let w_i = inverse_drag(idx);
-                        let share = w_i / (w_i + inverse_drag(j));
-                        total_delta += to_fixed((dir / dist) * overlap * share);
-                        coll_count++;
-                    }
-                }
-            }
-            j = particles[j].next_idx;
-            iter++;
-        }
-    }}}
-    if (coll_count > 0i) { add_delta_fixed(idx, total_delta, coll_count); }
-}
-
-@compute @workgroup_size(64)
 fn crust_apply_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
-    if (particles[idx].next_state == 2u) { particles[idx].state = 2u; }
-    // Collision corrections are averaged over their count (position-based
-    // dynamics); bond corrections arrive with count 0 and are applied in full.
-    let count = max(atomicLoad(&particle_deltas[idx].count), 1i);
+    // Edge corrections arrive already scaled (dlambda / degree) and are applied in full.
     let sum = vec3f(f32(atomicLoad(&particle_deltas[idx].dx)), f32(atomicLoad(&particle_deltas[idx].dy)), f32(atomicLoad(&particle_deltas[idx].dz)));
     if (any(sum != vec3f(0.0))) {
-        particles[idx].predicted_pos = vec4f(normalize(particles[idx].predicted_pos.xyz + sum / (FIXED_POINT * f32(count))), 1.0);
+        particles[idx].predicted_pos = vec4f(normalize(particles[idx].predicted_pos.xyz + sum / FIXED_POINT), 1.0);
     }
 }
 
@@ -276,4 +321,11 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
     // Overdamped: velocity is not state, only a record of this step's motion.
     particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, 0.0);
     particles[idx].position = vec4f(particles[idx].predicted_pos.xyz, 1.0);
+    // Subduction requested during contact detection: the column's top drops
+    // below any lithosphere (a stand-in until slabs bend, design phase 7).
+    if (particles[idx].next_state == 2u && particles[idx].state == 1u) {
+        particles[idx].state = 2u;
+        particles[idx].elevation = -sim.slab_initial_depth_km;
+    }
+    particles[idx].next_state = particles[idx].state;
 }

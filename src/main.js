@@ -14,6 +14,7 @@ import { OrbitCamera } from './render/camera.js';
 import { Recorder, snapshotFromZip } from './record/recorder.js';
 import { PlateTracker } from './plates/tracker.js';
 import { BUILD_INFO } from './build-info.js';
+import { Constraint, Particle } from './gpu/layout.js';
 
 
 const $ = (id) => document.getElementById(id);
@@ -173,6 +174,7 @@ async function main() {
 
   window.plate = {
     sim, recorder, plates, device, BUILD_INFO,
+    layout: { Particle, Constraint },           // struct offsets for reading raw buffers
     regenerate, loadState, runSteps, restoreFromZip,
     setParams: (overrides) => exclusive(() => sim.setParams(overrides)),
     snapshot: () => exclusive(() => sim.snapshot()),

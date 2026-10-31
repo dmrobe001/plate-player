@@ -13,7 +13,17 @@ const FIXED_POINT: f32 = 100000000.0;
 // Stack of free slot indices. `requests` is used by two-phase allocation
 // (crust_accumulation reserves, crust_commit_splits pops; see growth.wgsl).
 struct FreeList { counter: atomic<u32>, requests: atomic<u32>, pad2: u32, pad3: u32, indices: array<u32> }
-struct ParticleDelta { dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count: atomic<i32> }
+// Per-particle solver scratch: summed corrections, edge count, and the
+// particle's bond partners this step (so contact detection can skip bonded pairs).
+const MAX_PARTNERS: u32 = 12u;
+struct ParticleDelta {
+    dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count: atomic<i32>,
+    partner_count: atomic<u32>, pad1: u32, pad2: u32, pad3: u32,
+    partners: array<u32, 12>,
+}
+
+const BOND: u32 = 0u;
+const CONTACT: u32 = 1u;
 
 @group(0) @binding(0) var<storage, read_write> grid: array<GridNode>;
 @group(0) @binding(1) var<storage, read> adjacency: array<u32>;   // 6 neighbours per node, NONE-padded
@@ -26,7 +36,7 @@ struct ParticleDelta { dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count:
 
 // Solver iteration counter and the Chebyshev weight for each iteration
 // (written by simulation.js; see chebyshevWeights).
-struct SolverState { iteration: u32, pad1: u32, pad2: u32, pad3: u32, omega: array<f32> }
+struct SolverState { iteration: u32, contact_count: atomic<u32>, pad2: u32, pad3: u32, omega: array<f32> }
 @group(0) @binding(8) var<storage, read_write> solver: SolverState;
 
 fn chebyshev_omega() -> f32 {
@@ -50,7 +60,8 @@ fn add_delta(i: u32, d: vec3f, count: i32) {
     add_delta_fixed(i, to_fixed(d), count);
 }
 
-// Return an index to a free list (used when particles melt or bonds die).
+// Return an index to a free list (used when particles melt or bonds die;
+// the constraint pool holds bond slots only).
 // Pushes only ever run in dispatches without pops, so the slot written is
 // never being read concurrently.
 fn release(pool_is_particles: bool, idx: u32) {
@@ -59,7 +70,7 @@ fn release(pool_is_particles: bool, idx: u32) {
         if (n < sim.max_particles) { particle_pool.indices[n] = idx; } else { atomicSub(&particle_pool.counter, 1u); }
     } else {
         let n = atomicAdd(&constraint_pool.counter, 1u);
-        if (n < sim.max_constraints) { constraint_pool.indices[n] = idx; } else { atomicSub(&constraint_pool.counter, 1u); }
+        if (n < sim.max_bonds) { constraint_pool.indices[n] = idx; } else { atomicSub(&constraint_pool.counter, 1u); }
     }
 }
 
@@ -79,9 +90,9 @@ fn arrhenius(temp: f32) -> f32 {
     return select(0.0, exp(exponent), exponent > -50.0);
 }
 
-// A bond's rest length is always the sum of its particles' apothems, whatever
-// changed them (growth, splitting, ...), so bonds and contacts agree on the
-// distance at which two particles touch.
+// An edge's rest length is always the sum of its particles' apothems, whatever
+// changed them (growth, splitting, ...): bonds and contacts agree on the
+// distance at which two columns touch.
 fn rest_length(c: Constraint) -> f32 {
     return particles[c.particle_a].apothem + particles[c.particle_b].apothem;
 }

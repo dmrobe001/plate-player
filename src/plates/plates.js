@@ -15,7 +15,8 @@ export const PLATE_DEFAULTS = {
 
 /**
  * @param P   particle arrays: is_active, state, position (vec4), velocity (vec4)
- * @param C   constraint arrays: is_active, particle_a, particle_b, damage
+ * @param C   constraint arrays: is_active, particle_a, particle_b, damage, and
+ *            optionally kind (contacts, kind 1, never join plates)
  * @param previous  {ids: Uint32Array per particle slot, nextId} or null
  * @returns {ids, nextId, plates: [{id, size, members}], events: [...]}
  */
@@ -29,7 +30,7 @@ export function labelPlates(P, C, previous = null, options = {}) {
   const size = new Int32Array(n).fill(1);
   const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
   for (let k = 0; k < C.is_active.length; k++) {
-    if (!C.is_active[k] || C.damage[k] >= opt.intactDamage) continue;
+    if (!C.is_active[k] || C.damage[k] >= opt.intactDamage || C.kind?.[k]) continue;
     const a = C.particle_a[k], b = C.particle_b[k];
     if (!surface(a) || !surface(b)) continue;
     let ra = find(a), rb = find(b);

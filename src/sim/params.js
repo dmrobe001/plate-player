@@ -54,7 +54,8 @@ export const SIM_PARAMS = [
   ['spreading_efficiency', 'f32', 1.0],             // area growth rate / mantle divergence
   ['max_spreading_rate', 'f32', 0.05],              // cap on fractional area growth, 1/Myr
   ['max_particles', 'u32', null],
-  ['max_constraints', 'u32', null],
+  ['max_constraints', 'u32', null],     // bonds + contacts
+  ['max_bonds', 'u32', null],           // bond slots come first; contact slots follow
   ['hash_grid_dim', 'u32', null],
 
   // --- rheology: Arrhenius temperature dependence ---
@@ -72,8 +73,20 @@ export const SIM_PARAMS = [
   ['slab_assimilation_km_per_k', 'f32', 0.1], // slab thickness lost per kelvin of heating
   // Sea level in the same datum as particle elevation (the top of an
   // uncompensated mantle surface). 3.5 km puts cold 7 km oceanic crust about
-  // 4 km below sea level and 35 km continental crust about 1.7 km above it.
+  // 4.5 km below sea level and 35 km continental crust about 1.7 km above it.
   ['sea_level', 'f32', 3.5],
+  ['water_density', 'f32', 1030.0],
+  // Free radius (design 4.4): each column's elevation relaxes toward its Airy
+  // height at the rate of viscous isostatic rebound of a load one column pair
+  // wide (Haskell): tau = 4 pi eta / (drho g lambda), lambda = 4 apothems.
+  // 1e21 Pa s is the upper-mantle viscosity from post-glacial rebound; tau is
+  // then ~30 kyr at the base particle size, so columns track Airy closely.
+  ['isostatic_viscosity_pa_s', 'f32', 1e21],
+  // Stand-ins until slabs get real buoyancy and bending (design phase 7): a
+  // new slab's top drops below any lithosphere, so its column no longer
+  // overlaps surface columns in depth, then sinks at a fixed rate.
+  ['slab_initial_depth_km', 'f32', 160.0],
+  ['slab_sink_rate_km_myr', 'f32', 20.0],
 ];
 
 export function simParamsWGSL() {

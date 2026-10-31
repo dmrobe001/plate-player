@@ -5,7 +5,7 @@
 // exportZip() bundles them; snapshotFromZip() reads a snapshot back for Simulation.restore.
 
 import { createIcosphere } from '../geometry/icosphere.js';
-import { Constraint, describe, GridNode, Particle, unpack } from '../gpu/layout.js';
+import { Constraint, describe, EDGE, GridNode, Particle, unpack } from '../gpu/layout.js';
 import { CAPACITY, STATE_BUFFERS } from '../sim/simulation.js';
 import { BUILD_INFO } from '../build-info.js';
 import { eastNorth, latLonDeg, sampleToMesh } from './sampling.js';
@@ -98,7 +98,7 @@ export class Recorder {
     const damageSum = new Float32Array(CAPACITY.maxParticles);
     const bondCount = new Uint16Array(CAPACITY.maxParticles);
     for (let k = 0; k < CAPACITY.maxConstraints; k++) {
-      if (!C.is_active[k]) continue;
+      if (!C.is_active[k] || C.kind[k] !== EDGE.BOND) continue;
       for (const p of [C.particle_a[k], C.particle_b[k]]) { damageSum[p] += C.damage[k]; bondCount[p]++; }
     }
 

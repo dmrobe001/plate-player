@@ -76,7 +76,7 @@ export function describe(struct) {
 
 /** One crust particle: a hexagonal column of crust, drawn as a disc of radius `apothem`. */
 export const Particle = defineStruct('Particle', [
-  ['position', 'vec4f'],        // unit-sphere position (w unused)
+  ['position', 'vec4f'],        // unit-sphere direction of the column (w unused); its radius is `elevation`
   ['predicted_pos', 'vec4f'],   // position-based-dynamics predicted position
   ['velocity', 'vec4f'],        // radians / Myr, tangent to sphere
   ['iter_start', 'vec4f'],      // solver iterate x_k at the start of the current iteration (Chebyshev)
@@ -91,15 +91,21 @@ export const Particle = defineStruct('Particle', [
   ['is_active', 'u32'],
   ['next_idx', 'u32'],          // linked list through the collision hash grid
   ['density', 'f32'],           // cached thermally-corrected density
-  ['elevation', 'f32'],         // cached isostatic elevation, km
+  ['elevation', 'f32'],         // free radial coordinate: top of the column, km above the mantle datum
   ['split_child', 'u32'],       // index of child created this frame, else NONE
   ['mantle_node', 'u32'],       // nearest mantle grid node, updated by a local walk each step
-  ['next_state', 'u32'],        // state requested during collisions, applied afterwards
-  ['bond_count', 'u32'],        // active bonds this step; scales Jacobi updates
+  ['next_state', 'u32'],        // state requested during contact detection, applied at the end of the step
+  ['edge_count', 'u32'],        // bonds + contacts this step; scales Jacobi updates
 ]);
 
-/** A bond between two particles. Its rest length is not stored: it is always
- * the sum of the two apothems (rest_length() in bindings.wgsl). */
+/** Edge kinds. Bonds are persistent (cohesive, can be damaged); contacts are
+ * rebuilt every step between touching, unbonded columns (no cohesion). */
+export const EDGE = { BOND: 0, CONTACT: 1 };
+
+/** An edge between two particles: a bond or a contact (`kind`, see EDGE). Its
+ * rest length is not stored: it is always the sum of the two apothems
+ * (rest_length() in bindings.wgsl). Bonds live in slots [0, maxBonds),
+ * contacts in [maxBonds, maxConstraints). */
 export const Constraint = defineStruct('Constraint', [
   ['particle_a', 'u32'],
   ['particle_b', 'u32'],
@@ -110,6 +116,7 @@ export const Constraint = defineStruct('Constraint', [
   ['stress_normal_mpa', 'f32'], // diagnostic: + tension, - compression
   ['stress_shear_mpa', 'f32'],  // diagnostic: magnitude
   ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
+  ['kind', 'u32'],              // EDGE.BOND or EDGE.CONTACT
 ]);
 
 /** One node of the mantle grid; written from the CPU mantle model (src/mantle/). */
