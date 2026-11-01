@@ -66,6 +66,31 @@ export const SIM_PARAMS = [
   ['gas_constant', 'f32', 0.008314],    // kJ/(mol K)
   ['reference_temp', 'f32', 293.0],     // K, temperature at which yield = yield_stress_mpa
 
+  // --- column profile (design 4.0; src/columns/profile.js) ---
+  // Geotherms: oceanic half-space cooling; continental steady conduction with
+  // heat production in the upper crust. Strength: Byerlee friction with
+  // hydrostatic pore pressure plus cohesion (brittle), dislocation creep at a
+  // reference strain rate (ductile). Flow laws are laboratory values (A in
+  // MPa^-n s^-1); wet quartzite after Gleason & Tullis (1995), diabase after
+  // Mackwell et al. (1998), dry olivine after Hirth & Kohlstedt (2003).
+  // Provisional: calibrated at integration (design 9).
+  ['thermal_conductivity_w_m_k', 'f32', 2.5],
+  ['radiogenic_heat_uw_m3', 'f32', 1.5],     // continental upper crust
+  ['radiogenic_layer_km', 'f32', 15.0],
+  ['friction_coefficient', 'f32', 0.6],      // Byerlee
+  ['pore_fluid_factor', 'f32', 0.4],         // pore pressure / lithostatic (hydrostatic ~0.4)
+  ['cohesion_mpa', 'f32', 20.0],             // of intact rock (integrity 1)
+  ['reference_strain_rate_s', 'f32', 1e-15],
+  ['quartzite_log10_a', 'f32', -3.959],      // log10(1.1e-4)
+  ['quartzite_n', 'f32', 4.0],
+  ['quartzite_q_kj', 'f32', 223.0],
+  ['diabase_log10_a', 'f32', 0.903],         // log10(8)
+  ['diabase_n', 'f32', 4.7],
+  ['diabase_q_kj', 'f32', 485.0],
+  ['olivine_log10_a', 'f32', 5.041],         // log10(1.1e5)
+  ['olivine_n', 'f32', 3.5],
+  ['olivine_q_kj', 'f32', 530.0],
+
   // --- thermal state and isostasy ---
   ['mantle_density', 'f32', 3300.0],
   ['thermal_expansion_coeff', 'f32', 3e-5], // 1/K
@@ -74,10 +99,12 @@ export const SIM_PARAMS = [
   ['surface_cooling_rate', 'f32', 0.05],  // 1/Myr, relaxation of surface crust to ocean temperature
   ['slab_heating_rate', 'f32', 2.5],      // 1/Myr, relaxation of slab to mantle temperature
   ['slab_assimilation_km_per_k', 'f32', 0.1], // slab thickness lost per kelvin of heating
-  // Sea level in the same datum as particle elevation (the top of an
-  // uncompensated mantle surface). 3.5 km puts cold 7 km oceanic crust about
-  // 4.5 km below sea level and 35 km continental crust about 1.7 km above it.
-  ['sea_level', 'f32', 3.5],
+  // Sea level in the same datum as particle elevation (the top of a dry
+  // mantle at mantle temperature). With the column profile's Airy isostasy
+  // (design 4.0), 2.6 km puts a ridge (7 km crust, age 0) 2.9 km below sea
+  // level, old ocean (capped age) 5.6 km below, and 35 km continental crust
+  // 0.8 km above; 30 km continental crust is a shelf just under water.
+  ['sea_level', 'f32', 2.6],
   ['water_density', 'f32', 1030.0],
   // Free radius (design 4.4): each column's elevation relaxes toward its Airy
   // height at the rate of viscous isostatic rebound of a load one column pair

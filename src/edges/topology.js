@@ -15,10 +15,12 @@
 import { CellList } from '../init/cell-list.js';
 
 const SECONDS_PER_MYR = 3.15576e13;
+/** Columns lighter than this (kg/m^3 at mantle temperature) are continental. */
+export const CONTINENTAL_DENSITY_MAX = 2850;
 
 /** Depth of the column's base below its top, km (lithosphere_thickness_km in solver.wgsl). */
 export function lithosphereThicknessKm(compositionDensity, ageMyr, params) {
-  if (compositionDensity < 2850) return params.continental_lithosphere_km;
+  if (compositionDensity < CONTINENTAL_DENSITY_MAX) return params.continental_lithosphere_km;
   const ageS = Math.max(ageMyr, 0) * SECONDS_PER_MYR;
   return Math.min((2.32 * Math.sqrt(params.thermal_diffusivity_m2_s * ageS)) / 1000, params.oceanic_lithosphere_max_km);
 }

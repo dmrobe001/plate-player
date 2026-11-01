@@ -74,10 +74,30 @@ plate together, and collisions with other plates (slab pull and ridge push come 
 
 **Crust particles** (`Particle` in `src/gpu/layout.js`). Each one is a hexagonal
 column with thickness, composition density, temperature, age, and area
-(2√3·apothem²). Its density follows thermal expansion. Its elevation (the top of the
-column) is a free coordinate that relaxes toward Airy isostasy, thickness × (1 − ρ/ρ_mantle)
-plus water loading, with the viscous rebound time of a column-sized load
-(~30 kyr). It is not part of `position`, which stays on the unit sphere.
+(2√3·apothem²). Its elevation (the top of the column) is a free coordinate that
+relaxes toward the Airy height from its column profile (below), with the viscous
+rebound time of a column-sized load (~30 kyr). It is not part of `position`, which
+stays on the unit sphere.
+
+**Column profiles** (`ColumnProfile`, `shaders/compute/profile.wgsl`; CPU reference
+`src/columns/profile.js`). Every step, each column's vertical structure is computed
+from its state on 8 depth slices (3 in the crust, 5 in the lithospheric mantle):
+- **temperature**: oceanic columns cool as a half-space from their age (capped at
+  ~59 Myr, where the lithosphere reaches 100 km, so old sea floor flattens);
+  continents have a steady geotherm with radiogenic heat in the upper 15 km;
+- **density** from composition and temperature, and **lithostatic pressure**;
+- **ductile strength and viscosity** from laboratory creep laws (quartzite for
+  continental crust, diabase for oceanic crust, olivine for mantle) at a reference
+  strain rate of 10⁻¹⁵/s;
+- column totals: lithosphere base, **Airy height** of the whole column (crust plus
+  cooled mantle, water-loaded below sea level), **gravitational potential energy**
+  (GPE), surface heat flow, Moho temperature, and the brittle–ductile transition
+  (where Byerlee friction and creep cross).
+
+So sea floor deepens with √age (ridge 2.9 km deep, old basins 5.6 km), and GPE
+differences give the ridge push of half-space cooling. For now only isostasy reads
+the profile; the edge law (stiffness and strength from the slices, phase C) and GPE
+forces (phase D) come next.
 
 **Edges** (`Edge`, `shaders/compute/edges.wgsl`). There is one kind of edge: the
 interface between two neighbouring columns. An edge exists exactly while its pair is
@@ -164,7 +184,7 @@ plate-player/
 │   ├── build-info.js          git commit injected at build time (written into records)
 │   ├── gpu/
 │   │   ├── device.js          WebGPU init, shader compile-error reporting
-│   │   └── layout.js          GPU struct definitions (Particle, Edge, GridNode) + slot-list layout
+│   │   └── layout.js          GPU struct definitions (Particle, Edge, ColumnProfile, GridNode) + slot-list layout
 │   ├── geometry/
 │   │   ├── icosphere.js       mantle grid mesh + adjacency
 │   │   └── vec.js             vector / matrix helpers
@@ -175,6 +195,8 @@ plate-player/
 │   │   └── random.js          seeded RNG, uniform points on the sphere
 │   ├── edges/
 │   │   └── topology.js        CPU reference for edge existence, slot order, storage checks
+│   ├── columns/
+│   │   └── profile.js         CPU reference for column profiles: geotherm, Airy, GPE, strength
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
@@ -192,7 +214,7 @@ plate-player/
 │   │   ├── renderer.js        render pipelines and draw calls
 │   │   └── camera.js          orbit camera
 │   └── shaders/
-│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver, edges
+│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver, edges, profile
 │       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
 ├── test/
 │   ├── unit.test.mjs          CPU tests (Node only)
@@ -256,8 +278,9 @@ Page options (URL query): `?paused` starts paused, which scripts use to control
 stepping exactly; `?empty` skips generating a world (load one with
 `plate.loadState`); `?capacity=N` sizes the buffers for N particles (8 edge slots
 each) instead of the planet default. `plate.debug` holds the CPU reference functions
-and `plate.debug.edges()`, a readback of the edge storage checked against its
-invariants.
+and two readbacks checked against them: `plate.debug.edges()` (edge storage and its
+invariants) and `plate.debug.profiles()` (column profiles vs the reference, worst
+difference per field).
 
 **What belongs in the test suite.** Keep tests cheap and about *mechanisms*:
 invariants (every slot free or active exactly once), small analytic cases (two
@@ -369,10 +392,10 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       gone in about two steps. The rates (`slab_heating_rate`,
       `slab_assimilation_km_per_k`) should be much slower so slabs persist long
       enough to pull; design phase 7 replaces this mechanism.
-- [ ] **No ocean depth–age relation.** Real sea floor deepens about 3 km from ridge
-      to old basin (depth ∝ √age, from cooling of the lithospheric mantle). Here
-      only the 7 km crust contracts, about 0.25 km. Adding a lithosphere term
-      ∝ √(κ·age) to elevation would give ridges and basins.
+- [x] ~~No ocean depth–age relation.~~ Phase B: Airy isostasy of the whole column
+      profile, so sea floor deepens with √age, 2.8 km from ridge to old basin.
+      Sea level moved from 3.5 to 2.6 km in the elevation datum to keep
+      35 km continents ~0.8 km above it.
 - [x] ~~Bond "shear" resisted rigid rotation~~ (it was a velocity difference, not a
       strain). Removed in phase 2: bonds are central springs. A rotation-free shear
       measure comes with the per-particle strain fit (design phase 4); until then the

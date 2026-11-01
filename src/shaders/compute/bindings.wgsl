@@ -1,5 +1,5 @@
 // Bindings and helpers shared by every compute entry point.
-// (Particle, Edge, GridNode and SimParams structs are generated from
+// (Particle, Edge, ColumnProfile, GridNode and SimParams structs are generated from
 // src/gpu/layout.js and src/sim/params.js and prepended to this file.)
 
 const NONE: u32 = 0xFFFFFFFFu;
@@ -39,6 +39,8 @@ struct ParticleDelta {
 // (written by simulation.js; see chebyshevWeights).
 struct SolverState { iteration: u32, edge_pool_empty: atomic<u32>, slot_overflow: atomic<u32>, pad3: u32, omega: array<f32> }
 @group(0) @binding(8) var<storage, read_write> solver: SolverState;
+// Per-column vertical profiles (design 4.0), recomputed every step by column_profile (profile.wgsl).
+@group(0) @binding(9) var<storage, read_write> profiles: array<ColumnProfile>;
 
 fn chebyshev_omega() -> f32 {
     return solver.omega[min(solver.iteration, arrayLength(&solver.omega) - 1u)];

@@ -303,3 +303,113 @@ test('edges: update keeps, creates and removes by range; deep overlap creates no
   // ...but an existing edge between them is kept (removal is purely geometric).
   assert.deepEqual([...updateEdges(deep, new Set([pairKey(0, 1)]), EDGE_PARAMS).kept], [pairKey(0, 1)]);
 });
+
+// --- Column profile (design 4.0, phase B) ---------------------------------
+import * as profile from '../src/columns/profile.js';
+import { SIM_PARAMS } from '../src/sim/params.js';
+import { ColumnProfile } from '../src/gpu/layout.js';
+
+const PARAMS = Object.fromEntries(SIM_PARAMS.map(([n, , v]) => [n, v]));
+const ocean = (ageMyr, crustKm = 7) => ({ crustKm, compositionDensity: 3000, ageMyr, elevationKm: 0 });
+const continent = (crustKm = 35) => ({ crustKm, compositionDensity: 2700, ageMyr: 1000, elevationKm: 3 });
+
+test('profile: geotherms solve the heat equation with their boundary conditions', () => {
+  const p = PARAMS, kappa = p.thermal_diffusivity_m2_s, k = p.thermal_conductivity_w_m_k;
+  const Ts = p.ambient_ocean_temp, Tm = p.mantle_temp;
+  // Oceanic: dT/dt = kappa d2T/dz2 (finite differences in age and depth), T(0) = Ts,
+  // 90% isotherm at the lithosphere base, heat flow = k dT/dz at the surface.
+  for (const age of [2, 10, 40]) {
+    const T = (z, t) => profile.geotherm(ocean(t), p).T(z);
+    for (const z of [5, 20, 40]) {
+      const dt = 0.01, dz = 0.05; // Myr, km
+      const dTdt = (T(z, age + dt) - T(z, age - dt)) / (2 * dt * profile.SECONDS_PER_MYR);
+      const d2Tdz2 = (T(z + dz, age) - 2 * T(z, age) + T(z - dz, age)) / (dz * 1e3) ** 2;
+      assert.ok(Math.abs(dTdt - kappa * d2Tdz2) < 2e-3 * Math.abs(dTdt) + 1e-16, `age ${age} z ${z}: ${dTdt} vs ${kappa * d2Tdz2}`);
+    }
+    const g = profile.geotherm(ocean(age), p);
+    assert.equal(g.T(0), Ts);
+    assert.ok(Math.abs((g.T(g.L) - Ts) / (Tm - Ts) - 0.9) < 2e-3);
+    const q = (k * (g.T(0.01) - g.T(0))) / 10; // W/m^2
+    assert.ok(Math.abs(q * 1e3 / g.heatFlow - 1) < 2e-3, `heat flow ${q * 1e3} vs ${g.heatFlow}`);
+  }
+  // Continental: k T'' = -A in the heat-producing layer, T'' = 0 below it,
+  // T(0) = Ts, T(L) = 90% isotherm, flux continuous; heat flow = k dT/dz at 0.
+  const g = profile.geotherm(continent(35), p);
+  const A = p.radiogenic_heat_uw_m3 * 1e-6, h = 0.05;
+  const d2 = (z) => (g.T(z + h) - 2 * g.T(z) + g.T(z - h)) / (h * 1e3) ** 2;
+  assert.ok(Math.abs(k * d2(7) + A) < 1e-3 * A);
+  assert.ok(Math.abs(d2(60)) < 1e-3 * A / k);
+  const slope = (z) => (g.T(z + h) - g.T(z - h)) / (2 * h * 1e3);
+  assert.ok(Math.abs(slope(p.radiogenic_layer_km - 2 * h) - slope(p.radiogenic_layer_km + 2 * h)) < 0.02 * slope(60));
+  assert.equal(g.T(0), Ts);
+  assert.ok(Math.abs(g.T(g.L) - (Ts + 0.9 * (Tm - Ts))) < 1e-6);
+  assert.ok(Math.abs((k * (g.T(0.01) - g.T(0))) / 10 * 1e3 / g.heatFlow - 1) < 2e-3);
+  assert.equal(g.T(g.zMantle + 1), Tm);
+});
+
+test('profile: Airy elevation reproduces depth ~ sqrt(age), and flattens at the capped age', () => {
+  const p = { ...PARAMS, oceanic_lithosphere_max_km: 1e4 }; // uncapped half-space
+  const drho = p.mantle_density - p.water_density;
+  // Crustless column of mantle composition: subsidence below the ridge is
+  // 2 rho_m alpha (Tm - Ts) sqrt(kappa t / pi) / (rho_m - rho_w) (Turcotte & Schubert 4.209).
+  const coeff = (2 * p.mantle_density * p.thermal_expansion_coeff * (p.mantle_temp - p.ambient_ocean_temp)) / drho;
+  const ridge = profile.airy(ocean(0, 0), p).elevation;
+  for (const t of [1, 4, 16, 64, 150]) {
+    const subsidence = ridge - profile.airy(ocean(t, 0), p).elevation;
+    const expected = coeff * Math.sqrt((p.thermal_diffusivity_m2_s * t * profile.SECONDS_PER_MYR) / Math.PI) / 1e3;
+    assert.ok(Math.abs(subsidence / expected - 1) < 1e-4, `age ${t}: ${subsidence} km vs ${expected} km`);
+  }
+  // Default parameters: 7 km crust, depth grows to the capped age and then stays.
+  const depth = (t) => PARAMS.sea_level - profile.airy(ocean(t), PARAMS).elevation;
+  assert.ok(depth(0) < depth(10) && depth(10) < depth(50));
+  assert.ok(Math.abs(depth(80) - depth(150)) < 1e-9);
+  console.log(`  default hypsometry: ridge ${depth(0).toFixed(2)} km deep, old ocean ${depth(150).toFixed(2)} km deep, `
+    + `35 km continent ${(-PARAMS.sea_level + profile.airy(continent(35), PARAMS).elevation).toFixed(2)} km high`);
+});
+
+test('profile: GPE differences give the half-space ridge push, independent of the integration depth', () => {
+  const p = { ...PARAMS, oceanic_lithosphere_max_km: 1e4 };
+  const kt = (t) => p.thermal_diffusivity_m2_s * t * profile.SECONDS_PER_MYR;
+  const B = p.mantle_density * p.thermal_expansion_coeff * (p.mantle_temp - p.ambient_ocean_temp);
+  for (const t of [10, 50, 100]) {
+    // Turcotte & Schubert 6.405: F = g rho_m alpha dT kappa t [1 + 2 rho_m alpha dT / (pi (rho_m - rho_w))], N/m.
+    const F = profile.GRAVITY * B * kt(t) * (1 + (2 * B) / (Math.PI * (p.mantle_density - p.water_density)));
+    const push = (profile.gpe(ocean(0, 0), p) - profile.gpe(ocean(t, 0), p)) * 1e9;
+    assert.ok(Math.abs(push / F - 1) < 1e-4, `age ${t}: ${push.toExponential(3)} vs ${F.toExponential(3)} N/m`);
+  }
+  for (const col of [ocean(30), continent(35), continent(70)]) {
+    const a = profile.gpe(col, PARAMS), b = profile.gpe(col, PARAMS, undefined, undefined, 100);
+    assert.ok(Math.abs(a - b) < 2, `GPE ${a} vs ${b} MPa km with a deeper base`); // ridge push ~2000 MPa km
+  }
+});
+
+test('profile: the yield-strength envelope peaks at the brittle-ductile transition, at textbook temperatures', () => {
+  const p = PARAMS;
+  for (const [name, col, Tlo, Thi] of [
+    ['oceanic mantle (olivine)', ocean(30, 0), 873, 1073],   // 600-800 C
+    ['continental crust (quartzite)', continent(35), 523, 723], // 250-450 C
+  ]) {
+    const prof = profile.columnProfile(col, p);
+    const g = profile.geotherm(col, p);
+    // Search the first material only: a continent is a "jelly sandwich", and
+    // its strongest point is brittle upper mantle below the weak lower crust.
+    const zMax = col.crustKm > 0 ? col.crustKm : prof.columnKm;
+    let best = { z: 0, s: -1 };
+    for (let z = 0.05; z < zMax; z += 0.05) {
+      const s = profile.envelope(col, p, z, 1, g).strength;
+      if (s > best.s) best = { z, s };
+    }
+    const bdt = prof.brittleDuctileKm;
+    const e = profile.envelope(col, p, bdt, 1, g);
+    assert.ok(Math.abs(e.brittle / e.ductile - 1) < 1e-3, `${name}: curves do not cross at ${bdt}`);
+    assert.ok(Math.abs(best.z - bdt) < 0.1, `${name}: envelope peaks at ${best.z} km, transition at ${bdt} km`);
+    const T = g.T(bdt);
+    assert.ok(T > Tlo && T < Thi, `${name}: transition at ${T} K`);
+  }
+  // Slices tile [0, column] from the top down, and match the struct the kernel writes.
+  const prof = profile.columnProfile(ocean(30), p);
+  let z = 0;
+  for (const s of prof.slices) { assert.ok(Math.abs(s.z - 0.5 * s.dz - z) < 1e-9); z += s.dz; }
+  assert.ok(Math.abs(z - prof.columnKm) < 1e-9);
+  assert.equal(ColumnProfile.fields.find(([f]) => f === 'depth_km')[1], `array<f32, ${profile.SLICES}>`);
+});

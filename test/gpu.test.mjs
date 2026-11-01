@@ -240,25 +240,23 @@ test('a thickened block relaxes to its Airy height (free radius); its neighbours
   // middle three are instantly thickened to 35 km of continental crust while
   // still at the ocean's elevation. Each column's top relaxes toward its own
   // Airy height by implicit Euler with the Haskell rebound time. With no
-  // flexural rigidity yet (phase 7), columns are independent.
+  // flexural rigidity yet (phase F), columns are independent. Airy heights
+  // come from the column profile's CPU reference (design 4.0; checked against
+  // analytic answers in the unit tests): old ocean is past the capped age and
+  // continents have a steady geotherm, so the targets do not drift with age.
   const page = await openPage({ small: true });
   const out = await page.evaluate(async () => {
     const a = 0.0175, n = 9, half = Math.asin(a); // chord between neighbours = 2a
     await plate.setParams({ mantle_drive: 0 });
     const p = plate.sim.params;
-    // Independent Airy height and rebound time (same formulas as design 4.4).
-    const airy = (H, comp, T) => {
-      const rho = comp * (1 + p.thermal_expansion_coeff * (p.mantle_temp - T));
-      const e0 = H * (1 - rho / p.mantle_density);
-      return e0 >= p.sea_level ? e0 : e0 - (p.sea_level - e0) * p.water_density / (p.mantle_density - p.water_density);
-    };
+    const airy = (H, comp) => plate.debug.profile.airy({ crustKm: H, compositionDensity: comp, ageMyr: 100, elevationKm: 0 }, p).elevation;
     const tauMyr = (eq) => {
       const drho = eq < p.sea_level ? p.mantle_density - p.water_density : p.mantle_density;
       return (4 * Math.PI * p.isostatic_viscosity_pa_s) / (drho * 9.81 * 4 * a * 6.371e6) / 3.15576e13;
     };
     const block = (i) => i >= 3 && i <= 5;
-    const T = 278; // at ocean temperature, so densities stay constant
-    const ocean = airy(7, 3000, T);
+    const T = 278;
+    const ocean = airy(7, 3000);
     const position = new Float32Array(3 * n);
     for (let i = 0; i < n; i++) { const phi = (i - (n - 1) / 2) * 2 * half; position.set([Math.sin(phi), 0, Math.cos(phi)], 3 * i); }
     const fill = (f) => Float32Array.from({ length: n }, (_, i) => f(i));
@@ -281,7 +279,7 @@ test('a thickened block relaxes to its Airy height (free radius); its neighbours
     const steps = [];
     for (let s = 0; s < 6; s++) { await plate.runSteps(1); steps.push((await read()).e); }
     const end = await read();
-    return { start, steps, end, dt: p.dt_crust_myr, ocean, thick: airy(35, 2700, T), tau: tauMyr(airy(35, 2700, T)), sea: p.sea_level };
+    return { start, steps, end, dt: p.dt_crust_myr, ocean, thick: airy(35, 2700), tau: tauMyr(airy(35, 2700)), sea: p.sea_level };
   });
   assert.deepEqual(page.errors, []);
   await page.close();
@@ -296,6 +294,43 @@ test('a thickened block relaxes to its Airy height (free radius); its neighbours
     for (const i of [0, 1, 2, 6, 7, 8]) assert.ok(Math.abs(row[i] - ocean) < 1e-4, `ocean column ${i} moved to ${row[i]}`);
   });
   for (let i = 0; i < 9; i++) assert.ok(Math.abs(out.end.x[i] - out.start.x[i]) < 1e-6, `column ${i} moved sideways`);
+});
+
+test('column profiles on the GPU match the CPU reference', { timeout: 300_000 }, async () => {
+  // Phase B (design 9): the kernel (profile.wgsl) against its reference
+  // (src/columns/profile.js), whose physics the unit tests check against
+  // analytic answers. Columns span ridge to old ocean, a crustless column, and
+  // continents from shelf to plateau; elevations start at their Airy heights.
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async () => {
+    const cols = [ // crust km, composition density, age Myr
+      [7, 3000, 0], [7, 3000, 0.5], [7, 3000, 5], [7, 3000, 30], [7, 3000, 100], [0, 3000, 20],
+      [30, 2700, 1000], [35, 2700, 1000], [45, 2750, 1000], [70, 2700, 1000], [12, 2800, 50],
+    ];
+    const n = cols.length, a = 0.0175;
+    const position = new Float32Array(3 * n);
+    for (let i = 0; i < n; i++) { const phi = i * 3 * a; position.set([Math.sin(phi), 0, Math.cos(phi)], 3 * i); }
+    const f = (k) => Float32Array.from(cols, (c) => c[k]);
+    await plate.loadState({
+      particles: { count: n, position, thickness: f(0), compositionDensity: f(1), age: f(2), temperature: new Float32Array(n).fill(278), apothem: new Float32Array(n).fill(a) },
+      bonds: { count: 0, a: new Uint32Array(0), b: new Uint32Array(0), damage: new Float32Array(0) },
+      yieldStressMPa: 1e9,
+    });
+    const r = await plate.debug.profiles();
+    return {
+      worst: r.worst, active: r.active.length,
+      elevation: r.active.map((i) => r.P.elevation[i]), airy: r.active.map((i) => r.G.airy_elevation_km[i]),
+    };
+  });
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  assert.equal(out.active, 11);
+  console.log(`  worst scaled differences: ${Object.entries(out.worst).map(([k, w]) => `${k} ${w.err.toExponential(1)}`).join(', ')}`);
+  for (const [field, w] of Object.entries(out.worst)) {
+    assert.ok(w.err < 1e-3, `${field}: particle ${w.particle}, GPU ${w.gpu} vs reference ${w.ref}`);
+  }
+  // Loading sets each elevation to its Airy height.
+  out.elevation.forEach((e, k) => assert.ok(Math.abs(e - out.airy[k]) < 1e-6));
 });
 
 test('columns touch only if they overlap in map view and in depth', { timeout: 300_000 }, async () => {

@@ -44,14 +44,11 @@ fn update_density(idx: u32) {
     particles[idx].density = particles[idx].composition_density * (1.0 + sim.thermal_expansion_coeff * (sim.mantle_temp - particles[idx].temperature));
 }
 
-// Airy isostasy: freeboard of a floating column above the mantle datum,
-// e0 = H (1 - rho / rho_m). Where that is below sea level the column is also
-// loaded by water of depth (sea_level - e): balancing
-// rho H + rho_w (s - e) = rho_m (H - e) gives e = e0 - (s - e0) rho_w / (rho_m - rho_w).
+// Airy isostasy of the whole column (crust and lithospheric mantle, with
+// temperature-dependent densities), from its profile (design 4.0;
+// column_profile must have run this step).
 fn airy_elevation(idx: u32) -> f32 {
-    let e0 = particles[idx].thickness_km * (1.0 - particles[idx].density / sim.mantle_density);
-    if (e0 >= sim.sea_level) { return e0; }
-    return e0 - (sim.sea_level - e0) * sim.water_density / (sim.mantle_density - sim.water_density);
+    return profiles[idx].airy_elevation_km;
 }
 
 // Viscous rebound time of a load of wavelength lambda = 4 apothems (Haskell):

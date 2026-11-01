@@ -14,7 +14,8 @@ import { OrbitCamera } from './render/camera.js';
 import { Recorder, snapshotFromZip } from './record/recorder.js';
 import { PlateTracker } from './plates/tracker.js';
 import { BUILD_INFO } from './build-info.js';
-import { Edge, Particle, SLOTS, unpack } from './gpu/layout.js';
+import { ColumnProfile, Edge, Particle, SLOTS, unpack } from './gpu/layout.js';
+import * as profile from './columns/profile.js';
 import * as topology from './edges/topology.js';
 import { CAPACITY } from './sim/simulation.js';
 
@@ -27,6 +28,16 @@ const $ = (id) => document.getElementById(id);
  * the edge kernels saw them (predicted positions), the edge set as pairKeys,
  * the overflow counters and a list of problems (empty = consistent).
  */
+// Column profiles (design 4.0) read back, with the CPU reference's verdict.
+async function inspectProfiles(sim) {
+  const b = await sim.readBuffers(['particles', 'profiles']);
+  const P = unpack(Particle, b.particles, CAPACITY.maxParticles);
+  const G = unpack(ColumnProfile, b.profiles, CAPACITY.maxParticles);
+  const active = [];
+  for (let i = 0; i < CAPACITY.maxParticles; i++) if (P.is_active[i]) active.push(i);
+  return { P, G, active, worst: profile.compareProfiles(P, G, sim.params, active) };
+}
+
 async function inspectEdges(sim) {
   const b = await sim.readBuffers(['particles', 'edges', 'edgePool', 'deltas', 'solver']);
   const P = unpack(Particle, b.particles, CAPACITY.maxParticles);
@@ -201,7 +212,7 @@ async function main() {
 
   window.plate = {
     sim, recorder, plates, device, BUILD_INFO,
-    layout: { Particle, Edge, SLOTS },          // struct offsets for reading raw buffers
+    layout: { Particle, Edge, ColumnProfile, SLOTS },          // struct offsets for reading raw buffers
     regenerate, loadState, runSteps, restoreFromZip,
     setParams: (overrides) => exclusive(() => sim.setParams(overrides)),
     snapshot: () => exclusive(() => sim.snapshot()),
@@ -214,6 +225,8 @@ async function main() {
     debug: {
       topology,
       edges: () => exclusive(() => inspectEdges(sim)),
+      profile,
+      profiles: () => exclusive(() => inspectProfiles(sim)),
     },
   };
 

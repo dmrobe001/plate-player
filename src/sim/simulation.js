@@ -1,6 +1,6 @@
 // GPU-side simulation state and the per-frame compute schedule.
 
-import { Edge, GridNode, NONE, Particle, SLOTS } from '../gpu/layout.js';
+import { ColumnProfile, Edge, GridNode, NONE, Particle, SLOTS } from '../gpu/layout.js';
 import { createShaderModule } from '../gpu/device.js';
 import { packSimParams, SIM_PARAMS, SIM_PARAMS_BYTES, simParamsWGSL } from './params.js';
 
@@ -10,6 +10,7 @@ import thermalWGSL from '../shaders/compute/thermal.wgsl';
 import growthWGSL from '../shaders/compute/growth.wgsl';
 import solverWGSL from '../shaders/compute/solver.wgsl';
 import edgesWGSL from '../shaders/compute/edges.wgsl';
+import profileWGSL from '../shaders/compute/profile.wgsl';
 
 export const CAPACITY = {
   maxParticles: 25000,
@@ -34,7 +35,7 @@ export const STATE_BUFFERS = ['grid', 'particles', 'edges', 'particlePool', 'edg
 
 /** WGSL struct definitions shared by compute and render shaders. */
 export function structsWGSL() {
-  return Particle.wgsl() + Edge.wgsl()
+  return Particle.wgsl() + Edge.wgsl() + ColumnProfile.wgsl()
     + GridNode.wgsl()
     + simParamsWGSL();
 }
@@ -64,6 +65,7 @@ export class Simulation {
       // ParticleDelta in bindings.wgsl: position corrections + slot list (SLOTS in layout.js)
       deltas: device.createBuffer({ label: 'particle deltas and slot lists', size: maxParticles * SLOTS.wordsPerParticle * 4, usage: S }),
       solver: device.createBuffer({ label: 'solver state', size: (4 + MAX_SOLVER_ITERATIONS) * 4, usage: S }),
+      profiles: device.createBuffer({ label: 'column profiles (derived)', size: maxParticles * ColumnProfile.byteSize, usage: S }),
       plateIds: device.createBuffer({ label: 'plate ids (drawing only)', size: maxParticles * 4, usage: S }),
       params: device.createBuffer({ label: 'sim params', size: SIM_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
     };
@@ -101,10 +103,10 @@ export class Simulation {
 
   #createPipelines(onError) {
     const { device, buffers } = this;
-    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL, edgesWGSL].join('\n');
+    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL, edgesWGSL, profileWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
-    const order = ['grid', 'adjacency', 'particles', 'edges', 'particlePool', 'edgePool', 'hashGrid', 'deltas', 'solver'];
+    const order = ['grid', 'adjacency', 'particles', 'edges', 'particlePool', 'edgePool', 'hashGrid', 'deltas', 'solver', 'profiles'];
     const memoryLayout = device.createBindGroupLayout({
       entries: order.map((name, binding) => ({
         binding,
@@ -128,7 +130,7 @@ export class Simulation {
 
     const layout = device.createPipelineLayout({ bindGroupLayouts: [memoryLayout, uniformLayout] });
     const entryPoints = [
-      'crust_locate',
+      'crust_locate', 'column_profile',
       'crust_thermo_isostasy', 'crust_refresh_derived', 'crust_edge_healing',
       'crust_accumulation', 'crust_commit_splits', 'crust_rewire_edges', 'crust_clean_split',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
@@ -212,7 +214,12 @@ export class Simulation {
     const pass = encoder.beginComputePass({ label: 'refresh derived' });
     pass.setBindGroup(0, this.memoryBindGroup);
     pass.setBindGroup(1, this.uniformBindGroup);
+    pass.setPipeline(this.pipelines.column_profile);
+    pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
     pass.setPipeline(this.pipelines.crust_refresh_derived);
+    pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
+    // Again, now that every elevation is set (pressures include the water load).
+    pass.setPipeline(this.pipelines.column_profile);
     pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
     pass.end();
     device.queue.submit([encoder.finish()]);
@@ -263,7 +270,9 @@ export class Simulation {
 
     run('crust_locate', crust);
 
-    // Crust thermal state, healing, growth and splitting
+    // Column profiles (design 4.0), then thermal state and isostasy, healing,
+    // growth and splitting
+    run('column_profile', crust);
     run('crust_thermo_isostasy', crust);
     run('crust_edge_healing', edges);
     run('crust_accumulation', crust);

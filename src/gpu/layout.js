@@ -13,13 +13,19 @@ const TYPES = {
   i32: { size: 4, align: 4 },
   vec4f: { size: 16, align: 16 },
 };
+// Fixed-size scalar arrays, e.g. 'array<f32, 8>' (stride 4: storage buffers only).
+const arrayType = (type) => /^array<(f32|u32|i32), (\d+)>$/.exec(type);
+const typeInfo = (type) => {
+  const m = arrayType(type);
+  return m ? { size: 4 * Number(m[2]), align: 4 } : TYPES[type];
+};
 
 export function defineStruct(name, fields) {
   let offset = 0;
   let maxAlign = 4;
   const offsets = {};
   for (const [field, type] of fields) {
-    const { size, align } = TYPES[type];
+    const { size, align } = typeInfo(type);
     offset = Math.ceil(offset / align) * align;
     offsets[field] = offset / 4; // in 32-bit words
     offset += size;
@@ -52,9 +58,12 @@ export function unpack(struct, buffer, count) {
   const out = {};
   for (const [field, type] of struct.fields) {
     const o = struct.offsets[field];
-    if (type === 'vec4f') {
-      const a = new Float32Array(4 * count);
-      for (let i = 0; i < count; i++) a.set(f32.subarray(i * struct.words + o, i * struct.words + o + 4), 4 * i);
+    const arr = arrayType(type);
+    if (type === 'vec4f' || arr) {
+      const len = arr ? Number(arr[2]) : 4;
+      const src = arr && arr[1] !== 'f32' ? (arr[1] === 'u32' ? u32 : new Int32Array(buffer)) : f32;
+      const a = new src.constructor(len * count);
+      for (let i = 0; i < count; i++) a.set(src.subarray(i * struct.words + o, i * struct.words + o + len), len * i);
       out[field] = a;
     } else {
       const a = type === 'f32' ? new Float32Array(count) : type === 'i32' ? new Int32Array(count) : new Uint32Array(count);
@@ -136,6 +145,31 @@ export const Edge = defineStruct('Edge', [
  * which flags an overflow), then up to `capacity` edge ids sorted by the
  * angle of the partner around the particle. Rebuilt every step.
  */
+/**
+ * A column's vertical profile (design 4.0), recomputed every step from the
+ * particle's state by column_profile (profile.wgsl; CPU reference
+ * src/columns/profile.js). Derived, not state: never saved. Depths are km
+ * below the column top; per-slice arrays run from the top down, the first
+ * CRUST_SLICES over the crust.
+ */
+export const ColumnProfile = defineStruct('ColumnProfile', [
+  ['lithosphere_km', 'f32'],        // base of the lithosphere (90% isotherm)
+  ['column_km', 'f32'],             // slices span [0, max(lithosphere, crust)]
+  ['freeboard_km', 'f32'],          // Airy height without water loading
+  ['airy_elevation_km', 'f32'],     // equilibrium elevation (water-loaded below sea level)
+  ['gpe_mpa_km', 'f32'],            // gravitational potential energy vs the reference mantle column (1e9 N/m)
+  ['heat_flow_mw_m2', 'f32'],       // surface heat flow
+  ['moho_temp_k', 'f32'],
+  ['brittle_ductile_km', 'f32'],    // shallowest brittle-ductile transition (integrity 1)
+  ['depth_km', 'array<f32, 8>'],    // slice midpoints
+  ['thickness_km', 'array<f32, 8>'],
+  ['temp_k', 'array<f32, 8>'],
+  ['density', 'array<f32, 8>'],     // kg/m^3
+  ['pressure_mpa', 'array<f32, 8>'], // lithostatic, from the sea surface (or the column top on land)
+  ['log10_viscosity', 'array<f32, 8>'], // Pa s, dislocation creep at the reference strain rate
+  ['ductile_mpa', 'array<f32, 8>'], // ductile shear strength (capped at 1e6)
+]);
+
 export const SLOTS = { wordsPerParticle: 20, countWord: 4, firstSlotWord: 8, capacity: 12 };
 
 /** One node of the mantle grid; written from the CPU mantle model (src/mantle/). */

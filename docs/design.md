@@ -4,7 +4,8 @@ Status: **phases 0–3 implemented** (2 and 3 partly, see the phase table), plat
 identification from phase 5, Chebyshev acceleration, and the lava-lamp mantle with
 grounded basal drag. **The physics is being redesigned around one pair-interaction
 law** (sections 3.2, 4.0, 4.5, 4.7, 6): no bond/contact distinction, graded and
-history-dependent integrity, area and volume as exact budgets. The rest is a proposal.
+history-dependent integrity, area and volume as exact budgets. Of the redesign, phases
+A (persistent edges) and B (column profiles) are done. The rest is a proposal.
 This document says where the model is going and why.
 
 **Development strategy (current).** No more full-planet runs until all the physics
@@ -230,6 +231,17 @@ The weaker of brittle and ductile at each depth is the **yield-strength envelope
 downstream reads these slices; nothing reads crust type directly, so a stretched
 continent that turns oceanic changes behaviour through its profile alone.
 
+*As built (phase B; `src/columns/profile.js`, `profile.wgsl`).* 8 slices: 3 over the
+crust, 5 over the mantle lithosphere [crust, max(L, crust)]. Per slice: depth,
+thickness, T, ρ, P, log₁₀η, ductile strength. Per column: L, Airy elevation (and the
+unloaded freeboard), GPE, surface heat flow, Moho temperature, and the shallowest
+brittle–ductile transition at φ = 1. Brittle strength needs φ, which belongs to the
+edge, so the profile stores P and the edge law (phase C) applies μ(1 − λ_pore)P + φc.
+Depth integrals (Airy, GPE, P) do not use the slices: they use 2-point Gauss–Legendre
+quadrature on 6 crust and 16 mantle sub-intervals, down to the depth where T reaches
+mantle temperature, so the slices only resolve what the edge law needs. Details,
+parameter values and conventions: phase B findings.
+
 ### 4.1 Dissipation (the "mass" of the solver)
 
 - **Basal drag:** γᵢ = Aᵢ η_a / h_a, with η_a and h_a the asthenosphere viscosity
@@ -422,8 +434,9 @@ is removed.
 
 ### 5.1 Schedule
 
-Target order once the pair law is assembled (today's code runs stages 2–4 and 6–7,
-with stand-in rules for stage 5; see phase A findings):
+Target order once the pair law is assembled (today's code runs stage 1 without the
+tessellated area, stages 2–4 and 6–7, with stand-in rules for stage 5; see phase A and
+B findings):
 
 ```
 1. profiles                   per column: T(z), ρ(z), η(z), envelope (4.0); tessellated area (4.8)
@@ -745,7 +758,7 @@ written here.
 | 3 ✅ (partly) | **Unified edge array + column contacts + free radius & buoyancy.** Done: bonds and per-step one-sided contacts in one edge array solved by one XPBD kernel; contacts need overlap in map view *and* depth; fully damaged bonds retire; the radial coordinate is free and relaxes to Airy height (Haskell rebound time). *Superseded in part* by the pair law: edge kinds and per-step contacts give way to phase A | Thickened block relaxes to its Airy height as implicit Euler with the rebound time, neighbours unmoved (kept as a test); columns touch only when they overlap in depth (kept as a test) |
 | 5 (identification ✅; coarse solve shelved) | **Plate labelling** (diagnostic), Euler-pole fits, events | Labelling, persistent ids, split/merge events and Euler-pole fits are unit-tested on synthetic networks. The coarse *solve* does not fit the XPBD formulation (findings below) |
 | A ✅ | **Persistent pair-keyed edges**, one kind: per-particle angle-sorted slot lists; create on entering range (map view + depth), remove on leaving; φ, stored stresses, anchor, timers carried across steps | Slot lists stay symmetric (i lists j ⇔ j lists i) under random motion; an edge's state survives 100 steps of motion within range and is dropped exactly when the pair leaves; no duplicate pairs; free-list invariants hold. **Met** (kept as tests; phase A findings) |
-| B | **Column profile** (4.0): T(z) from thermal age / continental geotherm, ρ(z), η(z), envelope; lithosphere thickness; GPE | Oceanic profile matches half-space cooling; Airy elevation from the profile reproduces depth ∝ √age on a synthetic age ramp; envelope peak at the brittle–ductile transition where the two curves cross (analytic) |
+| B ✅ | **Column profile** (4.0): T(z) from thermal age / continental geotherm, ρ(z), η(z), envelope; lithosphere thickness; GPE | Oceanic profile matches half-space cooling; Airy elevation from the profile reproduces depth ∝ √age on a synthetic age ramp; envelope peak at the brittle–ductile transition where the two curves cross (analytic). **Met**, plus GPE differences = half-space ridge push, and the kernel matches the reference (kept as tests; phase B findings) |
 | C | **Edge law** (4.5): effective stiffness integral, caps as λ clamps, Maxwell stored-stress decay | Single edge under constant separation rate: stress approaches η_eff·rate with the Maxwell time (implicit-Euler sequence, exact); cold pair behaves as a spring, hot pair as a dashpot; tension cap of a φ = 0 cold pair is ≈ 0; two-particle relaxation test from phase 2 still passes when k is set from a uniform profile |
 | D | **Irreversible step** (4.7): volumetric flow at fixed volume, slip, integrity (work-driven damage, thermal healing), neighbour exchange | Uniform compression of a patch thickens at the predicted rate with Σ volume constant; pure shear leaves every area_ref unchanged and produces slip; φ decays in proportion to work input and heals with τ_heal(T); a patch below yield accumulates no plastic strain over many steps with solver noise |
 | E | **Area, volume, melt, splits** (4.8); remove the spreading proxy | Tessellated areas sum to 4π to float precision on random and lattice configurations; a stretched strip produces 7 km crust per unit new area at L = 0 and none at L ≥ H_m; a split conserves volume and area_ref; budget identity: Δ(Σ V) = logged sources − sinks exactly |
@@ -765,6 +778,56 @@ lava-lamp mantle with grounded basal drag, and bond rest length = apothem sum
 **Resolved:** how new crust is made. Not by inflation inside plates, and not by a
 separate gap-filling rule: by stretching (tessellated area grows at fixed volume) plus
 decompression melt where the lithosphere is thin (4.8).
+
+### Phase B findings: column profiles
+
+**What was built.** A `ColumnProfile` per particle (a derived buffer, never saved),
+written every step by `column_profile` before isostasy, and its CPU reference. Isostasy
+now targets the profile's Airy height; nothing else reads the profile yet.
+
+| Piece | Choice | Why |
+|---|---|---|
+| Oceanic geotherm | half-space cooling, T = Tₛ + ΔT erf(z / 2√(κt)); L = 2.32√(κt) (the 90% isotherm); age capped where L = 100 km (~59 Myr) | the existing L, and a cheap stand-in for the plate model's flattening |
+| Continental geotherm | steady conduction, heat production 1.5 µW/m³ in the top 15 km, T(L = 150 km) at the 90% isotherm, gradient continued below L to mantle temperature | gives 41 mW/m² surface heat flow (cratonic) and a 334 °C Moho under 35 km of crust |
+| Density | composition density at mantle temperature × (1 + α(Tₘ − T)) in crust and mantle | unchanged convention |
+| Airy | freeboard = ∫(1 − ρ/ρₘ)dz down to where T = Tₘ; water-loaded below sea level | whole column, so the lithospheric mantle's contraction sets depth vs age |
+| GPE | Γ = g ∫(ρ − ρ_ref)(r − r_b)dr, ρ_ref = mantle below the datum and 0 above, at the Airy height | independent of the base r_b in equilibrium (tested), so no compensation depth parameter |
+| Brittle | τ = φc + μ(1 − λ_pore)P, μ = 0.6, λ_pore = 0.4 (hydrostatic), c = 20 MPa | Byerlee friction |
+| Ductile | dislocation creep at ε̇ = 10⁻¹⁵ s⁻¹: wet quartzite (Gleason & Tullis 1995), diabase (Mackwell et al. 1998), dry olivine (Hirth & Kohlstedt 2003); shear strength = σ_diff/2, η = strength/2ε̇ | standard laboratory laws. Constants are from memory of the literature and should be checked against the papers before calibration; order-one factors between uniaxial laws and tensor invariants are ignored |
+| Brittle–ductile transition | shallowest slice midpoint where ductile < brittle, then bisection | a diagnostic; the edge law integrates the envelope itself |
+
+**Tests** (kept). Unit tests of the reference against analytic answers:
+- the oceanic geotherm satisfies ∂T/∂t = κ∂²T/∂z², and the continental one kT″ = −A
+  with continuous flux;
+- for a crustless column, subsidence below the ridge is
+  2ρₘαΔT√(κt/π)/(ρₘ − ρ_w) (Turcotte & Schubert) to 2×10⁻⁶ for ages 1–150 Myr;
+- GPE differences equal the half-space ridge push,
+  gρₘαΔTκt[1 + 2ρₘαΔT/π(ρₘ − ρ_w)], to 3×10⁻⁷ (4.2×10¹² N/m at 100 Myr);
+- moving the integration base 100 km deeper changes GPE by ≤ 1.2 MPa·km (ridge
+  push is ~2000);
+- the envelope peaks where the curves cross: olivine at ~650 °C, quartzite at ~260 °C.
+
+GPU: the kernel matches the reference on 11 columns (ridge to old ocean, crustless,
+shelf to plateau) to ≤ 2×10⁻⁵ of each field's scale. The Airy-block test (phase 3)
+now targets the profile's Airy height. One planet-scale run (5 steps): no errors; the test
+took 66 s instead of 56 s under the software GPU.
+
+**Behaviour changes.**
+- Hypsometry: ridge 2.85 km deep, old ocean 5.62 km, 35 km continent +0.81 km
+  (Earth: ~2.5, ~5.7, ~0.8). This needed sea level at 2.6 km in the elevation datum
+  (was 3.5); 30 km continental crust now sits just under water, as a shelf.
+- Elevation no longer depends on the per-particle `temperature` scalar, which is
+  left for the stand-in yield and healing rules (and slab heating) until phases C–D.
+
+**Noticed for later.**
+- Continents are "jelly sandwiches": the strongest point is brittle upper mantle at
+  ~70 km, below a weak quartz lower crust. The edge law integrates the whole
+  envelope, so it will see this, and continental stiffness will depend on the Moho
+  temperature.
+- At age 0 the column is at mantle temperature throughout (no lithosphere, no
+  brittle layer), and the reported heat flow uses a 1 kyr floor on age.
+- Sea level is the one calibrated number here; it moves with crust densities and
+  thicknesses at integration.
 
 ### Phase A findings: persistent edges of one kind
 
@@ -1175,6 +1238,11 @@ separate.
 | Maxwell element | spring and dashpot in series: elastic on short times, viscous on times longer than η/E |
 | yield-strength envelope | strength of the lithosphere versus depth: the weaker of brittle friction (rising with depth) and ductile creep (falling with depth as it gets hotter) |
 | Byerlee friction | the empirical rock friction law, shear strength ≈ 0.6 × normal stress |
+| dislocation creep | ductile flow of rock by crystal defects moving; strain rate ∝ stressⁿ exp(−Q/RT), n ≈ 3–5 |
+| brittle–ductile transition | depth where creep becomes weaker than friction; follows an isotherm (~300 °C in quartz, ~650 °C in olivine) |
+| jelly sandwich | continental strength profile: strong brittle upper crust, weak ductile lower crust, strong upper mantle |
+| half-space cooling | conductive cooling of sea floor moving away from a ridge: T follows erf(z / 2√(κ·age)), so depth and lithosphere thickness grow as √age |
+| ridge push | horizontal force from the GPE difference between young (hot, high) and old (cold, low) ocean lithosphere |
 | tessellation cell (Voronoi cell) | the region of the sphere closer to a marker than to any other |
 | solidus | temperature (at a given pressure) at which rock begins to melt |
 | T1 event | neighbour exchange in a foam or cell network: one contact is lost and another forms |
