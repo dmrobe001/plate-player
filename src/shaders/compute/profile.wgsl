@@ -30,6 +30,7 @@ struct Column {
     rho_crust: f32,      // composition density at mantle temperature
     continental: bool,
     elevation: f32,      // current elevation (water load for pressure)
+    slab: bool,          // overburden is mantle rock, not water
     // geotherm
     lith_km: f32,
     z_mantle_km: f32,    // below this, T = mantle temperature
@@ -46,6 +47,7 @@ fn column_of(i: u32) -> Column {
     c.rho_crust = particles[i].composition_density;
     c.continental = c.rho_crust < 2850.0;  // CONTINENTAL_DENSITY_MAX
     c.elevation = particles[i].elevation;
+    c.slab = particles[i].state == 2u;
     c.lith_km = lithosphere_thickness_km(i);
     let ts = sim.ambient_ocean_temp;
     let tm = sim.mantle_temp;
@@ -117,7 +119,7 @@ fn gpe_segment(c: Column, a: f32, b: f32, n: u32, e: f32, z_end: f32) -> f32 {
 }
 
 fn pressure_at(c: Column, z_km: f32) -> f32 {
-    let water = sim.water_density * max(sim.sea_level - c.elevation, 0.0) * 1000.0;
+    let water = select(sim.water_density, sim.mantle_density, c.slab) * max(sim.sea_level - c.elevation, 0.0) * 1000.0;
     let rock = integrate(c, 0u, 0.0, min(z_km, c.crust_km), 4u, 0.0, 0.0) + integrate(c, 0u, c.crust_km, z_km, 8u, 0.0, 0.0);
     return GRAVITY * (water + rock * 1000.0) / 1e6;
 }

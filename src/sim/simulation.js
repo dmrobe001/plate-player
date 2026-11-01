@@ -14,6 +14,7 @@ import profileWGSL from '../shaders/compute/profile.wgsl';
 import lawWGSL from '../shaders/compute/law.wgsl';
 import flowWGSL from '../shaders/compute/flow.wgsl';
 import areaWGSL from '../shaders/compute/area.wgsl';
+import flexureWGSL from '../shaders/compute/flexure.wgsl';
 
 export const CAPACITY = {
   maxParticles: 25000,
@@ -38,6 +39,7 @@ const WORKGROUP = 64;
 // the browser's GPU watchdog on slow GPUs (the device is then lost), so a
 // step with many iterations is submitted in pieces, waiting for each.
 const ITERATIONS_PER_SUBMIT = 16;
+const FLEXURE_ITERATIONS_PER_SUBMIT = 64;
 
 /** Buffers that together are the complete simulation state (snapshot / restore). */
 // (Slot lists in `deltas` are an index rebuilt every step, not state.)
@@ -113,7 +115,7 @@ export class Simulation {
 
   #createPipelines(onError) {
     const { device, buffers } = this;
-    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL, flowWGSL, areaWGSL, splitWGSL].join('\n');
+    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL, flowWGSL, areaWGSL, splitWGSL, flexureWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
     const order = ['grid', 'adjacency', 'particles', 'edges', 'particlePool', 'edgePool', 'hashGrid', 'deltas', 'solver', 'profiles'];
@@ -144,6 +146,7 @@ export class Simulation {
       'crust_thermo_isostasy', 'crust_refresh_derived', 'columns_flow', 'columns_gpe_force',
       'columns_split', 'crust_commit_splits', 'crust_rewire_edges', 'crust_clean_split',
       'columns_area', 'columns_volume', 'columns_init_volume',
+      'slabs_arc_count', 'columns_arc', 'columns_flexure_begin', 'columns_moment', 'columns_flexure',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
       'edges_begin', 'edges_prune', 'edges_note_listed', 'edges_create', 'edges_finish', 'edges_law', 'edges_maxwell',
       'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine',
@@ -187,8 +190,9 @@ export class Simulation {
       pf[base + po.thermal_age_myr] = P.thermalAge ? P.thermalAge[i] : P.age[i]; // clamped to its cap on the GPU
       pf[base + po.area_ref] = 2 * Math.sqrt(3) * P.apothem[i] ** 2;
       pf[base + po.apothem] = P.apothem[i];
-      pu[base + po.state] = 1;
-      pu[base + po.next_state] = 1;
+      pu[base + po.state] = P.state ? P.state[i] : 1; // 1 surface, 2 slab (tests may load slabs)
+      pu[base + po.next_state] = pu[base + po.state];
+      pu[base + po.geometry_reset] = pu[base + po.state] === 2 ? 1 : 0; // slab edges: length measured in 3D from step 1
       pu[base + po.is_active] = 1;
       pu[base + po.next_idx] = NONE;
       pf[base + po.density] = P.compositionDensity[i];
@@ -310,11 +314,25 @@ export class Simulation {
 
     // Tessellated area; dilatation thins the lithosphere and brings melt;
     // crust thickness = volume / area (design 4.8). Then column profiles
-    // (design 4.0), thermal state and isostasy.
+    // (design 4.0), thermal state, slab sinking (design 6) and arcs.
     run('columns_area', crust);
     run('columns_volume', crust);
     run('column_profile', crust);
     run('crust_thermo_isostasy', crust);
+    run('slabs_arc_count', crust);
+    run('columns_arc', crust);
+
+    // Surface elevations: Winkler isostasy with plate bending (design 4.3, 4.4).
+    run('columns_flexure_begin', crust);
+    for (let i = 0; i < this.params.flexure_iterations; i++) {
+      if (i > 0 && i % FLEXURE_ITERATIONS_PER_SUBMIT === 0) {
+        submit();
+        await device.queue.onSubmittedWorkDone();
+        open();
+      }
+      run('columns_moment', crust);
+      run('columns_flexure', crust);
+    }
 
     // Crust motion: overdamped XPBD. Update the edges (pairs in range), then
     // iterate all edges toward the minimum of drag + elastic energy.

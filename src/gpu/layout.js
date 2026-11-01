@@ -92,13 +92,14 @@ export const Particle = defineStruct('Particle', [
   ['iter_prev', 'vec4f'],       // solver iterate x_{k-1} (Chebyshev)
   ['cell_shape', 'vec4f'],      // tessellation cell (derived, design 4.8): centroid (x, y) and major-axis
                                 //   angle (z) in the gnomonic tangent basis, sqrt of the major second moment (w)
+  ['slab_trailing', 'vec4f'],   // slab: unit direction to the plate behind it (integrity-weighted surface partners), w = 1 if any
   ['thickness_km', 'f32'],      // crust thickness, derived: crust_volume / cell_area (slabs: / area_ref)
   ['composition_density', 'f32'], // kg/m^3 at mantle temperature
   ['temperature', 'f32'],       // K
   ['age', 'f32'],               // Myr
   ['area_ref', 'f32'],          // stress-free (reference) area, unit sphere = 2*sqrt(3)*apothem^2 (hexagon)
   ['apothem', 'f32'],           // unit-sphere length; sets rest lengths and range
-  ['state', 'u32'],             // 1 = surface, 2 = subducting slab
+  ['state', 'u32'],             // 1 = surface, 2 = slab (sinking below the surface)
   ['is_active', 'u32'],
   ['next_idx', 'u32'],          // linked list through the collision hash grid
   ['density', 'f32'],           // cached thermally-corrected density
@@ -114,6 +115,14 @@ export const Particle = defineStruct('Particle', [
   ['cell_area_prev', 'f32'],    // last step's cell_area (dilatation; 0 = none this step)
   ['volume_added', 'f32'],      // melt added this step (diagnostic)
   ['cell_clipped', 'u32'],      // 1 = the cell touched its clip polygon (a free side): its area is not real, it never splits
+  // Subduction, slabs, arcs, bending (design 4.3, 6; phase F):
+  ['slab_neighbours', 'u32'],   // edges to slab columns this step (subduction propagation, polarity)
+  ['geometry_reset', 'u32'],    // 1 = split or subducted this step: its edges restart their length measure
+  ['arc_count', 'u32'],         // slab: surface columns within arc reach this step
+  ['arc_supply', 'f32'],        // slab: arc volume it supplies this step (km x unit area)
+  ['flexural_rigidity', 'f32'], // D, N m (derived each step)
+  ['bending_moment', 'f32'],    // D x laplacian of elevation (solver scratch)
+  ['elevation_start', 'f32'],   // elevation at the start of the vertical solve
 ]);
 
 /**
@@ -191,7 +200,7 @@ export const ColumnProfile = defineStruct('ColumnProfile', [
   ['ductile_mpa', 'array<f32, 8>'], // ductile shear strength (capped at 1e6)
 ]);
 
-export const SLOTS = { wordsPerParticle: 20, countWord: 4, firstSlotWord: 8, capacity: 12 };
+export const SLOTS = { wordsPerParticle: 44, countWord: 4, firstSlotWord: 8, capacity: 12 };
 
 /** One node of the mantle grid; written from the CPU mantle model (src/mantle/). */
 export const GridNode = defineStruct('GridNode', [

@@ -38,6 +38,7 @@ fn columns_area(@builtin(global_invocation_id) id: vec3<u32>) {
         particles[idx].cell_area = particles[idx].area_ref;
         particles[idx].cell_shape = vec4f(0.0);
         particles[idx].cell_clipped = 0u;
+        particle_deltas[idx].cell_count = 0u;
         return;
     }
     let p = particles[idx].position.xyz;
@@ -67,7 +68,7 @@ fn columns_area(@builtin(global_invocation_id) id: vec3<u32>) {
         while (j != NONE && iter < HASH_LIST_CAP && n >= 3u) {
             let next = particles[j].next_idx;
             iter++;
-            if (j == idx || particles[j].state != 1u) { j = next; continue; }
+            if (j == idx || particles[j].is_active == 0u || particles[j].state != 1u) { j = next; continue; }
             // Half-plane c + nv.u <= 0 (halfPlane in area.js).
             let d = particles[j].position.xyz - p;
             let bj = excess_weight(particles[j].apothem);
@@ -133,6 +134,19 @@ fn columns_area(@builtin(global_invocation_id) id: vec3<u32>) {
         shape = vec4f(cx, cy, 0.5 * atan2(2.0 * cxy, cxx - cyy), sqrt(max(lambda, 0.0)));
     }
     particles[idx].cell_shape = shape;
+    // Tessellation neighbours and bending weights c = shared boundary / distance (flexure.wgsl).
+    var nc = 0u;
+    if (n >= 3u) {
+        for (var k = 0u; k < n; k++) {
+            let j = lab[k];
+            if (j == CLIP_LABEL || nc >= 12u) { continue; }
+            let len = length(poly[(k + 1u) % n] - poly[k]);
+            particle_deltas[idx].cell_nbr[nc] = j;
+            particle_deltas[idx].cell_coef[nc] = len / length(particles[j].position.xyz - p);
+            nc++;
+        }
+    }
+    particle_deltas[idx].cell_count = nc;
     // An empty cell (possible only with extreme weights) keeps its reference area.
     particles[idx].cell_area = select(particles[idx].area_ref, area, area > 0.0);
 }

@@ -219,7 +219,7 @@ test('initial bonds are stress-free with rest length = apothem sum, and unbonded
 import { columnsFrom, inRange, partnerAngle, rangeMargin, updateEdges, pairKey } from '../src/edges/topology.js';
 
 const EDGE_PARAMS = {
-  edge_range_margin: 0.1, subduction_overlap: 0.012,
+  edge_range_margin: 0.1,
   continental_lithosphere_km: 150, oceanic_lithosphere_max_km: 100, thermal_diffusivity_m2_s: 1e-6,
 };
 
@@ -297,11 +297,9 @@ test('edges: update keeps, creates and removes by range; deep overlap creates no
   const e1 = updateEdges(after, e0.edges, EDGE_PARAMS);
   assert.deepEqual([...e1.removed], [pairKey(0, 1)]);
   assert.deepEqual([...e1.created], [pairKey(1, 2)]);
-  // Two surface columns overlapping by more than subduction_overlap: no new edge...
+  // Deep overlap is just range: an edge (subduction starts from edge state, phase F).
   const deep = cols([at(0), at(2 * a - 0.02)]);
-  assert.equal(updateEdges(deep, new Set(), EDGE_PARAMS).edges.size, 0);
-  // ...but an existing edge between them is kept (removal is purely geometric).
-  assert.deepEqual([...updateEdges(deep, new Set([pairKey(0, 1)]), EDGE_PARAMS).kept], [pairKey(0, 1)]);
+  assert.deepEqual([...updateEdges(deep, new Set(), EDGE_PARAMS).edges], [pairKey(0, 1)]);
 });
 
 // --- Column profile (design 4.0, phase B) ---------------------------------
@@ -706,4 +704,82 @@ test('melt: a stretched continent thins until it melts; mixing in melt makes it 
   console.log(`  continent: melting starts at stretching factor ${firstMelt.beta.toFixed(2)} (L ${firstMelt.L.toFixed(1)} km); breakup at ${breakup.beta.toFixed(2)}, crust ${breakup.h.toFixed(1)} km`);
   assert.ok(Math.abs(firstMelt.beta - p.continental_lithosphere_km / p.melt_depth_km) < 0.02);
   assert.ok(breakup && breakup.age === 0 && c.compositionDensity >= 2850);
+});
+
+// --- subduction, suturing, slabs, bending (design 4.3, 6; phase F): CPU reference ---
+import * as transitions from '../src/edges/transitions.js';
+import * as flexure from '../src/columns/flexure.js';
+
+test('transitions: the timer runs only in sustained compression; dense columns subduct, buoyant pairs weld', () => {
+  const p = { ...PARAMS };
+  let t = 0;
+  for (let s = 0; s < 70; s++) t = transitions.timerStep(t, -2 * p.transition_stress_mpa, p);
+  assert.ok(Math.abs(t - 70 * p.dt_crust_myr) < 1e-12);
+  assert.equal(transitions.timerStep(t, -0.5 * p.transition_stress_mpa, p), 0);
+  const col = (index, ageMyr, rho = 3000, slabNeighbours = 0) => ({
+    index, slabNeighbours,
+    freeboardKm: profile.columnProfile({ crustKm: rho < 2850 ? 35 : 7, compositionDensity: rho, ageMyr, elevationKm: -3 }, p).freeboardKm,
+  });
+  const ripe = { timer: p.subduction_window_myr, work: 0 };
+  const early = { timer: 0.9 * p.subduction_window_myr, work: 0 };
+  // Old ocean against a continent: the ocean goes down, only once the window is past.
+  assert.equal(transitions.transition(ripe, col(0, 100), col(1, 1000, 2700), p).subduct, 0);
+  assert.equal(transitions.transition(early, col(0, 100), col(1, 1000, 2700), p).subduct, null);
+  // Old against younger ocean: the older (denser) goes down.
+  assert.equal(transitions.transition(ripe, col(0, 20), col(1, 60), p).subduct, 1);
+  // Polarity persists: the column already touching a slab goes down, on a tenth of the window.
+  const fast = { timer: p.subduction_window_myr * p.subduction_propagation_factor, work: 0 };
+  assert.equal(transitions.transition(fast, col(0, 20, 3000, 1), col(1, 60), p).subduct, 0);
+  // Two buoyant columns never subduct, however long; they weld once quiet past the suture window.
+  for (const [a, b] of [[col(0, 1000, 2700), col(1, 1000, 2700)], [col(0, 2), col(1, 1000, 2700)]]) {
+    const long = { timer: 100, work: 0 };
+    assert.equal(transitions.transition(long, a, b, p).subduct, null);
+    assert.equal(transitions.transition(long, a, b, p).weld, true);
+    assert.equal(transitions.transition({ timer: 100, work: 1 }, a, b, p).weld, false);
+    assert.equal(transitions.transition({ timer: 0.9 * p.suture_window_myr, work: 0 }, a, b, p).weld, false);
+  }
+  const fb = (age) => col(0, age).freeboardKm;
+  console.log(`  freeboard: ${fb(2).toFixed(2)} km at 2 Myr, ${fb(10).toFixed(2)} at 10, ${fb(60).toFixed(2)} at 60; continent ${col(0, 1000, 2700).freeboardKm.toFixed(2)}`);
+});
+
+test('slabs: sinking rate from negative buoyancy (Stokes-like), zero when buoyant', () => {
+  const p = PARAMS;
+  const w = transitions.slabSinkRate(-1.27, 0.0175, p);
+  const expected = (p.mantle_density * 1.27e3 * 9.81 * 2 * 0.0175 * 6.371e6) / (4 * p.isostatic_viscosity_pa_s) * 3.15576e13 / 1e3;
+  assert.ok(Math.abs(w / expected - 1) < 1e-12);
+  console.log(`  old ocean slab (freeboard -1.27 km) sinks at ${w.toFixed(0)} km/Myr = ${(w / 10).toFixed(1)} cm/yr`);
+  assert.equal(transitions.slabSinkRate(0.3, 0.0175, p), 0);
+});
+
+test('bending: a line load on a strip of columns gives the thin-plate flexure profile', () => {
+  // A row of 55 columns along the equator, spacing 0.005 (32 km), cells from
+  // the tessellation (clip radius 5 spacings: near-rectangular cells). The
+  // centre column's Airy height is raised by 1 km: a line load K delta A / b.
+  const l = 0.005, half = 27, n = 2 * half + 1, R = flexure.EARTH_RADIUS_M;
+  const pos = new Float64Array(3 * n);
+  for (let i = 0; i < n; i++) { const t = (i - half) * l; pos.set([Math.sin(t), 0, Math.cos(t)], 3 * i); }
+  const cells = area.tessellate(pos, new Array(n).fill(l / 2), 5 * l);
+  const P = (k) => [pos[3 * k], pos[3 * k + 1], pos[3 * k + 2]];
+  const K = (PARAMS.mantle_density - PARAMS.water_density) * 9.81;
+  const D = flexure.rigidity(50, PARAMS); // 50 km elastic plate
+  const cols = cells.map((c, i) => ({ A: c.area * R * R, K, r: 0, w0: 0, weq: i === half ? 1 : 0, D, nbrs: flexure.cellWeights(i, c, P) }));
+  const w = flexure.solveExact(cols);
+  const alpha = flexure.flexuralLength(D, K);
+  const boundary = cols[half].nbrs[0].c * l * R; // shared boundary length, m
+  const peak = flexure.lineLoadPeak((K * 1e3 * cols[half].A) / boundary, D, alpha) / 1e3;
+  let worst = 0, zero = null, bulge = 0;
+  for (let i = half; i < n; i++) {
+    const x = (i - half) * l * R;
+    worst = Math.max(worst, Math.abs(w[i] - peak * flexure.lineLoadShape(x, alpha)) / peak);
+    if (zero === null && w[i] < 0) zero = x;
+    bulge = Math.min(bulge, w[i]);
+  }
+  console.log(`  alpha ${(alpha / 1e3).toFixed(0)} km (${(alpha / (l * R)).toFixed(1)} spacings): peak ${w[half].toFixed(4)} vs ${peak.toFixed(4)} km, first zero ${(zero / alpha).toFixed(2)} alpha (3 pi / 4 = 2.36), forebulge ${(-bulge / w[half]).toFixed(3)} of the peak (exp(-pi) = 0.043); worst ${(100 * worst).toFixed(1)}% of the peak`);
+  assert.ok(worst < 0.1);
+  // The GPU's damped Jacobi converges to the same answer.
+  const it = flexure.jacobi(cols, 3000, PARAMS.flexure_damping);
+  assert.ok(Math.max(...w.map((v, i) => Math.abs(it[i] - v))) < 1e-3 * w[half]);
+  // D = 0: one sweep is exactly the old per-column relaxation (w0 + k weq) / (1 + k), k = 1 / r.
+  const one = flexure.jacobi(cols.map((c) => ({ ...c, D: 0, r: 2, w0: 0.5 })), 1, 2);
+  assert.ok(Math.abs(one[half] - (0.5 + 0.5 * 1) / 1.5) < 1e-12 && Math.abs(one[0] - 0.5 / 1.5) < 1e-12);
 });

@@ -81,8 +81,9 @@ fn crust_commit_splits() {
 
 // Integrity and stored stresses are kept: re-attaching an edge does not weld
 // or break it. An edge re-attached out of range is dropped by edges_prune.
-// Every edge touching a split column (parent or child) restarts its strain
-// measure from the new geometry, so the split adds no stress.
+// Every edge touching a split column (parent or child), or a column that
+// became a slab last step (its edges are now measured in 3D, bindings.wgsl),
+// restarts its strain measure from the new geometry, so neither adds stress.
 @compute @workgroup_size(64)
 fn crust_rewire_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
@@ -104,13 +105,13 @@ fn crust_rewire_edges(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     let b = edges[c_idx].particle_b;
-    if (childA != NONE || childB != NONE) {
-        edges[c_idx].length = distance(particles[a].position.xyz, particles[b].position.xyz);
+    if (childA != NONE || childB != NONE || particles[a].geometry_reset != 0u || particles[b].geometry_reset != 0u) {
+        edges[c_idx].length = length(edge_offset(a, b, particles[a].position.xyz, particles[b].position.xyz));
     }
 }
 
 @compute @workgroup_size(64)
 fn crust_clean_split(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
-    if (idx < sim.max_particles) { particles[idx].split_child = NONE; }
+    if (idx < sim.max_particles) { particles[idx].split_child = NONE; particles[idx].geometry_reset = 0u; }
 }

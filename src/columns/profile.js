@@ -112,7 +112,8 @@ export function airy(col, p, g = geotherm(col, p)) {
 
 /** Lithostatic pressure at depth z (MPa), from the sea surface or the column top. */
 export function pressureAt(col, p, zKm, g = geotherm(col, p), elevation = col.elevationKm) {
-  const water = p.water_density * Math.max(p.sea_level - elevation, 0) * 1e3;
+  // Overburden: sea water above a surface column, mantle rock above a slab.
+  const water = (col.slab ? p.mantle_density : p.water_density) * Math.max(p.sea_level - elevation, 0) * 1e3;
   const rock = integrate((z) => densityAt(col, g, p, z), 0, Math.min(zKm, col.crustKm), 4)
     + integrate((z) => densityAt(col, g, p, z), col.crustKm, zKm, 8);
   return (GRAVITY * (water + rock * 1e3)) / 1e6;
@@ -247,6 +248,7 @@ export function columnProfile(col, p) {
 /** The column inputs of particle i, from unpacked Particle arrays (layout.js). */
 export const columnOfParticle = (P, i) => ({
   crustKm: P.thickness_km[i], compositionDensity: P.composition_density[i], ageMyr: (P.thermal_age_myr ?? P.age)[i], elevationKm: P.elevation[i],
+  slab: P.state ? P.state[i] === 2 : false,
 });
 
 /**

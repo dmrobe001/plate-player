@@ -19,10 +19,14 @@ struct FreeList { counter: atomic<u32>, requests: atomic<u32>, pad2: u32, pad3: 
 // slot_count is the true number of edges and may exceed MAX_SLOTS, which is
 // an overflow (counted in solver.slot_overflow).
 const MAX_SLOTS: u32 = 12u;
+// Then the column's tessellation neighbours (columns_area) with the
+// bending weights c = shared cell boundary / distance (flexure.wgsl).
 struct ParticleDelta {
     dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count: atomic<i32>,
-    slot_count: atomic<u32>, pad1: u32, pad2: u32, pad3: u32,
+    slot_count: atomic<u32>, cell_count: u32, pad2: u32, pad3: u32,
     slots: array<u32, 12>,
+    cell_nbr: array<u32, 12>,
+    cell_coef: array<f32, 12>,
 }
 
 @group(0) @binding(0) var<storage, read_write> grid: array<GridNode>;
@@ -107,6 +111,17 @@ fn hash_cell(p: vec3f) -> vec3i {
 fn hash_index(c: vec3i) -> u32 {
     let d = sim.hash_grid_dim;
     return u32(c.x) + u32(c.y) * d + u32(c.z) * d * d;
+}
+
+// Separation of an edge's two columns (b - a). Map view (unit sphere) between
+// surface columns; in 3D when either is a slab, so a sinking slab stretches
+// its edges and pulls on the plate behind it (design 6).
+const EARTH_RADIUS_KM: f32 = 6371.0;
+fn edge_offset(a: u32, b: u32, xa: vec3f, xb: vec3f) -> vec3f {
+    if (particles[a].state == 2u || particles[b].state == 2u) {
+        return xb * (1.0 + particles[b].elevation / EARTH_RADIUS_KM) - xa * (1.0 + particles[a].elevation / EARTH_RADIUS_KM);
+    }
+    return xb - xa;
 }
 
 // An edge's rest length is always the sum of its particles' apothems, whatever

@@ -7,10 +7,8 @@
 // The rule: an edge exists between columns i and j exactly while they are in
 // range, i.e. their map-view gap is below `edge_range_margin` times the
 // apothem sum AND their depth intervals overlap. Edges are keyed by pair and
-// keep their state while the pair stays in range. Exception (until stress-
-// based subduction initiation, phase F): two surface columns overlapping by
-// more than `subduction_overlap` do not get a *new* edge; the lower one
-// becomes a slab instead.
+// keep their state while the pair stays in range. (Subduction starts from
+// edge state, src/edges/transitions.js, not from overlap.)
 
 import { CellList } from '../init/cell-list.js';
 
@@ -105,10 +103,7 @@ export function updateEdges(cols, previous, params) {
   const kept = new Set(), created = new Set(), removed = new Set();
   for (const k of previous) (now.has(k) ? kept : removed).add(k);
   for (const k of now) {
-    if (previous.has(k)) continue;
-    const [i, j] = k.split(',').map(Number);
-    const subducts = cols.surface[i] && cols.surface[j] && overlap(cols, i, j) > params.subduction_overlap;
-    if (!subducts) created.add(k);
+    if (!previous.has(k)) created.add(k);
   }
   return { edges: new Set([...kept, ...created]), kept, created, removed };
 }

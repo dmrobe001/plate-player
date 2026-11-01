@@ -9,7 +9,7 @@
 // buffer capacity, and a readback takes ~0.5 s. So mechanism tests run on an
 // empty page with small buffers (SMALL_PAGE: 1024 particle slots; the phase E
 // sphere tests 4096) and read back as rarely as they can; the whole default
-// suite takes about four minutes under SwiftShader.
+// suite takes about five and a half minutes under SwiftShader.
 // Tests on a generated planet (full capacity, minutes each) run only with
 // PLATE_PLANET=1.
 //
@@ -31,6 +31,8 @@ import { createIcosphere } from '../src/geometry/icosphere.js';
 import { CHAIN, chainExact, chainState } from './support/chain.mjs';
 import { tessellate } from '../src/columns/area.js';
 import { splitColumn, volumeStep } from '../src/columns/volume.js';
+import { slabSinkRate } from '../src/edges/transitions.js';
+import { cellWeights, flexuralLength, lineLoadPeak, lineLoadShape, rigidity, solveExact } from '../src/columns/flexure.js';
 
 // Typed arrays do not survive page.evaluate's JSON; send plain arrays (restored in the page).
 const jsonState = (st) => ({
@@ -258,7 +260,7 @@ test('a thickened block relaxes to its Airy height (free radius); its neighbours
   const page = await openPage({ small: true });
   const out = await page.evaluate(async () => {
     const a = 0.0175, n = 9, half = Math.asin(a); // chord between neighbours = 2a
-    await plate.setParams({ mantle_drive: 0 });
+    await plate.setParams({ mantle_drive: 0, flexure_factor: 0 }); // Airy: no bending (phase F tests bending separately)
     const p = plate.sim.params;
     const airy = (H, comp) => plate.debug.profile.airy({ crustKm: H, compositionDensity: comp, ageMyr: 100, elevationKm: 0 }, p).elevation;
     const tauMyr = (eq) => {
@@ -606,7 +608,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
     await plate.loadState(H.state(pts, a, bonds));
 
     // Distinct values in every carried field.
-    const E = plate.layout.Edge, fields = ['stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1', 'timer'];
+    const E = plate.layout.Edge, fields = ['stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1']; // (the timer is live state since phase F)
     const buf = (await plate.readBuffers(['edges'])).edges, v = new Float32Array(buf);
     bonds.forEach((_, k) => fields.forEach((f, m) => { v[E.words * k + E.offsets[f]] = 10 * (m + 1) + k; }));
     plate.sim.device.queue.writeBuffer(plate.sim.buffers.edges, 0, buf);
@@ -660,7 +662,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   assert.deepEqual(out.problems.slice(0, 10), []);
   assert.deepEqual(out.mismatches.slice(0, 10), []);
   assert.equal(out.start.length, 12);
-  assert.ok(out.start.every((e) => Math.abs(e.integrity - 0.7) < 1e-6 && e.timer >= 50), 'carried state not as written');
+  assert.ok(out.start.every((e) => Math.abs(e.integrity - 0.7) < 1e-6 && e.slip_anchor1 >= 40), 'carried state not as written');
   assert.deepEqual(out.afterJitter, out.start, 'edge state changed while every pair stayed in range');
 
   // The ring column has 3 edges (centre and two ring neighbours); all leave range.
@@ -679,7 +681,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   // Back in range: fresh edges with no cohesion and no history, born now.
   for (const e of out.returned.filter((x) => x.k.split(',').includes('0'))) {
     assert.equal(e.integrity, 0);
-    for (const f of ['stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1', 'timer']) assert.equal(e[f], 0);
+    for (const f of ['stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1']) assert.equal(e[f], 0);
     assert.ok(e.born > 0, `born_myr ${e.born}`);
   }
   assert.equal(out.returned.length, 12);
@@ -908,8 +910,10 @@ test('tessellated areas tile the sphere and match the reference; crust volume = 
 
 test('melt: new area makes 7 km of crust where the lithosphere is thin, none under thick lithosphere; the volume budget closes', { timeout: 300_000 }, async () => {
   // One step with the columns moved by hand (a smooth displacement field, so
-  // cells grow and shrink) and one column pushed deep onto a neighbour (the
-  // overlap stand-in turns the lower one into a slab: a volume sink). Young
+  // cells grow and shrink) and one old-ocean column pushed deep onto a
+  // neighbour. With a subduction window of half a step, compressed pairs with
+  // a negatively buoyant side subduct at the end of the step (phase F): the
+  // volume sinks. Young
   // ocean (L = 0) in the north, old ocean at mid latitudes, continent in the south.
   const kind = (p) => (p[2] > 0.3 ? 'young' : p[2] < -0.3 ? 'continent' : 'old');
   const { pts, spacing, apothem, state } = sphereState({ kind });
@@ -925,8 +929,7 @@ test('melt: new area makes 7 km of crust where the lithosphere is thin, none und
   const fields = ['cell_area', 'crust_volume', 'thermal_age_myr', 'composition_density', 'volume_added', 'state', 'age'];
   const out = await page.evaluate(async ([st, params, readSrc, movedPts, fields, helperSrc]) => {
     const read = eval(readSrc), H = eval(helperSrc);
-    // Only the pushed pair (overlap ~0.05) may trigger the overlap stand-in for subduction.
-    await plate.setParams({ ...params, subduction_overlap: 0.03 });
+    await plate.setParams({ ...params, subduction_window_myr: 0.5 * plate.sim.params.dt_crust_myr });
     const restore = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? Float32Array.from(v) : v]));
     await plate.loadState({ ...st, particles: restore(st.particles), bonds: restore(st.bonds) });
     const before = await read(st.particles.count, fields);
@@ -938,9 +941,10 @@ test('melt: new area makes 7 km of crust where the lithosphere is thin, none und
   await page.close();
 
   const { before: B, after: A, params: p } = out;
-  const sinkCol = [k, j].find((i) => A.state[i] === 2);
-  assert.ok(sinkCol !== undefined, 'the pushed pair should have produced a slab');
-  assert.equal(A.state.filter((x) => x === 2).length, 1, 'exactly one slab');
+  const slabs = [];
+  for (let i = 0; i < n; i++) if (A.state[i] === 2) slabs.push(i);
+  assert.ok(slabs.includes(k) || slabs.includes(j), 'the pushed pair should have produced a slab');
+  const slabV = slabs.reduce((v, i) => v + A.crust_volume[i], 0);
   // Per column vs the reference (volume.js), from the GPU's own cell areas.
   let worst = 0, young = { dA: 0, dV: 0, n: 0 }, thick = 0, added = 0;
   for (let i = 0; i < n; i++) {
@@ -955,12 +959,12 @@ test('melt: new area makes 7 km of crust where the lithosphere is thin, none und
   const source = A.counters.volumeSource - B.counters.volumeSource, sink = A.counters.volumeSink - B.counters.volumeSink;
   const dV = surface(A) - surface(B);
   console.log(`  ${young.n} stretched young columns: ${(young.dV / young.dA).toFixed(4)} km of crust per unit new area (F H_m = ${p.melt_fraction * p.melt_depth_km}); old ocean and continent: max melt ${thick}`);
-  console.log(`  worst column vs reference ${worst.toExponential(1)}; budget: d(sum V) ${dV.toExponential(6)}, sources ${source.toExponential(6)} (sum of columns ${added.toExponential(6)}), sinks ${sink.toExponential(6)} (slab V ${A.crust_volume[sinkCol].toExponential(6)})`);
+  console.log(`  worst column vs reference ${worst.toExponential(1)}; budget: d(sum V) ${dV.toExponential(6)}, sources ${source.toExponential(6)} (sum of columns ${added.toExponential(6)}), sinks ${sink.toExponential(6)} (${slabs.length} new slabs, V ${slabV.toExponential(6)})`);
   assert.ok(young.n > 50 && Math.abs(young.dV / young.dA / (p.melt_fraction * p.melt_depth_km) - 1) < 1e-4);
   assert.equal(thick, 0);
   assert.ok(worst < 1e-3);
   assert.ok(Math.abs(source / added - 1) < 1e-5, 'logged sources = sum of columns');
-  assert.ok(Math.abs(sink / A.crust_volume[sinkCol] - 1) < 1e-6, 'logged sink = slab volume');
+  assert.ok(Math.abs(sink / slabV - 1) < 1e-6, 'logged sink = slab volume');
   // Identity to the float32 rounding of each column's V (at most 6e-8 V per column touched).
   let rounding = 0;
   for (let i = 0; i < n; i++) if (A.volume_added[i] > 0) rounding += 6e-8 * A.crust_volume[i];
@@ -977,7 +981,7 @@ test('splits: halves share volume and area_ref, sit on the cell axis, start bond
   const fields = ['cell_area', 'crust_volume', 'area_ref', 'position', 'cell_shape', 'cell_clipped', 'is_active'];
   const out = await page.evaluate(async ([st, params, readSrc, fields]) => {
     const read = eval(readSrc);
-    await plate.setParams({ ...params, split_area_factor: 1.15, melt_fraction: 0, subduction_overlap: 1 }); // no slabs
+    await plate.setParams({ ...params, split_area_factor: 1.15, melt_fraction: 0 });
     const restore = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? Float32Array.from(v) : v]));
     await plate.loadState({ ...st, particles: restore(st.particles), bonds: restore(st.bonds) });
     const cap = 4096;
@@ -1029,6 +1033,186 @@ test('splits: halves share volume and area_ref, sit on the cell axis, start bond
   // WGSL's cos and sin are accurate to 2^-11 (absolute): ~1e-5 of the offset.
   assert.ok(worstPos < 2e-4);
   assert.ok(Math.abs(total / (4 * Math.PI) - 1) < 1e-5);
+});
+
+// --- Phase F: subduction, suturing, slabs, arcs, bending (design 4.3, 6) -----
+
+test('edge timers: a dense column subducts after the window; buoyant pairs never do, and weld once quiet', { timeout: 300_000 }, async () => {
+  // Four bonded pairs (integrity 0), held at a fixed strain by an elastic
+  // rheology (no solve, no mantle): old ocean vs continent, compressed (the
+  // ocean must go down once the timer passes the window); continent vs
+  // continent and young ocean vs young ocean, compressed (never subduct; weld
+  // past the suture window); old ocean vs old ocean in tension (timer stays 0).
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async (elastic) => {
+    const a = 0.0175;
+    const pairs = [
+      { lon: 0, kinds: ['old', 'continent'], strain: -2e-3 },
+      { lon: 0.6, kinds: ['continent', 'continent'], strain: -2e-3 },
+      { lon: 1.2, kinds: ['young', 'young'], strain: -2e-3 },
+      { lon: 1.8, kinds: ['old', 'old'], strain: 2e-3 },
+    ];
+    const K = { young: [7, 3000, 2], old: [7, 3000, 100], continent: [35, 2700, 1000] };
+    const pts = [], kind = [];
+    for (const pr of pairs) {
+      const half = Math.asin(a * (1 + pr.strain));
+      for (const [s, k] of [[-1, 0], [1, 1]]) { pts.push([Math.sin(pr.lon) * Math.cos(s * half), Math.sin(s * half), Math.cos(pr.lon) * Math.cos(s * half)]); kind.push(pr.kinds[k]); }
+    }
+    const n = pts.length, f = (c) => Float32Array.from(kind, (k) => K[k][c]);
+    const dt = plate.sim.params.dt_crust_myr;
+    await plate.setParams({ ...elastic, mantle_drive: 0, solver_iterations: 0, subduction_window_myr: 4.5 * dt, suture_window_myr: 9.5 * dt, heal_time_myr: 1e30 });
+    await plate.loadState({
+      particles: { count: n, position: Float32Array.from(pts.flat()), thickness: f(0), compositionDensity: f(1), age: f(2), temperature: new Float32Array(n).fill(278), apothem: new Float32Array(n).fill(a) },
+      bonds: { count: 4, a: Uint32Array.of(0, 2, 4, 6), b: Uint32Array.of(1, 3, 5, 7), damage: new Float32Array(4).fill(1) },
+    });
+    const rows = [];
+    for (let s = 1; s <= 12; s++) {
+      await plate.runSteps(1);
+      const r = await plate.debug.edges();
+      const edge = (i) => [...r.pairs].find(([k]) => k === `${i},${i + 1}`)?.[1];
+      rows.push({
+        s, state: Array.from(r.P.state.subarray(0, n)),
+        timer: [0, 2, 4, 6].map((i) => (edge(i) === undefined ? null : r.E.timer[edge(i)])),
+        phi: [0, 2, 4, 6].map((i) => (edge(i) === undefined ? null : r.E.integrity[edge(i)])),
+        stress: [0, 2, 4, 6].map((i) => (edge(i) === undefined ? null : r.E.stress_normal_mpa[edge(i)])),
+      });
+    }
+    return { rows, kind };
+  }, ELASTIC);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  const first = (pred) => out.rows.find(pred)?.s ?? null;
+  const subducted = first((r) => r.state[0] === 2);
+  const welded = [1, 2].map((k) => first((r) => r.phi[k] === 1));
+  console.log(`  stresses ${out.rows[0].stress.map((v) => v.toFixed(0)).join(', ')} MPa; old ocean vs continent: ocean became a slab at step ${subducted} (window 5 steps); continent pair welded at step ${welded[0]}, young pair at ${welded[1]} (window 10); tension timer ${out.rows[11].timer[3]}`);
+  assert.equal(subducted, 5);
+  assert.ok(out.rows.every((r) => r.state[1] === 1 && r.state.slice(2).every((x) => x === 1)), 'only the old ocean column may subduct');
+  assert.deepEqual(welded, [10, 10]);
+  assert.equal(out.rows[11].timer[3], 0);
+  assert.equal(out.rows[11].phi[3], 0);
+});
+
+test('slabs sink by their buoyancy, pull the plate behind them through their edge, feed arcs and are removed', { timeout: 300_000 }, async () => {
+  // A row of five bonded old-ocean columns; the last starts as a slab. Beyond
+  // it, an unbonded continental column (the overriding plate). No mantle
+  // flow. The slab sinks at the reference rate; its edge, measured in 3D,
+  // stretches and pulls the row toward it; crossing a (shallow, for the test)
+  // arc window it feeds the continent but not the plate behind it; past the
+  // (shallow) cutoff it is removed.
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async () => {
+    const a = 0.0175, half = Math.asin(a);
+    const at = (k) => { const t = k * 2 * half; return [Math.sin(t), 0, Math.cos(t)]; };
+    const pts = [at(-2), at(-1), at(0), at(1), at(2), at(3.1)];
+    const n = pts.length;
+    const col = (row, cont) => Float32Array.from(pts, (_, i) => (i === 5 ? cont : row));
+    // (No melt: the arc's hot lithosphere would melt where its cell grows.)
+    await plate.setParams({ mantle_drive: 0, arc_depth_min_km: 5, arc_depth_max_km: 15, slab_cutoff_km: 60, melt_fraction: 0 });
+    await plate.loadState({
+      particles: {
+        count: n, position: Float32Array.from(pts.flat()), thickness: col(7, 35), compositionDensity: col(3000, 2700), age: col(100, 1000),
+        temperature: new Float32Array(n).fill(278), apothem: new Float32Array(n).fill(a), state: Uint32Array.of(1, 1, 1, 1, 2, 1),
+      },
+      bonds: { count: 4, a: Uint32Array.of(0, 1, 2, 3), b: Uint32Array.of(1, 2, 3, 4), damage: new Float32Array(4) },
+    });
+    const P = plate.layout.Particle;
+    const rows = [];
+    const c0 = await plate.debug.counters();
+    const V0 = (await plate.debug.edges()).P.crust_volume.slice(0, n);
+    for (let s = 1; s <= 10; s++) {
+      const before = new Float32Array((await plate.readBuffers(['particles'])).particles);
+      await plate.runSteps(1);
+      const { P: Q, G } = await plate.debug.profiles();
+      rows.push({ s, e: Q.elevation[4], ePrev: before[P.words * 4 + P.offsets.elevation], freeboard: G.freeboard_km[4] });
+    }
+    // On to just before the cutoff (~1.15 km per step from -3 km).
+    let r;
+    let s = 10;
+    for (; s < 200; s++) {
+      await plate.runSteps(1);
+      r = await plate.debug.edges();
+      if (r.P.elevation[4] < -55 || !r.P.is_active[4]) break;
+    }
+    const e34 = r.pairs.get('3,4');
+    const pull = { s, active: r.P.is_active[4], e: r.P.elevation[4], tension: e34 === undefined ? null : r.E.stress_normal_mpa[e34], x0: r.P.position[0] };
+    let gone = null;
+    for (let k = 0; k < 20 && gone === null; k++) {
+      await plate.runSteps(1);
+      if (!(await plate.debug.edges()).P.is_active[4]) gone = s + k + 1;
+    }
+    const end = await plate.debug.edges();
+    return { rows, pull, gone, c0, c1: await plate.debug.counters(), V0: Array.from(V0), V1: Array.from(end.P.crust_volume.slice(0, n)), V4: end.P.crust_volume[4], params: plate.sim.params, pts };
+  });
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  const { rows, params: p } = out;
+  let worst = 0;
+  for (const r of rows) worst = Math.max(worst, Math.abs((r.ePrev - r.e) / (slabSinkRate(r.freeboard, 0.0175, p) * p.dt_crust_myr) - 1));
+  console.log(`  slab sinks ${(rows[0].ePrev - rows[0].e).toFixed(2)} km per step (${((rows[0].ePrev - rows[0].e) / p.dt_crust_myr / 10).toFixed(1)} cm/yr), worst vs reference ${worst.toExponential(1)}; removed at step ${out.gone}`);
+  assert.ok(worst < 1e-3);
+  const moved = (out.pull.x0 - out.pts[0][0]) * 6371;
+  console.log(`  slab pull at step ${out.pull.s} (slab top ${out.pull.e.toFixed(1)} km): edge stress ${out.pull.tension?.toFixed(1)} MPa; the far end of the plate moved ${moved.toFixed(2)} km toward the slab`);
+  assert.ok(out.pull.active && out.pull.tension > 0 && moved > 0);
+  assert.ok(out.gone !== null);
+  // Arc: f x slab volume over the whole window, all to the continent (column 5).
+  const source = out.c1.volumeSource - out.c0.volumeSource;
+  const gain = out.V1.map((v, i) => v - out.V0[i]);
+  console.log(`  arc volume ${(source / (p.arc_efficiency * out.V4)).toFixed(5)} x efficiency x slab volume; to the continent ${(gain[5] / source).toFixed(5)}, to the plate behind ${gain.slice(0, 4).reduce((x, y) => x + y, 0)}`);
+  assert.ok(Math.abs(source / (p.arc_efficiency * out.V4) - 1) < 1e-4);
+  assert.ok(Math.abs(gain[5] / source - 1) < 1e-4);
+  assert.ok(gain.slice(0, 4).every((g) => g === 0));
+});
+
+test('bending: a line load on a strip of columns gives the thin-plate flexure profile on the GPU', { timeout: 300_000 }, async () => {
+  // 55 columns along the equator, 32 km apart, elastic 50 km plates (old
+  // ocean with the lithosphere capped at 50 km, elastic rheology), on a fast
+  // foundation (tau << dt): one step solves the static problem. The centre
+  // column has 10 km of crust (its Airy height is higher): a line load.
+  const l = 0.005, half = 27, n = 2 * half + 1;
+  const page = await openPage({ small: true, query: '&grid=50' });
+  const out = await page.evaluate(async ([l, half, n, elastic]) => {
+    const pts = Array.from({ length: n }, (_, i) => { const t = (i - half) * l; return [Math.sin(t), 0, Math.cos(t)]; });
+    const fill = (v) => new Float32Array(n).fill(v);
+    await plate.setParams({
+      ...elastic, mantle_drive: 0, solver_iterations: 0, oceanic_lithosphere_max_km: 50, isostatic_viscosity_pa_s: 1e12,
+      cell_clip_radius: 5 * l, flexure_iterations: 3000,
+    });
+    await plate.loadState({
+      particles: { count: n, position: Float32Array.from(pts.flat()), thickness: Float32Array.from(pts, (_, i) => (i === half ? 10 : 7)), compositionDensity: fill(3000), age: fill(100), temperature: fill(278), apothem: fill(l / 2) },
+      bonds: { count: 0, a: new Uint32Array(0), b: new Uint32Array(0), damage: new Float32Array(0) },
+    });
+    await plate.runSteps(1);
+    const { P, G } = await plate.debug.profiles();
+    return {
+      w: Array.from(P.elevation.subarray(0, n)), D: Array.from(P.flexural_rigidity.subarray(0, n)), weq: Array.from(G.airy_elevation_km.subarray(0, n)),
+      area: Array.from(P.cell_area.subarray(0, n)), params: plate.sim.params, pts,
+    };
+  }, [l, half, n, ELASTIC]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  const { params: p } = out;
+  const R = 6.371e6, K = (p.mantle_density - p.water_density) * 9.81;
+  const D = rigidity(50, p);
+  console.log(`  D on the GPU ${out.D[0].toExponential(3)} N m, expected ${D.toExponential(3)}`);
+  assert.ok(Math.abs(out.D[0] / D - 1) < 1e-3);
+  // CPU reference: the same energy, solved exactly, on the CPU tessellation.
+  const pos = Float64Array.from(out.pts.flat());
+  const cells = tessellate(pos, new Array(n).fill(l / 2), 5 * l);
+  const Pp = (k) => [pos[3 * k], pos[3 * k + 1], pos[3 * k + 2]];
+  const base = out.weq[0];
+  const cols = cells.map((c, i) => ({ A: c.area * R * R, K, r: 0, w0: 0, weq: out.weq[i] - base, D: out.D[i], nbrs: cellWeights(i, c, Pp) }));
+  const ref = solveExact(cols);
+  const alpha = flexuralLength(D, K);
+  const peak = lineLoadPeak((K * 1e3 * (out.weq[half] - base) * cols[half].A) / (cols[half].nbrs[0].c * l * R), D, alpha) / 1e3;
+  let vsRef = 0, vsAnalytic = 0;
+  for (let i = 0; i < n; i++) {
+    const w = out.w[i] - base;
+    vsRef = Math.max(vsRef, Math.abs(w - ref[i]) / ref[half]);
+    vsAnalytic = Math.max(vsAnalytic, Math.abs(w - peak * lineLoadShape(Math.abs(i - half) * l * R, alpha)) / peak);
+  }
+  console.log(`  centre deflection ${(out.w[half] - base).toFixed(4)} km (analytic ${peak.toFixed(4)}); worst vs CPU reference ${(100 * vsRef).toFixed(2)}%, vs analytic ${(100 * vsAnalytic).toFixed(1)}% of the peak`);
+  assert.ok(vsRef < 0.02);
+  assert.ok(vsAnalytic < 0.1);
 });
 
 test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 , ...PLANET }, async () => {

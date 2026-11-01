@@ -49,16 +49,10 @@ fn crust_predict(@builtin(global_invocation_id) id: vec3<u32>) {
     let pos = particles[idx].position.xyz;
     let node = particles[idx].mantle_node;
 
+    // (Slab pull is not a velocity here: sinking slabs pull through their
+    // edges, which are measured in 3D; bindings.wgsl, edge_offset.)
     let grid_vel = grid[node].velocity.xyz * sim.mantle_drive;
-    var target_vel = grid_vel;
-
-    // Slab pull, as an extra velocity (force / drag).
-    if (particles[idx].state == 2u && particles[idx].density > sim.mantle_density) {
-        let pull = (particles[idx].density - sim.mantle_density) * 0.02;
-        target_vel += normalize(grid_vel + vec3f(0.001)) * pull;
-    }
-
-    particles[idx].predicted_pos = vec4f(normalize(pos + target_vel * sim.dt_crust_myr), 1.0);
+    particles[idx].predicted_pos = vec4f(normalize(pos + grid_vel * sim.dt_crust_myr), 1.0);
 }
 
 @compute @workgroup_size(64)
@@ -134,7 +128,7 @@ fn crust_solve_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     let pA = c.particle_a;
     let pB = c.particle_b;
 
-    let dir = particles[pB].predicted_pos.xyz - particles[pA].predicted_pos.xyz;
+    let dir = edge_offset(pA, pB, particles[pA].predicted_pos.xyz, particles[pB].predicted_pos.xyz);
     let dist = max(length(dir), 1e-6);
     let n = dir / dist;
     let C = dist - c.reference_gap - rest_length(c); // + stretched, - compressed, vs this step's zero-force length
@@ -172,12 +166,13 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
     // Overdamped: velocity is not state, only a record of this step's motion.
     particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, 0.0);
     particles[idx].position = vec4f(particles[idx].predicted_pos.xyz, 1.0);
-    // Subduction requested during contact detection: the column's top drops
-    // below any lithosphere (a stand-in until slabs bend, design phase 7).
+    // Subduction initiated by an edge (edges_maxwell): the column becomes a
+    // slab where it is; it then sinks under its own weight (thermal.wgsl), and
+    // its edges are measured in 3D from the next step (length reset, split.wgsl).
     if (particles[idx].next_state == 2u && particles[idx].state == 1u) {
         particles[idx].state = 2u;
+        particles[idx].geometry_reset = 1u;
         add_budget(BUDGET_SINK, particles[idx].crust_volume); // leaves the surface: a volume sink (design 4.8)
-        particles[idx].elevation = -sim.slab_initial_depth_km;
     }
     particles[idx].next_state = particles[idx].state;
 }

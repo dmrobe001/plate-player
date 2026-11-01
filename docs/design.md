@@ -6,8 +6,8 @@ grounded basal drag. **The physics is being redesigned around one pair-interacti
 law** (sections 3.2, 4.0, 4.5, 4.7, 6): no bond/contact distinction, graded and
 history-dependent integrity, area and volume as exact budgets. Of the redesign, phases
 A (persistent edges), B (column profiles), C (the edge law, normal part), D (the
-irreversible step, without slip) and E (area, volume, melt, splits) are done. The rest
-is a proposal.
+irreversible step, without slip), E (area, volume, melt, splits) and F (subduction,
+suturing, slabs, arcs, bending) are done. Integration is next.
 This document says where the model is going and why.
 
 **Development strategy (current).** No more full-planet runs until all the physics
@@ -287,6 +287,20 @@ The second term is a soft Kirchhoff constraint keeping the director normal to th
 sheet. The discretisation is the least settled part of the design. It is accepted
 only if it passes the line-load flexure benchmark (section 9) at 50 km.
 
+*As built (phase F; `src/columns/flexure.js`, `flexure.wgsl`).* Not directors: the
+elevation field itself is bent, with the tessellation's Laplacian.
+- Energy per step: Σᵢ Aᵢ[(Kᵢτᵢ/2dt)(wᵢ − w₀,ᵢ)² + (Kᵢ/2)(wᵢ − w_eq,ᵢ)²] + Σᵢ (DᵢAᵢ/2) mᵢ²,
+  with mᵢ = (1/Aᵢ) Σⱼ cᵢⱼ (wⱼ − wᵢ) and cᵢⱼ = shared cell boundary / distance (the
+  finite-volume, or "cotangent", Laplacian of a Voronoi mesh). The first term is
+  implicit Euler against the Haskell rebound time, the second the Winkler
+  foundation (4.4), the third thin-plate bending (D/2)(∇²w)². The Gaussian-curvature
+  part of the Kirchhoff energy only adds boundary terms and is left out.
+- D = E hₑ³/12(1 − ν²), hₑ = Σ slices × their Maxwell factor this step: the same
+  elastic fraction the edge law uses in-plane. `flexure_factor` scales D (0 = Airy).
+- Solved by damped Jacobi sweeps (bending part of the diagonal × 2). With D = 0 one
+  sweep is exactly the old per-column relaxation to Airy.
+- Slabs are not in the network (they sink, section 6).
+
 ### 4.4 Buoyancy (new; free radius)
 
 Each surface column has an equilibrium surface radius r_eq,i from Airy isostasy of
@@ -561,8 +575,8 @@ is removed.
 ### 5.1 Schedule
 
 Target order once the pair law is assembled (today's code runs stage 1, stage 2
-including the edge law's normal part, stages 3–4, stage 5 without slip, arcs or edge
-state transitions, and stages 6–7; the GPE force is implemented but off by default;
+including the edge law's normal part, stages 3–4, stage 5 without slip, and stages
+6–7; the GPE force is implemented but off by default;
 see phase A–E findings). As built, splits run at the start of the step on last step's
 cells, and the tessellation (with melt) runs after the hash grid is built, before the
 profiles:
@@ -656,6 +670,44 @@ reset (hot, weak arc lithosphere). This is how continents grow over time.
 volumetric flow (4.7), bounded by GPE spreading. Integrity across the collision zone
 heals while the zone is compressed and quiet, which welds the plates (suturing); the
 plate labelling records the merge.
+
+*As built (phase F; `src/edges/transitions.js`, `law.wgsl`, `thermal.wgsl`,
+`flexure.wgsl`).*
+- **One timer per edge** (in `edges_maxwell`, after the stresses): + dt while the
+  depth-averaged normal stress is below −`transition_stress_mpa` (50 MPa), reset to 0
+  otherwise.
+- **"Negatively buoyant" = freeboard < 0** (the column's Airy height without water
+  is below the datum): the whole column is denser than the mantle. From the column
+  profile this is ocean older than ~8 Myr (not 30–40: the basaltic crust's
+  compositional buoyancy is small at 3000 kg/m³); calibrate at integration.
+- **Polarity:** the column touching a slab, if only one can sink and does; else the
+  lower freeboard; ties to the lower index. Window `subduction_window_myr` (1 Myr),
+  × `subduction_propagation_factor` (0.1) when the down column already touches a slab:
+  the trench propagates along the plate and keeps its polarity.
+- **Suturing:** both buoyant, timer past `suture_window_myr` (5 Myr), and no plastic
+  work on the edge that step: integrity → 1.
+- **The overlap stand-in is gone** (edges_create no longer turns deeply overlapping
+  columns into slabs; `subduction_overlap` removed).
+- **Slabs** keep their place and elevation when they subduct, then sink at
+  w = B g (2a) / 4η with B = −ρ_m × freeboard (kg/m²), η the upper-mantle viscosity
+  (`isostatic_viscosity_pa_s`), a the apothem: ~7 cm/yr for old ocean. They warm
+  (thermal age × exp(−0.05/Myr · dt)), so they slow, and are removed at
+  `slab_cutoff_km` (660) or at neutral buoyancy. Their volume leaves the surface
+  budget when they subduct.
+- **Slab pull through edges:** an edge with a slab end is measured in 3D (radius
+  1 + elevation/R), so a sinking slab stretches it and pulls the plate behind it. Its
+  edges restart their length measure when it subducts (no stress jump). The edge
+  keeps existing while depth intervals overlap (a slab ~100 km down detaches).
+- **Weak interface:** compression caps on edges with exactly one slab end × 0.1
+  (`slab_interface_weakening`). The overburden of a slab is mantle rock, not water.
+- **Arcs:** a slab crossing the arc window (80–160 km) supplies
+  `arc_efficiency` (0.2) × its volume over the passage, shared equally among surface
+  columns within `arc_reach` (0.05, ~320 km) on the far side from the plate behind
+  the slab (the integrity-weighted direction to its surface edge partners), mixed in
+  at `arc_density` 2750 (so arcs build continental crust); their thermal age resets
+  to 0. Logged as a source.
+- **Not built:** the slab's vertical load on the plate behind it (the trench and
+  outer rise). Bending exists (4.3), but the slab–plate coupling is only in-plane.
 
 **Coarse-resolution fallback (~220 km).** Slabs are only 2–3 particles long, bending
 is aliased, and arcs are one particle wide. The same rules still run; slab pull is
@@ -891,7 +943,7 @@ written here.
 | C ✅ (normal part) | **Edge law** (4.5): effective stiffness integral, caps as λ clamps, Maxwell stored-stress decay | Single edge under constant separation rate: stress approaches η_eff·rate with the Maxwell time (implicit-Euler sequence, exact); cold pair behaves as a spring, hot pair as a dashpot; tension cap of a φ = 0 cold pair is ≈ 0; two-particle relaxation test from phase 2 still passes when k is set from a uniform profile. **Met** for the normal part (kept as tests; phase C findings). Tangential part deferred: needs particle orientation |
 | D ✅ (without slip) | **Irreversible step** (4.7): volumetric flow at fixed volume, slip, integrity (work-driven damage, thermal healing), neighbour exchange; plus the GPE force (4.6) | Uniform compression of a patch thickens at the predicted rate with Σ volume constant; pure shear leaves every area_ref unchanged and produces slip; φ decays in proportion to work input and heals with τ_heal(T); a patch below yield accumulates no plastic strain over many steps with solver noise. **Met**, with "slip" read as crack opening and plastic work, since edges have no tangential channel; neighbour exchange is the range rule of phase A (kept as tests; phase D findings) |
 | E ✅ | **Area, volume, melt, splits** (4.8); remove the spreading proxy | Tessellated areas sum to 4π to float precision on random and lattice configurations; a stretched strip produces 7 km crust per unit new area at L = 0 and none at L ≥ H_m; a split conserves volume and area_ref; budget identity: Δ(Σ V) = logged sources − sinks exactly. **Met** ("exactly" = to the float32 rounding of each column's V; kept as tests; phase E findings) |
-| F | **Subduction and suturing as edge-state transitions**; slab particles, bending directors (4.3); arcs | Timer-based initiation fires on a synthetic convergent pair with a dense side and never with two buoyant sides; line-load flexure profile within 10% (a mechanism test on a strip, not a planet) |
+| F ✅ | **Subduction and suturing as edge-state transitions**; slab particles, bending (4.3; elevation on the tessellation, not directors); arcs | Timer-based initiation fires on a synthetic convergent pair with a dense side and never with two buoyant sides; line-load flexure profile within 10% (a mechanism test on a strip, not a planet). **Met** (kept as tests; phase F findings) |
 | **Integration** | Assemble A–F; first planet runs since the redesign | Calibrate together, recorded once: plate speeds (rms ~4 cm/yr, slab-attached plates fastest), interior rigidity (non-rigid strain rate ≲ 10⁻⁹/yr), ridge depth ∝ √age, ~7 km oceanic crust, orogen heights bounded by collapse, coverage exact, volume budget closed, damage localised into narrow boundaries |
 | 9 | **Adaptivity** (refine first, coarsen second) | Benchmarks of Integration give the same continuum answer at 220/110/50 km within stated tolerances |
 | 10 | **Patch mode:** run L1 code on a projected patch driven by a Forcing; adapters from records; event log | Patch driven by a global record stays within tolerance of the global fields in its interior over [t₀, t₁] |
@@ -907,6 +959,71 @@ lava-lamp mantle with grounded basal drag, and bond rest length = apothem sum
 **Resolved:** how new crust is made. Not by inflation inside plates, and not by a
 separate gap-filling rule: by stretching (tessellated area grows at fixed volume) plus
 decompression melt where the lithosphere is thin (4.8).
+
+### Phase F findings: subduction, suturing, slabs, arcs and bending
+
+**What was built** (rules: 4.3 and section 6, "As built").
+- **Edge timer and transitions** at the end of `edges_maxwell`; CPU reference
+  `src/edges/transitions.js`.
+- **Slabs** (`thermal.wgsl`): sink at a Stokes-like rate from the profile's
+  freeboard, warm, and are removed at 660 km or at neutral buoyancy. Edges with a slab
+  end are measured in 3D (`edge_offset`, bindings.wgsl) and lubricated in
+  compression. The slab's overburden in its profile is rock, not water.
+- **Arcs** (`slabs_arc_count`, `columns_arc` in `flexure.wgsl`).
+- **Bending** of the free radius (`columns_flexure_begin`, `columns_moment`,
+  `columns_flexure`); CPU reference `src/columns/flexure.js`. It replaces the
+  per-column Airy relaxation in `crust_thermo_isostasy`.
+- **Removed:** the overlap stand-in for subduction (`subduction_overlap`), the slab
+  pull velocity in `crust_predict`, the fixed slab drop and sink rate
+  (`slab_initial_depth_km`, `slab_sink_rate_km_myr`), and crust assimilation
+  (`slab_assimilation_km_per_k`).
+- **New particle fields:** `slab_neighbours`, `geometry_reset`, `arc_count`,
+  `arc_supply`, `slab_trailing`, `flexural_rigidity`, `bending_moment`,
+  `elevation_start`. The slot-list record per particle grew to 44 words (the
+  tessellation neighbours and bending weights). `plate.loadState` accepts `state`.
+
+**Tests** (kept). Unit tests of the references:
+- **Timer and transitions:** the timer counts only beyond the threshold and resets;
+  old ocean against a continent goes down only past the window; of two oceans the
+  older goes down; a column touching a slab goes down on a tenth of the window; two
+  buoyant columns never subduct, and weld after the suture window only when quiet.
+  Freeboard: +0.30 km at 2 Myr, −0.14 at 10, −1.27 at 60; continent +3.41.
+- **Slab sinking:** old ocean sinks at 72 km/Myr (7.2 cm/yr); buoyant columns don't.
+- **Flexure on a strip of 55 tessellated columns** (α = 109 km = 3.4 spacings):
+  peak 0.1506 km against 0.1485 analytic, first zero at 2.34α (3π/4 = 2.36),
+  forebulge 4.1% of the peak (e^(−π) = 4.3%), worst deviation 1.4% of the peak. The
+  GPU iteration converges to the exact solve; with D = 0 one sweep is exactly the old
+  Airy relaxation.
+
+GPU tests:
+- **Edge timers** (four pairs held at ±0.2% strain, elastic): old ocean against a
+  continent subducted at step 5 (window 4.5 steps); the continent pair and the young
+  ocean pair welded at step 10 (window 9.5); the pair in tension kept timer 0.
+- **Slab** (a row of five bonded old-ocean columns, the last a slab, and a continent
+  beyond it): sinks 1.16 km per step, matching the reference to 6×10⁻⁷; at 55 km its
+  edge carries 1.8 MPa of tension and the far end of the plate has moved 8.9 km toward
+  it (slab pull through the edge); removed at the (test) cutoff; the arc got
+  exactly 20% of its volume, all to the continent, none to the plate behind.
+- **Flexure on the GPU** (the same strip, D from a 50 km elastic profile): D exact;
+  deflections within 0.03% of the CPU exact solve and 1.5% of the analytic profile.
+
+**Found by the tests.**
+- **`interface` is a reserved word in WGSL**: the whole compute module failed to
+  compile, so every test stalled rather than failed. Page errors are checked only at
+  the end of each test; when many tests stall at once, look at the page errors first.
+- **Arcs fed the slab's own plate**, resetting its lithosphere hot (L = 0), which ended
+  the depth overlap and detached the slab. Arcs now grow only on the far side from
+  the plate behind the slab.
+- **Removed slabs were still in the step's hash grid** (built before slabs sink), so
+  `edges_create` could bond to them; found by the 10× time-step planet test. Hash
+  scans now skip inactive particles.
+- **Arc heat makes melt:** a column whose lithosphere was reset by an arc melts where
+  its cell grows (decompression), so arcs and rifting interact. Reasonable; noted.
+
+**On a generated planet, measured once:** no slab forms in 20 steps (0.32 Myr; the
+window is 1 Myr). The 10× time step (1.6 Myr) does subduct; it passes with p99 speed
+6.8 cm/yr, max 25 (2.6 and 23 before phase F). Bending deepens the deepest columns by
+~0.2 km. The default GPU suite now takes ~5.5 minutes under SwiftShader.
 
 ### Phase E findings: area, volume, melt and splits
 
@@ -1537,6 +1654,14 @@ separate.
 - **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity like the contact
   clamp, which has been tolerated so far. Check at integration that dense yielding
   zones do not slow or break convergence.
+- **Subduction calibration** (phase F): freeboard < 0 makes ocean older than ~8 Myr
+  subductable (design intent 30–40 Myr); the 50 MPa threshold, 1 Myr window and the
+  interface weakening are guesses. Set them at integration with plate speeds.
+- **Trench and outer rise** (phase F): the slab's vertical load on the plate behind
+  it is not coupled to bending; the flexure solver could take it as a line load.
+- **Bending at fine resolution** (phase F): Jacobi needs ~(α/ℓ)⁴ sweeps (~2000 at
+  α/ℓ = 3.4). Free at today's 220 km (α/ℓ < 1); at 50 km it needs Chebyshev or
+  multigrid.
 - **Tessellated area on the sphere** (resolved in phase E): weighted cells from the
   hash neighbourhood tile exactly; the only leak is at voids wider than the hash
   reach (clipped cells, counted).
@@ -1596,6 +1721,12 @@ separate.
 | Van Oosterom–Strackee formula | the solid angle of a triangle of three vectors: tan(Ω/2) = det / (products of lengths + dot products) |
 | stretching factor β | ratio of stretched to original length (McKenzie 1978); here of area, A/A₀, which thins the lithosphere by 1/β |
 | decompression melting | rising mantle melts as pressure drops below the solidus; ~10% melt from ~70 km gives 7 km of oceanic crust |
+| freeboard | height a column would float above the mantle datum without water loading, ∫(1 − ρ/ρ_m)dz; negative = the column is denser than the mantle and can sink |
+| flexural length α | (4D/Δρg)^¼: the distance over which a plate on a fluid foundation spreads a load; under a line load the plate first crosses zero at 3πα/4 and bulges up by e^(−π) ≈ 4% at πα |
+| finite-volume ("cotangent") Laplacian | (∇²f)ᵢ ≈ (1/Aᵢ) Σⱼ (shared boundary/distance)(fⱼ − fᵢ) on a Voronoi mesh; for a Delaunay triangulation the weights equal the cotangent formula |
+| Stokes sinking | settling of a dense body through a viscous fluid at a speed ∝ buoyancy × size / viscosity |
+| suture | the weld where two colliding plates become one |
+| magmatic arc | chain of volcanoes above a subducting slab at ~100 km depth, fed by melt from the mantle wedge |
 | solidus | temperature (at a given pressure) at which rock begins to melt |
 | T1 event | neighbour exchange in a foam or cell network: one contact is lost and another forms |
 | integrity φ | an edge's undamaged fraction: scales cohesion, friction and optionally ductile viscosity |

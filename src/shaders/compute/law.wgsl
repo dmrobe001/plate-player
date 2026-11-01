@@ -9,7 +9,9 @@
 //                  step's strain, cap it, store it; mean stress; then the
 //                  irreversible part (phase D): inelastic strain (accumulated
 //                  on both columns for volumetric flow, flow.wgsl), plastic
-//                  work, and the integrity law (damage by work, thermal healing)
+//                  work, and the integrity law (damage by work, thermal healing);
+//                  then the edge timer and state transitions (phase F):
+//                  subduction initiation and suturing (src/edges/transitions.js)
 
 const EDGE_SLICES: u32 = 8u;
 
@@ -49,6 +51,8 @@ fn edge_slices(a: u32, b: u32, phi: f32) -> EdgeSlices {
     let ca = column_of(a);
     let cb = column_of(b);
     let ln_edt = log(sim.crust_youngs_modulus_gpa * 1e9 * sim.dt_crust_myr * 3.15576e13);
+    // Subduction interface (exactly one slab end): lubricated in compression.
+    let lubricated = select(1.0, sim.slab_interface_weakening, (particles[a].state == 2u) != (particles[b].state == 2u));
     let ln_eta_shift = log(1e6) - log(2.0 * sim.reference_strain_rate_s);
     for (var k = 0u; k < EDGE_SLICES; k++) {
         let z = top - (f32(k) + 0.5) * s.dz;
@@ -63,7 +67,7 @@ fn edge_slices(a: u32, b: u32, phi: f32) -> EdgeSlices {
         let brittle_comp = phi * sim.cohesion_mpa + sim.friction_coefficient * (1.0 - sim.pore_fluid_factor) * pressure;
         let brittle = brittle_comp < ductile_cap;
         s.r[k] = 1.0 / (1.0 + edt_over_eta);
-        s.comp[k] = min(brittle_comp, ductile_cap);
+        s.comp[k] = min(brittle_comp, ductile_cap) * lubricated;
         s.tens[k] = select(ductile_cap * (1.0 - sim.ductile_damage_weakening * (1.0 - phi)), phi * sim.cohesion_mpa, brittle);
         s.cracks[k] = select(0u, 1u, brittle);
         s.temp[k] = 0.5 * (temp_at(ca, da) + temp_at(cb, db));
@@ -108,7 +112,7 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
     if (e >= sim.max_edges || edges[e].is_active == 0u) { return; }
     let c = edges[e];
     let rest = rest_length(c);
-    let len = distance(particles[c.particle_b].predicted_pos.xyz, particles[c.particle_a].predicted_pos.xyz);
+    let len = length(edge_offset(c.particle_a, c.particle_b, particles[c.particle_a].predicted_pos.xyz, particles[c.particle_b].predicted_pos.xyz));
     let d_strain = (len - c.length) / rest;
     let s = edge_slices(c.particle_a, c.particle_b, c.integrity);
     let E = sim.crust_youngs_modulus_gpa * 1000.0;
@@ -146,12 +150,16 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
     edges[e].inelastic_strain = inelastic;
     edges[e].work_mpa_km = work;
 
-    // Volumetric flow: both columns collect this edge's inelastic strain.
-    let fixed = i32(round(inelastic * FIXED_POINT));
-    atomicAdd(&particle_deltas[c.particle_a].dx, fixed);
-    atomicAdd(&particle_deltas[c.particle_a].count, 1i);
-    atomicAdd(&particle_deltas[c.particle_b].dx, fixed);
-    atomicAdd(&particle_deltas[c.particle_b].count, 1i);
+    // Volumetric flow: both columns collect this edge's inelastic strain
+    // (surface pairs only: slabs are not part of the area budget).
+    let surface_pair = particles[c.particle_a].state == 1u && particles[c.particle_b].state == 1u;
+    if (surface_pair) {
+        let fixed = i32(round(inelastic * FIXED_POINT));
+        atomicAdd(&particle_deltas[c.particle_a].dx, fixed);
+        atomicAdd(&particle_deltas[c.particle_a].count, 1i);
+        atomicAdd(&particle_deltas[c.particle_b].dx, fixed);
+        atomicAdd(&particle_deltas[c.particle_b].count, 1i);
+    }
 
     // Integrity law: damage by plastic work, then exact exponential healing
     // at the temperature of the load-bearing part of the interface.
@@ -160,4 +168,26 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
     let exponent = min((sim.heal_activation_kj / sim.gas_constant) * (1.0 / max(t_heal, 1.0) - 1.0 / sim.mantle_temp), 80.0);
     let tau = sim.heal_time_myr * exp(exponent);
     edges[e].integrity = 1.0 - (1.0 - damaged) * exp(-sim.dt_crust_myr / tau);
+
+    // State transitions (design 6; transitions.js): subduction initiation and suturing.
+    let timer = select(0.0, c.timer + sim.dt_crust_myr, edges[e].stress_normal_mpa < -sim.transition_stress_mpa);
+    edges[e].timer = timer;
+    if (!surface_pair) { return; }
+    let a = c.particle_a;
+    let b = c.particle_b;
+    let fa = profiles[a].freeboard_km;
+    let fb = profiles[b].freeboard_km;
+    let sink_a = fa < 0.0;
+    let sink_b = fb < 0.0;
+    if (sink_a || sink_b) {
+        let slab_a = sink_a && particles[a].slab_neighbours > 0u;
+        let slab_b = sink_b && particles[b].slab_neighbours > 0u;
+        var down = select(b, a, fa < fb || (fa == fb && a < b));
+        if (slab_a && !slab_b) { down = a; } else if (slab_b && !slab_a) { down = b; }
+        let window = sim.subduction_window_myr * select(1.0, sim.subduction_propagation_factor, particles[down].slab_neighbours > 0u);
+        if (timer >= window) { particles[down].next_state = 2u; } // every writer writes 2
+    } else if (timer >= sim.suture_window_myr && work == 0.0) {
+        edges[e].integrity = 1.0;
+        edges[e].timer = 0.0;
+    }
 }

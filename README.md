@@ -69,15 +69,19 @@ asthenosphere viscosity, and h is the channel from the plate's base (oceanic: 2.
 capped at 100 km; continental: 150 km) down to the base of the low-viscosity layer
 (300 km). Deep keels drag hard and young ocean drags weakly. A plate's speed is not
 imposed: it comes out of the force balance between this drag, the bonds holding the
-plate together, and collisions with other plates (slab pull and ridge push come later).
+plate together, collisions with other plates, and slab pull through slab edges (ridge
+push exists but is off until calibration).
 η is the effective drag coefficient to tune.
 
 **Crust particles** (`Particle` in `src/gpu/layout.js`). Each one is a hexagonal
 column with thickness, composition density, temperature, age, and area
 (2√3·apothem²). Its elevation (the top of the column) is a free coordinate that
 relaxes toward the Airy height from its column profile (below), with the viscous
-rebound time of a column-sized load (~30 kyr). It is not part of `position`, which
-stays on the unit sphere.
+rebound time of a column-sized load (~30 kyr), while bending couples neighbours: a
+thin elastic plate of rigidity D = E hₑ³/12(1 − ν²) over the column's elastic
+thickness, discretised on the tessellation (`shaders/compute/flexure.wgsl`; reference
+`src/columns/flexure.js`; matches the line-load flexure profile to 1.4%). It is not
+part of `position`, which stays on the unit sphere.
 
 **Column profiles** (`ColumnProfile`, `shaders/compute/profile.wgsl`; CPU reference
 `src/columns/profile.js`). Every step, each column's vertical structure is computed
@@ -178,13 +182,18 @@ an intact, stress-free edge. Sources (melt) and sinks (slabs) are logged, so the
 volume budget closes. This replaced the old spreading stand-in (area growth over
 diverging mantle).
 
-**Subduction** (`solver.wgsl`, `thermal.wgsl`; a stand-in until phase F). When two
-surface discs overlap deeply, the lower one
-becomes a slab (state 2): its top drops below the lithosphere, so its edges to
-surface columns leave range (it also loses its attachment to the trailing plate
-until design phase F), and it sinks, heats up, and thins until it melts. Its index then
-returns to a free list for reuse. (Since contacts became stiff, deep overlaps hardly
-occur, so subduction rarely starts; see the to-do list.)
+**Subduction, suturing and arcs** (`law.wgsl`, `thermal.wgsl`, `flexure.wgsl`;
+reference `src/edges/transitions.js`). Each edge has a timer that runs while it is
+compressed beyond 50 MPa. If either column is denser than the mantle (negative
+freeboard: ocean older than ~8 Myr), the denser one becomes a **slab** once the timer
+passes 1 Myr (a tenth of that if it already touches a slab, so trenches propagate and
+keep their polarity). If both are buoyant, nothing subducts; after 5 quiet Myr the edge
+**welds** (suturing). A slab stays where it was and sinks at a Stokes rate set by its
+negative buoyancy (~7 cm/yr for old ocean), warming and slowing; it is removed at
+660 km. Its edges are measured in 3D, so as it sinks it stretches them and pulls the
+plate behind it; its interface with the other plate is weak in compression. Crossing
+80–160 km depth, a slab feeds an **arc**: surface columns within ~320 km gain 20% of
+its crust volume (at continental density, 2750) and their lithosphere is reset hot.
 
 ### Initial conditions (`src/init/initial-state.js`)
 
@@ -234,12 +243,14 @@ plate-player/
 │   │   └── random.js          seeded RNG, uniform points on the sphere
 │   ├── edges/
 │   │   ├── topology.js        CPU reference for edge existence, slot order, storage checks
-│   │   └── law.js             CPU reference for the edge law: slices, Maxwell stresses, caps, integrity
+│   │   ├── law.js             CPU reference for the edge law: slices, Maxwell stresses, caps, integrity
+│   │   └── transitions.js     CPU reference for subduction initiation, suturing, slab sinking
 │   ├── columns/
 │   │   ├── profile.js         CPU reference for column profiles: geotherm, Airy, GPE, strength
 │   │   ├── flow.js            CPU reference for volumetric flow and the GPE push
 │   │   ├── area.js            CPU reference for the tessellated area (weighted Voronoi cells)
-│   │   └── volume.js          CPU reference for crust volume, thinning, melt, breakup and splits
+│   │   ├── volume.js          CPU reference for crust volume, thinning, melt, breakup and splits
+│   │   └── flexure.js         CPU reference for bending of the free radius (thin plate on a Winkler foundation)
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
@@ -257,7 +268,7 @@ plate-player/
 │   │   ├── renderer.js        render pipelines and draw calls
 │   │   └── camera.js          orbit camera
 │   └── shaders/
-│       ├── compute/           bindings.wgsl, locate, thermal, solver, edges, profile, law, flow, area, split
+│       ├── compute/           bindings.wgsl, locate, thermal, solver, edges, profile, law, flow, area, split, flexure
 │       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
 ├── test/
 │   ├── unit.test.mjs          CPU tests (Node only)
@@ -426,17 +437,10 @@ floating-point contraction all vary. A resumed or re-run simulation should match
 Ordered roughly by how much each item affects the plausibility of generated worlds.
 
 **Physics**
-- [ ] **Slab pull never fires.** It requires slab density > 3300, but slabs are
-      3000 kg/m³ crust being *heated*, so their density stays below about 3120.
-      The fix is to include the cold lithospheric mantle that moves with the slab
-      (density ≈ 3300 × (1 + α ΔT)). The pull magnitude (`× 0.02` rad/Myr per
-      kg/m³) is also orders of magnitude above plate speeds. Its direction
-      follows the mantle flow (biased by `+vec3(0.001)`), not the trench normal.
-- [ ] **Slabs melt within a few frames.** Slab heating relaxes at 2.5 /Myr (now
-      integrated exactly) and thickness loss is 0.1 km per K, so a 7 km slab is
-      gone in about two steps. The rates (`slab_heating_rate`,
-      `slab_assimilation_km_per_k`) should be much slower so slabs persist long
-      enough to pull; design phase 7 replaces this mechanism.
+- [x] ~~**Slab pull never fires.**~~ Phase F: buoyancy is the whole column's
+      (freeboard), and pull goes through the slab's 3D-measured edges.
+- [x] ~~**Slabs melt within a few frames.**~~ Phase F: slabs sink by their own
+      buoyancy and warm over ~20 Myr; removed at 660 km.
 - [x] ~~No ocean depth–age relation.~~ Phase B: Airy isostasy of the whole column
       profile, so sea floor deepens with √age, 2.8 km from ridge to old basin.
       Sea level moved from 3.5 to 2.6 km in the elevation datum to keep
@@ -468,26 +472,24 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [x] ~~Contacts were rebuilt every step.~~ Phase A: one kind of edge, keyed by pair,
       persistent while in range (design 3.2). Stress-based subduction initiation,
       suturing and friction can now keep state on the edge.
-- [ ] **Cold plates never weld.** Edges heal only where hot (phase D), so colliding
-      cold plates don't suture. Suturing is design phase F.
+- [x] ~~**Cold plates never weld.**~~ Phase F: buoyant pairs in sustained, quiet
+      compression weld (suturing).
 - [ ] **No ridge push yet.** The GPE push exists but is off until basal drag is
       calibrated against it (design, phase D findings).
-- [ ] **Subduction rarely starts.** The trigger is a deep overlap (34% of an apothem
-      sum), which stiff contacts now prevent; converging plates lock instead. Design §6
-      replaces it with a stress-based rule on the (now persistent) edges (phase F).
+- [x] ~~**Subduction rarely starts.**~~ Phase F: initiation is a timer on compressed
+      edges with a dense side, not an overlap.
+- [ ] **No trench or outer rise:** the slab pulls the plate in-plane only; its
+      vertical load on the plate behind it is not coupled to the bending.
 - [ ] **No friction.** Edges have strength caps in compression and tension
       (phase C) but no tangential part, so sliding columns feel no friction. A
       tangential channel needs a per-particle orientation (design §10).
-- [ ] **Slabs detach from their plate.** A new slab's edges leave range when its top
-      drops below the lithosphere, so slab pull no longer reaches the plate through
-      edges (phase F replaces the drop with bending).
+- [x] ~~**Slabs detach from their plate.**~~ Phase F: a slab subducts where it is
+      and keeps its edges until it has sunk below the plate behind it.
 - [x] ~~Water loading factor~~ was d·(1 + ρ_w/ρ_m); now ρ_w/(ρ_m − ρ_w) (phase 3).
-- [ ] **Mass is not conserved at splits.** The parent keeps its thickness at half
-      the area, and the child is reset to 7 km oceanic crust, so continental
-      material vanishes when a continent rifts.
-- [ ] **Subduction choice.** The lower disc of any deeply overlapping pair
-      subducts, including continent under continent. The polarity is decided per
-      pair, so a trench can flip polarity along its length.
+- [x] ~~**Mass is not conserved at splits.**~~ Phase E: volume is state, shared
+      equally at splits; the child copies the parent's material.
+- [x] ~~**Subduction choice.**~~ Phase F: only negatively buoyant columns subduct
+      (the denser of a pair); buoyant pairs weld instead.
 - [x] ~~The Swift–Hohenberg mantle took hundreds of Myr to emerge, locked into a
       fixed pattern once it did, and its velocity scale was arbitrary.~~ Replaced by
       the lava-lamp mantle: spun up alone, never settles, speed calibrated to ~4 cm/yr.

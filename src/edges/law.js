@@ -57,7 +57,7 @@ export function slicePressure(prof, d) {
 
 /**
  * The edge's slices for this step. `a`, `b`: column inputs
- * ({ crustKm, compositionDensity, ageMyr, elevationKm }), phi: integrity.
+ * ({ crustKm, compositionDensity, ageMyr, elevationKm, slab? }), phi: integrity.
  * Per slice: dz (km), r (Maxwell factor), comp and tens caps (MPa), and
  * whether tension is brittle-limited (cracks) rather than ductile (flows).
  */
@@ -68,6 +68,8 @@ export function edgeSlices(a, b, phi, p) {
   const dz = overlap / EDGE_SLICES;
   const ends = [a, b].map((col) => ({ col, g: geotherm(col, p), prof: columnProfile(col, p) }));
   const lnEdt = Math.log(p.crust_youngs_modulus_gpa * 1e9 * p.dt_crust_myr * SECONDS_PER_MYR);
+  // Subduction interface (exactly one slab end): lubricated in compression.
+  const iface = !!a.slab !== !!b.slab ? p.slab_interface_weakening : 1;
   const slices = [];
   for (let k = 0; k < EDGE_SLICES; k++) {
     const z = top - (k + 0.5) * dz; // height above the datum
@@ -89,7 +91,7 @@ export function edgeSlices(a, b, phi, p) {
     slices.push({
       z, dz, T,
       r: 1 / (1 + edtOverEta),
-      comp: Math.min(brittleComp, ductileCap),
+      comp: Math.min(brittleComp, ductileCap) * iface,
       tens: brittle ? phi * p.cohesion_mpa : ductileCap * (1 - p.ductile_damage_weakening * (1 - phi)),
       cracks: brittle,
     });

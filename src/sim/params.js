@@ -51,7 +51,6 @@ export const SIM_PARAMS = [
   // A surface column splits when its actual (tessellated) area exceeds this
   // factor x the base hexagon area (design 4.8).
   ['split_area_factor', 'f32', 2.0],
-  ['subduction_overlap', 'f32', 0.012], // overlap depth that triggers subduction
   // An edge exists while its pair's map-view gap is below this fraction of the
   // apothem sum (and their depth intervals overlap); design 3.2.
   ['edge_range_margin', 'f32', 0.1],
@@ -124,8 +123,7 @@ export const SIM_PARAMS = [
   ['ambient_ocean_temp', 'f32', 278.0],
   ['mantle_temp', 'f32', 1600.0],
   ['surface_cooling_rate', 'f32', 0.05],  // 1/Myr, relaxation of surface crust to ocean temperature
-  ['slab_heating_rate', 'f32', 2.5],      // 1/Myr, relaxation of slab to mantle temperature
-  ['slab_assimilation_km_per_k', 'f32', 0.1], // slab thickness lost per kelvin of heating
+  ['slab_heating_rate', 'f32', 0.05],     // 1/Myr: a slab's thermal age decays at this rate (it warms; design 6)
   // Sea level in the same datum as particle elevation (the top of a dry
   // mantle at mantle temperature). With the column profile's Airy isostasy
   // (design 4.0), 2.6 km puts a ridge (7 km crust, age 0) 2.9 km below sea
@@ -139,11 +137,43 @@ export const SIM_PARAMS = [
   // 1e21 Pa s is the upper-mantle viscosity from post-glacial rebound; tau is
   // then ~30 kyr at the base particle size, so columns track Airy closely.
   ['isostatic_viscosity_pa_s', 'f32', 1e21],
-  // Stand-ins until slabs get real buoyancy and bending (design phase 7): a
-  // new slab's top drops below any lithosphere, so its column no longer
-  // overlaps surface columns in depth, then sinks at a fixed rate.
-  ['slab_initial_depth_km', 'f32', 160.0],
-  ['slab_sink_rate_km_myr', 'f32', 20.0],
+  // --- subduction, suturing, slabs, arcs (design 6; phase F; src/edges/transitions.js) ---
+  // One timer per edge: it accumulates while the edge's depth-averaged normal
+  // stress is more compressive than transition_stress_mpa, and resets
+  // otherwise. Past subduction_window_myr, if a column is negatively buoyant
+  // (freeboard < 0), the denser one becomes a slab; past suture_window_myr
+  // with both buoyant and no plastic work that step, the edge welds (integrity 1).
+  ['transition_stress_mpa', 'f32', 50.0],
+  ['subduction_window_myr', 'f32', 1.0],
+  ['subduction_propagation_factor', 'f32', 0.1], // window x this when the down column already touches a slab
+  ['suture_window_myr', 'f32', 5.0],
+  // The subduction interface is lubricated: compression caps of edges with
+  // exactly one slab end are scaled by this.
+  ['slab_interface_weakening', 'f32', 0.1],
+  // Slabs sink under their own negative buoyancy B = -rho_m x freeboard
+  // (kg/m^2) at the Stokes-like rate w = B g width / (4 eta), eta =
+  // isostatic_viscosity_pa_s (upper mantle). Removed below this depth or once
+  // warmed to neutral buoyancy.
+  ['slab_cutoff_km', 'f32', 660.0],
+  // Arcs: surface columns within arc_reach (unit sphere) of a slab whose top
+  // is between these depths gain crust volume: arc_efficiency x the slab's
+  // volume over its passage through the window, shared equally; their thermal
+  // age resets to 0 (hot, weak arc lithosphere).
+  ['arc_depth_min_km', 'f32', 80.0],
+  ['arc_depth_max_km', 'f32', 160.0],
+  ['arc_reach', 'f32', 0.05],
+  ['arc_efficiency', 'f32', 0.2],
+  ['arc_density', 'f32', 2750.0],
+
+  // --- bending (design 4.3, 4.4; phase F; src/columns/flexure.js) ---
+  // Plate energy (D/2) (laplacian of elevation)^2 per area on the tessellation
+  // (cotangent-like weights: shared cell boundary / distance), with a Winkler
+  // foundation (isostasy). D = E h_e^3 / 12 (1 - nu^2), h_e = the column's
+  // Maxwell-elastic thickness this step. flexure_factor scales D (0 = Airy).
+  ['flexure_factor', 'f32', 1.0],
+  ['poisson_ratio', 'f32', 0.25],
+  ['flexure_iterations', 'u32', 8],       // damped Jacobi sweeps per step (read by simulation.js)
+  ['flexure_damping', 'f32', 2.0],        // bending part of the Jacobi diagonal x this (> 1.4 for convergence)
 ];
 
 export function simParamsWGSL() {

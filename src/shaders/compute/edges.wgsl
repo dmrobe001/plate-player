@@ -70,7 +70,7 @@ fn new_edge(a: u32, b: u32, integrity: f32) -> Edge {
     c.stress_normal_mpa = 0.0;
     c.stress_shear_mpa = 0.0;
     let rest = particles[a].apothem + particles[b].apothem;
-    c.length = distance(particles[a].position.xyz, particles[b].position.xyz);
+    c.length = length(edge_offset(a, b, particles[a].position.xyz, particles[b].position.xyz));
     c.strain = (c.length - rest) / rest;
     c.inelastic_strain = 0.0;
     c.work_mpa_km = 0.0;
@@ -125,18 +125,12 @@ fn listed(i: u32, j: u32, n: u32) -> bool {
     return false;
 }
 
-// Also the (overlap-based) subduction trigger, until phase F replaces it with
-// a stress-based rule: deep map-view overlap between two surface columns
-// makes the lower one a slab at the end of the step, and no edge is created
-// between them. Every pair is examined by both threads, so each thread only
-// writes its own next_state.
 @compute @workgroup_size(64)
 fn edges_create(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     let n0 = particles[idx].edge_count;      // survivors listed by edges_prune
     let can_create = n0 <= MAX_SLOTS;
-    let surface_i = particles[idx].state == 1u;
     let home = hash_cell(particles[idx].predicted_pos.xyz);
     let dim = i32(sim.hash_grid_dim);
 
@@ -150,12 +144,9 @@ fn edges_create(@builtin(global_invocation_id) id: vec3<u32>) {
         while (j != NONE && iter < 50) {
             let next = particles[j].next_idx;
             iter++;
-            if (j == idx || !in_range(idx, j)) { j = next; continue; }
-            if (surface_i && particles[j].state == 1u && pair_overlap(idx, j) > sim.subduction_overlap) {
-                let lower = select(j, idx, particles[idx].elevation < particles[j].elevation
-                    || (particles[idx].elevation == particles[j].elevation && idx < j));
-                if (lower == idx) { particles[idx].next_state = 2u; }
-            } else if (idx < j && can_create && !listed(idx, j, n0)) {
+            // (The hash is built before slabs are removed this step: skip the removed.)
+            if (j == idx || particles[j].is_active == 0u || !in_range(idx, j)) { j = next; continue; }
+            if (idx < j && can_create && !listed(idx, j, n0)) {
                 let e = pop_edge();
                 if (e == NONE) {
                     atomicAdd(&solver.edge_pool_empty, 1u);
@@ -209,7 +200,12 @@ fn edges_finish(@builtin(global_invocation_id) id: vec3<u32>) {
         ids[m] = e;
         ang[m] = a;
     }
-    for (var k = 0u; k < n; k++) { particle_deltas[idx].slots[k] = ids[k]; }
+    var slabs = 0u;
+    for (var k = 0u; k < n; k++) {
+        particle_deltas[idx].slots[k] = ids[k];
+        if (particles[other_end(ids[k], idx)].state == 2u) { slabs++; }
+    }
+    particles[idx].slab_neighbours = slabs;
     particles[idx].iter_start = particles[idx].predicted_pos;
     particles[idx].iter_prev = particles[idx].predicted_pos;
 }
