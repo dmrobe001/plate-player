@@ -47,7 +47,6 @@ export const SIM_PARAMS = [
   // <= 1 (the thickest column), which keeps the Chebyshev bound valid.
   ['stiffness_reference_km', 'f32', 150.0],
   ['bond_rate_myr_inv', 'f32', null],   // derived: bond stiffness / reference drag of a base-size particle, 1/Myr
-  ['yield_stress_mpa', 'f32', 150.0],
   ['base_apothem', 'f32', 0.0175],      // reference particle apothem
   ['split_area_factor', 'f32', 3.0],    // particle splits when area > factor * base hexagon area
   ['subduction_overlap', 'f32', 0.012], // overlap depth that triggers subduction
@@ -64,10 +63,8 @@ export const SIM_PARAMS = [
   ['max_edges', 'u32', null],
   ['hash_grid_dim', 'u32', null],
 
-  // --- rheology: Arrhenius temperature dependence ---
-  ['activation_energy', 'f32', 250.0],  // kJ/mol
+  // --- constants ---
   ['gas_constant', 'f32', 0.008314],    // kJ/(mol K)
-  ['reference_temp', 'f32', 293.0],     // K, temperature at which yield = yield_stress_mpa
 
   // --- column profile (design 4.0; src/columns/profile.js) ---
   // Geotherms: oceanic half-space cooling; continental steady conduction with
@@ -89,6 +86,20 @@ export const SIM_PARAMS = [
   // resists separation whatever phi); 1 = a broken edge's ductile part is as
   // weak in tension as its brittle part (shear-zone damage, as in grain-damage theory).
   ['ductile_damage_weakening', 'f32', 0.0],
+  // Integrity law (design 4.7, phase D): damage by plastic work, thermally
+  // activated healing. Provisional; calibrated at integration.
+  ['damage_work_mpa_km', 'f32', 50.0],     // plastic work (per unit edge length and depth) that removes all integrity
+  ['heal_time_myr', 'f32', 0.1],           // healing time at mantle temperature
+  ['heal_activation_kj', 'f32', 250.0],    // Arrhenius: ~50 Myr at 1200 K, effectively never below ~900 K
+  // GPE force (design 4.6): push down the gradient of gravitational potential
+  // energy (ridge push, plateau collapse). 1 = physical; 0 = off. Off by
+  // default until integration calibrates basal drag against it: at 1, a
+  // column at a continental margin is pushed at metres per year against the
+  // present drag (design, phase D findings).
+  ['gpe_force_factor', 'f32', 0.0],
+  // Volumetric flow (design 4.7): multiplies the area_ref change from edges'
+  // inelastic strain. 1 = physical; 0 = off (storage tests).
+  ['volumetric_flow_factor', 'f32', 1.0],
   ['quartzite_log10_a', 'f32', -3.959],      // log10(1.1e-4)
   ['quartzite_n', 'f32', 4.0],
   ['quartzite_q_kj', 'f32', 223.0],

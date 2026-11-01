@@ -67,11 +67,13 @@ fn new_edge(a: u32, b: u32, integrity: f32) -> Edge {
     c.integrity = integrity;
     c.lambda = 0.0;
     c.lambda_prev = 0.0;
-    c.yield_stress_mpa = sim.yield_stress_mpa;
     c.stress_normal_mpa = 0.0;
     c.stress_shear_mpa = 0.0;
     let rest = particles[a].apothem + particles[b].apothem;
-    c.strain = (distance(particles[a].position.xyz, particles[b].position.xyz) - rest) / rest;
+    c.length = distance(particles[a].position.xyz, particles[b].position.xyz);
+    c.strain = (c.length - rest) / rest;
+    c.inelastic_strain = 0.0;
+    c.work_mpa_km = 0.0;
     for (var k = 0u; k < 8u; k++) { c.slice_stress_mpa[k] = sim.crust_youngs_modulus_gpa * 1000.0 * c.strain; }
     c.stiffness = 0.0;
     c.reference_gap = 0.0;

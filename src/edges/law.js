@@ -71,7 +71,7 @@ export function edgeSlices(a, b, phi, p) {
   const slices = [];
   for (let k = 0; k < EDGE_SLICES; k++) {
     const z = top - (k + 0.5) * dz; // height above the datum
-    let edtOverEta = 0, invStrength = 0, pressure = 0;
+    let edtOverEta = 0, invStrength = 0, pressure = 0, T = 0;
     for (const { col, g, prof } of ends) {
       const d = col.elevationKm - z; // depth in this column
       const lnStrength = ductile(flowLaw(col, d, p), g.T(d), p).lnStrength;
@@ -81,12 +81,13 @@ export function edgeSlices(a, b, phi, p) {
       edtOverEta += 0.5 * Math.exp(lnEdt - lnEta);
       invStrength += 0.5 * Math.exp(-lnS);
       pressure += 0.5 * slicePressure(prof, d);
+      T += 0.5 * g.T(d);
     }
     const ductileCap = 1 / invStrength;
     const brittleComp = phi * p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * pressure;
     const brittle = brittleComp < ductileCap;
     slices.push({
-      z, dz,
+      z, dz, T,
       r: 1 / (1 + edtOverEta),
       comp: Math.min(brittleComp, ductileCap),
       tens: brittle ? phi * p.cohesion_mpa : ductileCap * (1 - p.ductile_damage_weakening * (1 - phi)),
@@ -131,19 +132,63 @@ export function lambdaBounds(lin, rest, p) {
  * After the solve: advance each slice by the strain increment (implicit
  * Euler), cap, and store. An open crack stores its elastic trial stress less
  * the creep its actual (capped) stress drives over the step, E dt / eta x cap.
- * Returns the stored stresses, the actual (capped) ones, and S.
+ *
+ * Also the irreversible bookkeeping of the step (design 4.7, phase D):
+ *   inelastic: the edge's strain increment not stored elastically (creep and
+ *     plastic flow; not crack opening, which closes again) in its stiffest
+ *     slice (largest r; the first of equals). A column shortens permanently
+ *     only as fast as its strongest layer lets it: a cold lid that does not
+ *     yield holds it however much the hot base creeps (stress relaxing below
+ *     is load moving to the lid, not shortening); a lid at its cap lets it
+ *     flow; an all-hot column flows by its coldest part. Columns turn it into
+ *     area_ref change (volumetric flow).
+ *   work: plastic work this step, MPa km (cap x plastic strain x dz, summed):
+ *     slices at a cap, and cracks opening against cohesion. Creep below the
+ *     cap is not counted. Drives damage.
+ * Returns the stored stresses, the actual (capped) ones, S, inelastic, work.
  */
 export function maxwellUpdate(stress, edge, dStrain, p) {
   const E = E_MPA(p);
   const stored = [], actual = [];
-  let S = 0;
+  let S = 0, work = 0, inelastic = 0, rMax = -1;
   edge.slices.forEach((s, k) => {
     const elastic = stress[k] + E * dStrain;       // no creep
     const relaxed = elastic * s.r;                 // Maxwell, implicit Euler
     const capped = Math.min(Math.max(relaxed, -s.comp), s.tens);
+    const crack = relaxed > s.tens && s.cracks;
+    const kept = crack ? elastic - (1 / s.r - 1) * s.tens : capped;
     actual.push(capped);
-    stored.push(relaxed > s.tens && s.cracks ? elastic - (1 / s.r - 1) * s.tens : capped);
+    stored.push(kept);
     S += capped * s.dz;
+    if (crack) work += s.tens * Math.max(dStrain, 0) * s.dz;
+    else if (relaxed !== capped) work += Math.abs(capped * (relaxed - capped) / (E * Math.max(s.r, 1e-30))) * s.dz;
+    if (s.r > rMax) { rMax = s.r; inelastic = dStrain - (kept - stress[k]) / E; }
   });
-  return { stored, actual, S, meanStress: edge.overlap > 0 ? S / edge.overlap : 0 };
+  return {
+    stored, actual, S, work,
+    inelastic: edge.overlap > 0 ? inelastic : 0,
+    meanStress: edge.overlap > 0 ? S / edge.overlap : 0,
+  };
+}
+
+/** Temperature of the edge's load-bearing part: slice temperatures weighted by elastic weight r dz. */
+export function healingTemperature(edge) {
+  let w = 0, wt = 0;
+  for (const s of edge.slices) { const x = (s.r + 1e-9) * s.dz; w += x; wt += x * s.T; }
+  return w > 0 ? wt / w : 0;
+}
+
+/** Healing time (Myr) at temperature T: heal_time_myr at mantle temperature, Arrhenius below it. */
+export function healTimeMyr(T, p) {
+  return p.heal_time_myr * Math.exp(Math.min((p.heal_activation_kj / p.gas_constant) * (1 / Math.max(T, 1) - 1 / p.mantle_temp), 80));
+}
+
+/**
+ * Integrity law (design 4.7), one step: damage by plastic work,
+ * phi -= W / W_D (floored at 0), then healing toward 1 with time scale
+ * tau_heal(T), integrated exactly: 1 - phi decays by exp(-dt / tau).
+ */
+export function integrityStep(phi, work, T, p) {
+  const damaged = Math.max(phi - work / p.damage_work_mpa_km, 0);
+  return 1 - (1 - damaged) * Math.exp(-p.dt_crust_myr / healTimeMyr(T, p));
 }

@@ -5,7 +5,8 @@ identification from phase 5, Chebyshev acceleration, and the lava-lamp mantle wi
 grounded basal drag. **The physics is being redesigned around one pair-interaction
 law** (sections 3.2, 4.0, 4.5, 4.7, 6): no bond/contact distinction, graded and
 history-dependent integrity, area and volume as exact budgets. Of the redesign, phases
-A (persistent edges), B (column profiles) and C (the edge law, normal part) are done. The rest is a proposal.
+A (persistent edges), B (column profiles), C (the edge law, normal part) and D (the
+irreversible step, without slip) are done. The rest is a proposal.
 This document says where the model is going and why.
 
 **Development strategy (current).** No more full-planet runs until all the physics
@@ -161,7 +162,8 @@ contact or a ridge is a matter of the edge's state and the two columns' profiles
 |---|---|---|
 | `a`, `b` | u32 | particle indices; the pair is the edge's identity, and it persists across steps |
 | `integrity` φ | f32 | 0..1. Scales cohesion, friction and (optionally) ductile viscosity. Lowered by plastic work, raised by thermally activated healing (4.7) |
-| `strain`, `slice_stress` | f32, 8×f32 | normal strain at the last update, and the Maxwell stress of each of 8 depth slices of the shared interval: the memory that makes the edge history-dependent (4.5; done in phase C) |
+| `length`, `slice_stress` | f32, 8×f32 | the pair's distance at the last update (strain increments are measured from it, so a change of rest length adds no stress), and the Maxwell stress of each of 8 depth slices of the shared interval: the memory that makes the edge history-dependent (4.5; phases C, D) |
+| `strain`, `inelastic_strain`, `work` | f32 | diagnostics of the last update: strain vs rest length, inelastic strain (feeds area_ref), plastic work (feeds damage) |
 | `stress_t` | vec2 | tangential stored stress (reserved; needs particle orientation, section 10) |
 | `slip_anchor` | vec2 | tangential reference offset, moved by slip |
 | `lambda`, `lambda_prev` | f32 | XPBD multipliers for this step (Chebyshev needs the previous one) |
@@ -389,6 +391,14 @@ cooling this produces ridge push, and on thick continents it produces plateau
 collapse and orogenic spreading. Explicit is acceptable here because Γ varies
 slowly; a test should confirm it has no stability limit in practice.
 
+*As built (phase D; `columns_gpe_force` in `flow.wgsl`, reference `flow.js`).* The
+least-squares gradient of Γ over the column's listed neighbours (start-of-step
+positions), applied after the edge update as a shift of the predicted position,
+Δx = −∇Γ·h·dt/η_a (the column's basal drag; independent of its area). Scaled by
+`gpe_force_factor`, **default 0**: against today's drag, a column at a continental
+margin (ΔΓ ≈ 2×10¹² N/m over one spacing) is pushed at metres per year, and a planet
+run with it on breaks the stability tests (phase D findings). Calibrated at integration.
+
 ### 4.7 Irreversible processes (between solves)
 
 All are applied once per step, after the solve, from converged stresses. This keeps
@@ -422,6 +432,38 @@ nothing permanent.
   (reduce thermal age in proportion), as do arcs.
 - **State transitions on edges** (need persistent edges): subduction initiation and
   suturing via the edge timers (section 6).
+
+*As built (phase D; `src/edges/law.js`, `src/columns/flow.js`, `law.wgsl`, `flow.wgsl`).*
+- **Edge memory is the pair's distance** at the last update. The rest length (from
+  area_ref) then only sets where new edges start and where columns are in range.
+  Changing it creates no stress, so area_ref change is an outlet, not a double count.
+- **Inelastic strain** of an edge in a step: the strain increment its *stiffest*
+  slice (largest Maxwell factor r) did not store elastically. A column shortens
+  permanently only as fast as its strongest layer lets it.
+  - A cold lid below yield holds the column, however much the hot base creeps.
+    Stress relaxing below is load moving to the lid, not shortening.
+  - A lid at its cap lets the column flow.
+  - An all-hot column flows by its coldest part.
+  - Crack opening is not inelastic: it closes again.
+  - An elastic-weighted mean over slices was tried first and failed: a pair held
+    still drifted in area as its mid slices relaxed.
+- **Volumetric flow** replaces the p̃ > Y rule above:
+  d ln area_ref = 2 × mean of the column's edges' inelastic strain, at fixed crust
+  volume (thickness ∝ 1/area_ref until phase E's V/area). The GPE term reaches it
+  through the GPE force (4.6) loading the edges, not as a separate pressure.
+  - Uniform shortening at the caps gives d ln A = 2 dε.
+  - In pure shear the per-edge parts cancel: tension cracks and compression stays
+    elastic, so no area changes.
+- **Plastic work**: cap × plastic strain × dz, summed over slices at a cap, plus
+  cohesion × opening for cracks. Creep below a cap is not counted.
+- **Integrity**: φ ← max(φ − W/W_D, 0), then 1 − φ decays by exp(−dt/τ_heal).
+  - τ_heal = heal_time × exp(Q_h/R (1/T − 1/T_m)).
+  - T is the temperature of the edge's load-bearing part: slice temperatures
+    weighted by r·dz.
+  - Defaults: W_D = 50 MPa·km; τ_heal = 0.1 Myr at mantle temperature, 53 Myr at
+    1200 K, never below ~900 K.
+  - This replaces the stand-in yield damage and the stand-in healing kernel.
+- **Slip: not built.** It needs the tangential channel (4.5, As built).
 
 ### 4.8 Area, volume and melt
 
@@ -467,8 +509,8 @@ is removed.
 
 Target order once the pair law is assembled (today's code runs stage 1 without the
 tessellated area, stage 2 including the edge law's normal part, stages 3–4, stage 5
-as Maxwell slice updates plus the old stand-in damage and healing, and stages 6–7; see
-phase A–C findings):
+without slip, melt, thermal reheating or edge state transitions, and stages 6–7; the
+GPE force is implemented but off by default; see phase A–D findings):
 
 ```
 1. profiles                   per column: T(z), ρ(z), η(z), envelope (4.0); tessellated area (4.8)
@@ -792,7 +834,7 @@ written here.
 | A ✅ | **Persistent pair-keyed edges**, one kind: per-particle angle-sorted slot lists; create on entering range (map view + depth), remove on leaving; φ, stored stresses, anchor, timers carried across steps | Slot lists stay symmetric (i lists j ⇔ j lists i) under random motion; an edge's state survives 100 steps of motion within range and is dropped exactly when the pair leaves; no duplicate pairs; free-list invariants hold. **Met** (kept as tests; phase A findings) |
 | B ✅ | **Column profile** (4.0): T(z) from thermal age / continental geotherm, ρ(z), η(z), envelope; lithosphere thickness; GPE | Oceanic profile matches half-space cooling; Airy elevation from the profile reproduces depth ∝ √age on a synthetic age ramp; envelope peak at the brittle–ductile transition where the two curves cross (analytic). **Met**, plus GPE differences = half-space ridge push, and the kernel matches the reference (kept as tests; phase B findings) |
 | C ✅ (normal part) | **Edge law** (4.5): effective stiffness integral, caps as λ clamps, Maxwell stored-stress decay | Single edge under constant separation rate: stress approaches η_eff·rate with the Maxwell time (implicit-Euler sequence, exact); cold pair behaves as a spring, hot pair as a dashpot; tension cap of a φ = 0 cold pair is ≈ 0; two-particle relaxation test from phase 2 still passes when k is set from a uniform profile. **Met** for the normal part (kept as tests; phase C findings). Tangential part deferred: needs particle orientation |
-| D | **Irreversible step** (4.7): volumetric flow at fixed volume, slip, integrity (work-driven damage, thermal healing), neighbour exchange | Uniform compression of a patch thickens at the predicted rate with Σ volume constant; pure shear leaves every area_ref unchanged and produces slip; φ decays in proportion to work input and heals with τ_heal(T); a patch below yield accumulates no plastic strain over many steps with solver noise |
+| D ✅ (without slip) | **Irreversible step** (4.7): volumetric flow at fixed volume, slip, integrity (work-driven damage, thermal healing), neighbour exchange; plus the GPE force (4.6) | Uniform compression of a patch thickens at the predicted rate with Σ volume constant; pure shear leaves every area_ref unchanged and produces slip; φ decays in proportion to work input and heals with τ_heal(T); a patch below yield accumulates no plastic strain over many steps with solver noise. **Met**, with "slip" read as crack opening and plastic work, since edges have no tangential channel; neighbour exchange is the range rule of phase A (kept as tests; phase D findings) |
 | E | **Area, volume, melt, splits** (4.8); remove the spreading proxy | Tessellated areas sum to 4π to float precision on random and lattice configurations; a stretched strip produces 7 km crust per unit new area at L = 0 and none at L ≥ H_m; a split conserves volume and area_ref; budget identity: Δ(Σ V) = logged sources − sinks exactly |
 | F | **Subduction and suturing as edge-state transitions**; slab particles, bending directors (4.3); arcs | Timer-based initiation fires on a synthetic convergent pair with a dense side and never with two buoyant sides; line-load flexure profile within 10% (a mechanism test on a strip, not a planet) |
 | **Integration** | Assemble A–F; first planet runs since the redesign | Calibrate together, recorded once: plate speeds (rms ~4 cm/yr, slab-attached plates fastest), interior rigidity (non-rigid strain rate ≲ 10⁻⁹/yr), ridge depth ∝ √age, ~7 km oceanic crust, orogen heights bounded by collapse, coverage exact, volume budget closed, damage localised into narrow boundaries |
@@ -810,6 +852,72 @@ lava-lamp mantle with grounded basal drag, and bond rest length = apothem sum
 **Resolved:** how new crust is made. Not by inflation inside plates, and not by a
 separate gap-filling rule: by stretching (tessellated area grows at fixed volume) plus
 decompression melt where the lithosphere is thin (4.8).
+
+### Phase D findings: the irreversible step
+
+**What was built** (rules: 4.6 and 4.7, "As built").
+- **`edges_maxwell`** now does more after advancing the slices. It records each edge's
+  inelastic strain and plastic work, accumulates the inelastic strain on both columns,
+  and applies the integrity law.
+- **`columns_flow`** turns the accumulated inelastic strain into area_ref and
+  thickness changes.
+- **`columns_gpe_force`** pushes columns down the GPE gradient (off by default).
+- **Removed:** the stand-in yield damage, the stand-in healing kernel, and their
+  parameters (`yield_stress_mpa`, `activation_energy`, `reference_temp`).
+- **Changed edge fields:** edges now remember their length rather than their strain.
+  The record schema is 0.4.0.
+
+**Parameters** (provisional, calibrated at integration):
+- `damage_work_mpa_km` 50, `heal_time_myr` 0.1, `heal_activation_kj` 250;
+- `gpe_force_factor` 0 (off; see below);
+- `volumetric_flow_factor` 1. The storage tests set it to 0, and it is a tuning
+  handle.
+
+**Tests** (kept). Unit tests of the references:
+- inelastic strain is 0 below yield and the full increment at the cap;
+- plastic work = cap × plastic strain;
+- a crack opening is not inelastic but does work against cohesion;
+- in pure shear of a hexagon of edges the area is unchanged, and uniform shortening
+  at the caps gives d ln A = 2 dε at constant volume;
+- integrity falls by exactly W/W_D and heals as exp(−dt/τ) with the Arrhenius ratio;
+- the least-squares gradient is exact for linear fields.
+
+GPU tests, on a 19-column patch moved by hand:
+- **Uniform shortening, 0.4% per step:** the crust thickens by ln 0.0479 over
+  steps 6–12 against 0.0481 predicted, and total volume holds to 10⁻⁵.
+- **Integrity** matches 1 − ΣW/W_D to 2×10⁻⁷.
+- **Pure shear:** no area changes at all. Work appears on the 14 stretched edges and
+  on none of the other 28.
+- **Below yield, solved for 30 steps:** zero work, integrity exactly 1, zero area
+  change.
+- **GPE push:** matches the reference to 2×10⁻³.
+
+**Found by the tests.**
+- **Inelastic strain** had to come from the stiffest slice, not a weighted mean
+  (4.7, As built).
+- **The GPE kernel read neighbours' predicted positions** while they were being
+  pushed (a race); it now reads start-of-step positions.
+- **Load transfer is real.** In a patch strained to ~1 MPa, the hot base relaxes and
+  passes its load to the 47 km lid, which roughly doubles the lid stress. A patch
+  built flat on the sphere starts pre-stretched ~3×10⁻⁴ (25 MPa), enough to crack.
+  The test declares its loaded state stress-free, as the generated planet is.
+
+**GPE force against today's drag, measured once.**
+- **A free column at a ridge-like age gradient** (9–51 Myr across 900 km) is pushed
+  at 141 cm/yr.
+- **On a generated planet with the force on**, the first 3 steps give median speed
+  ~30 cm/yr, p99 120–160 cm/yr, and up to 35 m/yr at poorly connected margin
+  columns. Mean integrity falls 0.39 → 0.18 as the push breaks edges.
+- **With the force off**, median speed is 5 → 3 cm/yr, p99 30 → 11 cm/yr, and
+  integrity settles near 0.87.
+- **The physics is right; the balance isn't.** ΔΓ ≈ 2×10¹² N/m across a margin is
+  realistic, but basal drag (η_a = 10¹⁹ Pa·s over a ~200 km channel) is too weak to
+  hold it, and broken plate edges carry no tension.
+- **So the force is off by default.** Turning it on is the first calibration at
+  integration, together with drag, slab pull and edge strength.
+
+**Planet runs, once** (force off): the free-list test passed, and the 10× time step
+reached p99 3.0 cm/yr, max 19.2.
 
 ### Phase C findings: the edge law (normal part)
 
@@ -1285,17 +1393,16 @@ separate.
 - **Neighbour exchange at 50 km:** do capped forces plus range-based edge turnover
   give sensible ductile shear zones, or does the deviatoric part need a per-edge
   outlet (a zero-mean rest offset, which would amend rest = aᵢ + aⱼ)?
-- **Ductile tension at zero integrity** (phase C): should a broken edge's ductile base
-  still resist separation at its flow stress (the design table; for old ocean ~1700
-  MPa·km, near ridge push) or be weakened by lost integrity too
-  (`ductile_damage_weakening` = 1; consistent with grain-damage shear zones, but
-  then hot new edges, which start at φ = 0, need fast healing to hold ridges
-  together)? Decide before phase D, since it sets what the integrity law must do.
-- **Shear on edges** (phase C deferred): a tangential channel with slip anchors needs
-  a per-particle orientation, so the tangential offset is measured in a frame that
-  rotates with the material and rigid rotation stays free. That is the polar
-  decomposition of the neighbour fit (4.2): bring it forward into phase D, or keep
-  edges central and let shear resistance come from the network?
+- **Ductile tension at zero integrity** (phase C): tuned at integration with the
+  other interaction parameters (`ductile_damage_weakening`). New hot edges are held
+  by their surroundings and heal fast; columns made in a highly dynamic setting
+  should not cohere (transform faults cut ridges).
+- **Shear on edges** (phase C): a tangential channel with slip anchors needs a
+  per-particle orientation (the polar decomposition of the neighbour fit, 4.2) so
+  rigid rotation stays free. Not scheduled; revisit if integration shows it matters.
+- **GPE force vs basal drag** (phase D): the force is physical but, against today's
+  drag, metres per year at margins. Calibrate drag, edge tension and this force
+  together at integration.
 - **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity like the contact
   clamp, which has been tolerated so far. Check at integration that dense yielding
   zones do not slow or break convergence.

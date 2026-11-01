@@ -11,7 +11,7 @@ import { BUILD_INFO } from '../build-info.js';
 import { eastNorth, latLonDeg, sampleToMesh } from './sampling.js';
 import { readZip, writeZip } from './zip.js';
 
-export const SCHEMA = { name: 'plate-player-record', version: '0.3.0' };
+export const SCHEMA = { name: 'plate-player-record', version: '0.4.0' };
 const EARTH_RADIUS_KM = 6371;
 
 /** Field series written for every sample. Order here is order in the manifest. */

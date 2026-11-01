@@ -120,12 +120,27 @@ envelope:
   where it is ductile.
 
 So an edge at integrity 0 between cold columns only pushes (a contact), and its
-brittle slices crack in tension and close exactly at touching. Rest length is always
-the sum of the two apothems. Within a step the law is linear, with the total force
-clamped to the depth-integrated caps. Only the normal (push–pull) part exists:
-tangential friction needs a per-particle orientation first. Damage and healing are
-still stand-ins until design phase D: mean stress beyond an Arrhenius-weakened yield
-lowers integrity, and heat slowly restores it, except at 0.
+brittle slices crack in tension and close exactly at touching. Within a step the law is
+linear, with the total force clamped to the depth-integrated caps. Only the normal
+(push–pull) part exists: tangential friction needs a per-particle orientation first.
+
+**Irreversible step** (`law.wgsl`, `shaders/compute/flow.wgsl`; references
+`src/edges/law.js`, `src/columns/flow.js`). After each solve:
+- **Inelastic strain.** Each edge records the strain its stiffest slice could not
+  store elastically.
+- **Volumetric flow.** Each column changes its reference area by twice the mean of
+  its edges' inelastic strain, at fixed crust volume. Shortening past the strength
+  limits thickens crust (and isostasy raises it); stretching thins it; pure shear
+  leaves areas alone. The rest length (sum of apothems) follows the area. Edges
+  remember the pair's distance, not its strain, so that change adds no stress.
+- **Integrity.** Edges lose integrity in proportion to the plastic work done on them,
+  and heal toward 1 with a thermally activated time: 0.1 Myr at mantle temperature,
+  ~50 Myr at 1200 K, never in cold lithosphere.
+- **GPE push** (ridge push and plateau collapse): columns are pushed down the
+  gradient of gravitational potential energy. It is implemented but **off by
+  default** (`gpe_force_factor` = 0): against today's basal drag it pushes margin
+  columns at metres per year, so it waits for calibration.
+
 
 **Motion** (`shaders/compute/solver.wgsl`). Overdamped extended position-based
 dynamics (XPBD), with basal drag in the role of mass: each step minimises
@@ -204,9 +219,10 @@ plate-player/
 │   │   └── random.js          seeded RNG, uniform points on the sphere
 │   ├── edges/
 │   │   ├── topology.js        CPU reference for edge existence, slot order, storage checks
-│   │   └── law.js             CPU reference for the edge law: depth slices, Maxwell stresses, caps
+│   │   └── law.js             CPU reference for the edge law: slices, Maxwell stresses, caps, integrity
 │   ├── columns/
-│   │   └── profile.js         CPU reference for column profiles: geotherm, Airy, GPE, strength
+│   │   ├── profile.js         CPU reference for column profiles: geotherm, Airy, GPE, strength
+│   │   └── flow.js            CPU reference for volumetric flow and the GPE push
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
@@ -224,7 +240,7 @@ plate-player/
 │   │   ├── renderer.js        render pipelines and draw calls
 │   │   └── camera.js          orbit camera
 │   └── shaders/
-│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver, edges, profile, law
+│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver, edges, profile, law, flow
 │       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
 ├── test/
 │   ├── unit.test.mjs          CPU tests (Node only)
@@ -433,8 +449,10 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [x] ~~Contacts were rebuilt every step.~~ Phase A: one kind of edge, keyed by pair,
       persistent while in range (design 3.2). Stress-based subduction initiation,
       suturing and friction can now keep state on the edge.
-- [ ] **Plates never weld.** Colliding plates don't suture, and edges at zero
-      integrity never heal. Suturing is design phase F.
+- [ ] **Cold plates never weld.** Edges heal only where hot (phase D), so colliding
+      cold plates don't suture. Suturing is design phase F.
+- [ ] **No ridge push yet.** The GPE push exists but is off until basal drag is
+      calibrated against it (design, phase D findings).
 - [ ] **Subduction rarely starts.** The trigger is a deep overlap (34% of an apothem
       sum), which stiff contacts now prevent; converging plates lock instead. Design §6
       replaces it with a stress-based rule on the (now persistent) edges (phase F).

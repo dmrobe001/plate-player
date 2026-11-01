@@ -17,6 +17,7 @@ import { BUILD_INFO } from './build-info.js';
 import { ColumnProfile, Edge, Particle, SLOTS, unpack } from './gpu/layout.js';
 import * as profile from './columns/profile.js';
 import * as law from './edges/law.js';
+import * as flow from './columns/flow.js';
 import * as topology from './edges/topology.js';
 import { CAPACITY } from './sim/simulation.js';
 
@@ -229,6 +230,7 @@ async function main() {
       profile,
       profiles: () => exclusive(() => inspectProfiles(sim)),
       law,
+      flow,
     },
   };
 

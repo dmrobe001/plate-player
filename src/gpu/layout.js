@@ -126,12 +126,16 @@ export const Edge = defineStruct('Edge', [
   ['integrity', 'f32'],         // 0..1: 0 = no cohesion (pushes only), 1 = intact
   ['lambda', 'f32'],            // XPBD multiplier accumulated over this step's iterations
   ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
-  ['yield_stress_mpa', 'f32'],   // stand-in damage rule, until phase D
   ['stress_normal_mpa', 'f32'], // diagnostic: depth-averaged normal stress, + tension, - compression
   ['stress_shear_mpa', 'f32'],  // diagnostic: magnitude (0 until shear exists)
   // Edge law (design 4.5, phase C; src/edges/law.js). State:
-  ['strain', 'f32'],            // normal strain (|x_b - x_a| - rest) / rest at the last update
+  ['length', 'f32'],            // |x_b - x_a| (unit sphere) at the last update: strain increments are
+                                //   measured from it, so a change of rest length (area_ref) adds no stress
   ['slice_stress_mpa', 'array<f32, 8>'], // Maxwell stress per depth slice of the shared interval, top down
+  // Diagnostics of the last update (design 4.7, phase D):
+  ['strain', 'f32'],            // (|x_b - x_a| - rest) / rest
+  ['inelastic_strain', 'f32'],  // strain increment not stored elastically (feeds area_ref)
+  ['work_mpa_km', 'f32'],       // plastic work (feeds damage)
   // Derived each step by edges_law, for the solve:
   ['stiffness', 'f32'],         // effective stiffness / (E * stiffness_reference_km), in [0, 1]
   ['reference_gap', 'f32'],     // gap C (unit sphere) at which the linearised force is zero

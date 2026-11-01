@@ -12,6 +12,7 @@ import solverWGSL from '../shaders/compute/solver.wgsl';
 import edgesWGSL from '../shaders/compute/edges.wgsl';
 import profileWGSL from '../shaders/compute/profile.wgsl';
 import lawWGSL from '../shaders/compute/law.wgsl';
+import flowWGSL from '../shaders/compute/flow.wgsl';
 
 export const CAPACITY = {
   maxParticles: 25000,
@@ -104,7 +105,7 @@ export class Simulation {
 
   #createPipelines(onError) {
     const { device, buffers } = this;
-    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL].join('\n');
+    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL, flowWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
     const order = ['grid', 'adjacency', 'particles', 'edges', 'particlePool', 'edgePool', 'hashGrid', 'deltas', 'solver', 'profiles'];
@@ -132,7 +133,7 @@ export class Simulation {
     const layout = device.createPipelineLayout({ bindGroupLayouts: [memoryLayout, uniformLayout] });
     const entryPoints = [
       'crust_locate', 'column_profile',
-      'crust_thermo_isostasy', 'crust_refresh_derived', 'crust_edge_healing',
+      'crust_thermo_isostasy', 'crust_refresh_derived', 'columns_flow', 'columns_gpe_force',
       'crust_accumulation', 'crust_commit_splits', 'crust_rewire_edges', 'crust_clean_split',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
       'edges_begin', 'edges_prune', 'edges_note_listed', 'edges_create', 'edges_finish', 'edges_law', 'edges_maxwell',
@@ -199,11 +200,11 @@ export class Simulation {
       eu[base + eo.particle_b] = B.b[k];
       eu[base + eo.is_active] = 1;
       ef[base + eo.integrity] = 1 - B.damage[k];
-      ef[base + eo.yield_stress_mpa] = state.yieldStressMPa;
       // Elastic loading from the rest length (apothem sum), in every slice.
       const i = B.a[k], j = B.b[k];
       const d = Math.hypot(...[0, 1, 2].map((c) => P.position[3 * i + c] - P.position[3 * j + c]));
       const rest = P.apothem[i] + P.apothem[j];
+      ef[base + eo.length] = d;
       ef[base + eo.strain] = (d - rest) / rest;
       ef.fill(this.params.crust_youngs_modulus_gpa * 1000 * ((d - rest) / rest), base + eo.slice_stress_mpa, base + eo.slice_stress_mpa + 8);
     }
@@ -281,7 +282,6 @@ export class Simulation {
     // growth and splitting
     run('column_profile', crust);
     run('crust_thermo_isostasy', crust);
-    run('crust_edge_healing', edges);
     run('crust_accumulation', crust);
     run('crust_commit_splits', 1);
     run('crust_rewire_edges', edges);
@@ -299,6 +299,7 @@ export class Simulation {
     run('edges_note_listed', crust);
     run('edges_create', crust);      // new pairs in range
     run('edges_finish', crust);      // edge counts, angle-sorted slots, solver iterates
+    run('columns_gpe_force', crust); // GPE push into the predicted positions (design 4.6)
     run('edges_law', edges);         // this step's linear force law and caps (design 4.5)
     for (let i = 0; i < this.params.solver_iterations; i++) {
       if (i > 0 && i % ITERATIONS_PER_SUBMIT === 0) {
@@ -312,7 +313,9 @@ export class Simulation {
       run('crust_chebyshev_combine', crust);
       run('solver_next_iteration', 1);
     }
-    run('edges_maxwell', edges);     // slice stresses advance, capped; stand-in damage
+    run('crust_clear_deltas', crust);
+    run('edges_maxwell', edges);     // slice stresses, inelastic strain, plastic work, integrity (design 4.5, 4.7)
+    run('columns_flow', crust);      // volumetric flow at fixed crust volume (design 4.7)
     run('crust_integrate', crust);
     submit();
     this.steps++;

@@ -520,3 +520,79 @@ test('edge law: a cold pair without integrity carries no tension, closes exactly
   const unload = law.maxwellUpdate(crush.stored, intact, 1e-5, p);
   assert.ok(Math.abs(unload.actual[0] - (-intact.slices[0].comp + E * 1e-5) * intact.slices[0].r) < 1e-6);
 });
+
+// --- Irreversible step (design 4.6, 4.7, phase D) ---------------------------
+import * as flow from '../src/columns/flow.js';
+
+test('irreversible: inelastic strain is zero below yield, the full increment at yield, and plastic work = cap x plastic strain', () => {
+  const E0 = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
+  const p = { ...uniform(1e6 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa }; // cold: every slice brittle and elastic
+  const E = p.crust_youngs_modulus_gpa * 1000;
+  const edge = law.edgeSlices(oldOcean(-3), oldOcean(-3), 1, p);
+  const below = law.maxwellUpdate(new Array(8).fill(0), edge, -1e-4, p);
+  assert.ok(Math.abs(below.inelastic) < 1e-9 && below.work === 0, `below yield: ${below.inelastic}, ${below.work}`);
+  // Load every slice to its compression cap, then compress further.
+  const atCap = edge.slices.map((s) => -s.comp);
+  const more = law.maxwellUpdate(atCap, edge, -2e-4, p);
+  assert.ok(Math.abs(more.inelastic / -2e-4 - 1) < 1e-6, `at yield: inelastic ${more.inelastic}`);
+  const expectWork = edge.slices.reduce((a, s) => a + s.comp * 2e-4 * s.dz, 0);
+  assert.ok(Math.abs(more.work / expectWork - 1) < 1e-4, `work ${more.work} vs ${expectWork}`); // r = 1 - 1e-6: a little creep is not plastic
+  // A crack opening is recoverable: no inelastic strain, but work against cohesion.
+  const open = law.maxwellUpdate(new Array(8).fill(0), edge, 1e-3, p);
+  assert.ok(Math.abs(open.inelastic) < 1e-9);
+  assert.ok(Math.abs(open.work / (p.cohesion_mpa * 1e-3 * edge.overlap) - 1) < 1e-6);
+  void E;
+});
+
+test('irreversible: pure shear of a hexagon of edges leaves the area unchanged; uniform compression shrinks it at twice the strain', () => {
+  // A column's 6 edges at 0, 60, ..., 300 degrees under the strain field
+  // diag(+e, -e): edge strain e cos 2 theta. With compression elastic and
+  // tension cracking, no edge has inelastic strain. Then all edges at the
+  // compression cap under uniform shortening.
+  const E0 = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
+  const p = { ...uniform(1e6 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa };
+  const edge = law.edgeSlices(oldOcean(-3), oldOcean(-3), 1, p);
+  const e = 1e-3;
+  const shear = [0, 60, 120, 180, 240, 300].map((deg) => law.maxwellUpdate(new Array(8).fill(0), edge, e * Math.cos(2 * deg * Math.PI / 180), p));
+  const col = { area: 1e-3, thicknessKm: 7 };
+  const sheared = flow.columnFlow(col, shear.map((u) => u.inelastic));
+  assert.ok(Math.abs(sheared.area / col.area - 1) < 1e-9, `pure shear changed the area by ${sheared.area / col.area - 1}`);
+  assert.ok(shear.some((u) => u.work > 0), 'the stretched edges should crack (work against cohesion)');
+  const atCap = edge.slices.map((s) => -s.comp);
+  const squeezed = flow.columnFlow(col, new Array(6).fill(law.maxwellUpdate(atCap, edge, -e, p).inelastic));
+  assert.ok(Math.abs(Math.log(squeezed.area / col.area) - -2 * e) < 1e-9);
+  assert.ok(Math.abs(squeezed.area * squeezed.thicknessKm - col.area * col.thicknessKm) < 1e-15, 'volume changed');
+});
+
+test('irreversible: integrity falls by work / W_D and heals exponentially with an Arrhenius time', () => {
+  const p = PARAMS;
+  // Cold: no healing; damage is exactly proportional to work.
+  assert.ok(Math.abs(law.integrityStep(0.8, 10, 400, p) - (0.8 - 10 / p.damage_work_mpa_km)) < 1e-12);
+  assert.equal(law.integrityStep(0.1, 1e3, 400, p), 0);
+  // Hot: 1 - phi decays as exp(-dt / tau(T)), tau = heal_time at mantle temperature.
+  let phi = 0;
+  for (let n = 0; n < 10; n++) phi = law.integrityStep(phi, 0, p.mantle_temp, p);
+  assert.ok(Math.abs(1 - phi - Math.exp(-10 * p.dt_crust_myr / p.heal_time_myr)) < 1e-12);
+  const ratio = law.healTimeMyr(1200, p) / law.healTimeMyr(1400, p);
+  assert.ok(Math.abs(Math.log(ratio) - (p.heal_activation_kj / p.gas_constant) * (1 / 1200 - 1 / 1400)) < 1e-9);
+  console.log(`  healing time: ${law.healTimeMyr(1600, p)} Myr at 1600 K, ${law.healTimeMyr(1200, p).toFixed(0)} Myr at 1200 K, ${law.healTimeMyr(900, p).toExponential(1)} Myr at 900 K`);
+});
+
+test('irreversible: the least-squares gradient is exact for linear fields; the GPE push runs down it', () => {
+  const xi = [0.2, -0.1, Math.sqrt(1 - 0.05)];
+  const [e1, e2] = flow.tangentBasis(xi);
+  const g = [3, -5]; // per unit length in the tangent basis
+  const lin = (x) => 7 + [0, 1, 2].reduce((a, c) => a + (g[0] * e1[c] + g[1] * e2[c]) * (x[c] - xi[c]), 0);
+  const rng = mulberry32(3);
+  const nbrs = Array.from({ length: 5 }, () => {
+    const t = [0.03 * (rng() - 0.5), 0.03 * (rng() - 0.5)];
+    const x = [0, 1, 2].map((c) => xi[c] + t[0] * e1[c] + t[1] * e2[c]);
+    return { x, f: lin(x) };
+  });
+  const grad = flow.gradient(xi, 7, nbrs);
+  const want = [0, 1, 2].map((c) => g[0] * e1[c] + g[1] * e2[c]);
+  assert.ok(Math.hypot(...grad.map((v, c) => v - want[c])) < 1e-9 * Math.hypot(...want));
+  assert.equal(flow.gradient(xi, 7, nbrs.slice(0, 1)), null);
+  const dx = flow.gpeDisplacement(grad, 100, { ...PARAMS, gpe_force_factor: 1 });
+  assert.ok(dx.every((v, c) => Math.sign(v) === -Math.sign(grad[c]) || grad[c] === 0), 'push should run down the gradient');
+});

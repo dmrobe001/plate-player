@@ -374,15 +374,15 @@ test('edge law on the GPU matches the CPU reference: linearised law, caps and sl
       const colA = Pr.columnOfParticle(after.P, 2 * k), colB = Pr.columnOfParticle(after.P, 2 * k + 1);
       const edge = L.edgeSlices(colA, colB, after.E.integrity[e], p);
       const stress0 = Array.from(before.E.slice_stress_mpa.subarray(8 * e, 8 * e + 8));
-      const lin = L.linearize(stress0, edge, before.E.strain[e], p);
-      const rest = after.P.apothem[2 * k] + after.P.apothem[2 * k + 1];
+      const rest = before.P.apothem[2 * k] + before.P.apothem[2 * k + 1]; // during the step (columns_flow may change it at the end)
+      const lin = L.linearize(stress0, edge, (before.E.length[e] - rest) / rest, p);
       const bounds = L.lambdaBounds(lin, rest, p);
       note('stiffness', after.E.stiffness[e], lin.stiffness, 1);
       note('reference_gap', after.E.reference_gap[e], lin.zeroStrain * rest, Math.max(Math.abs(lin.zeroStrain * rest), 1e-3 * rest));
       note('lambda_min', after.E.lambda_min[e], bounds.lambdaMin, Math.max(bounds.lambdaMax, 1e-12));
       note('lambda_max', after.E.lambda_max[e], bounds.lambdaMax, Math.max(bounds.lambdaMax, 1e-12));
       note('overlap_km', after.E.overlap_km[e], edge.overlap, 100);
-      const upd = L.maxwellUpdate(stress0, edge, after.E.strain[e] - before.E.strain[e], p);
+      const upd = L.maxwellUpdate(stress0, edge, (after.E.length[e] - before.E.length[e]) / rest, p);
       for (let s = 0; s < 8; s++) note('slice_stress_mpa', after.E.slice_stress_mpa[8 * e + s], upd.stored[s], 70);
       note('stress_normal_mpa', after.E.stress_normal_mpa[e], upd.meanStress, 70);
       summary.push(`${q[0][0]}/${q[1][0]} km, strain ${q[2]}, integrity ${q[3]}: stiffness ${lin.stiffness.toFixed(3)}, stress ${upd.meanStress.toFixed(1)} MPa`);
@@ -537,10 +537,10 @@ test('edge storage stays consistent and matches the reference under random motio
   // and sorted, no duplicate pairs, free list exact, and the edge set equal to
   // the CPU reference's.
   const page = await openPage({ small: true });
-  const out = await page.evaluate(async (helperSrc) => {
+  const out = await page.evaluate(async ([helperSrc, elastic]) => {
     const H = eval(helperSrc);
     const a = 0.0175, pts = H.patch(6, a), n = pts.length;
-    await plate.setParams({ mantle_drive: 0, solver_iterations: 0 });
+    await plate.setParams({ ...elastic, damage_work_mpa_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing or area change
     await plate.loadState(H.state(pts, a));
     let seed = 12345;
     const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
@@ -566,7 +566,7 @@ test('edge storage stays consistent and matches the reference under random motio
       res.steps++;
     }
     return res;
-  }, PATCH_HELPERS);
+  }, [PATCH_HELPERS, ELASTIC]);
   assert.deepEqual(page.errors, []);
   await page.close();
   console.log(`  ${out.steps} steps: ${out.minEdges}-${out.maxEdges} edges, ${out.created} created and ${out.removed} removed after step 0`);
@@ -586,13 +586,13 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   // step the reference says they leave range, the others stay as they were.
   // Moved back, the pair gets a fresh edge: no cohesion and no history.
   const page = await openPage({ small: true });
-  const out = await page.evaluate(async (helperSrc) => {
+  const out = await page.evaluate(async ([helperSrc, elastic]) => {
     const H = eval(helperSrc);
     const a = 0.0175, pts = H.patch(1, a), n = pts.length; // 7 columns; index 3 is the centre
     const d = (i, j) => Math.hypot(...pts[i].map((v, c) => v - pts[j][c]));
     const bonds = [];
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (d(i, j) < 2.1 * a) bonds.push([i, j, 0.3]);
-    await plate.setParams({ mantle_drive: 0, solver_iterations: 0 });
+    await plate.setParams({ ...elastic, damage_work_mpa_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing or area change
     await plate.loadState(H.state(pts, a, bonds));
 
     // Distinct values in every carried field.
@@ -643,7 +643,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
     await step('return');
     const returned = snapshotEdges(r);
     return { start, afterJitter, afterPull, returned, drops, problems, mismatches, time: plate.sim.timeMyr };
-  }, PATCH_HELPERS);
+  }, [PATCH_HELPERS, ELASTIC]);
   assert.deepEqual(page.errors, []);
   await page.close();
 
@@ -673,6 +673,157 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
     assert.ok(e.born > 0, `born_myr ${e.born}`);
   }
   assert.equal(out.returned.length, 12);
+});
+
+// Cold, brittle columns for the volumetric-flow tests: no creep at all, so
+// slices are pure springs up to their Byerlee caps (cohesion as default).
+const BRITTLE = { olivine_log10_a: -60, diabase_log10_a: -60, quartzite_log10_a: -60 };
+
+test('volumetric flow: uniform compression thickens at the predicted rate at constant volume; pure shear changes no area', { timeout: 300_000 }, async () => {
+  // Phase D (design 9). A 19-column patch of old ocean, bonded, moved by
+  // hand (no solve). (1) Uniform shortening by 0.4% per step: once every
+  // slice sits at its compression cap, all further shortening is inelastic,
+  // so each column's area shrinks by 2 x 0.4% per step and its crust
+  // thickens inversely, with total crust volume constant; integrity falls by
+  // exactly the logged plastic work / W_D (cold: no healing). (2) Pure shear
+  // (x stretched, y shortened by 0.02% per step) below the compression cap:
+  // stretched edges crack, others stay elastic, and no area changes.
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async ([helperSrc, brittle]) => {
+    const H = eval(helperSrc);
+    const a = 0.0175, pts = H.patch(2, a), n = pts.length;
+    const d = (i, j) => Math.hypot(...pts[i].map((v, c) => v - pts[j][c]));
+    const bonds = [];
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (d(i, j) < 2.1 * a) bonds.push([i, j, 0]);
+    const centre = pts.findIndex((p) => Math.hypot(p[0], p[1]) < 1e-9);
+    const WD = 1e5;
+    await plate.setParams({ ...brittle, damage_work_mpa_km: WD, gpe_force_factor: 0, mantle_drive: 0, solver_iterations: 0 });
+    const volume = (r) => { let v = 0; for (let i = 0; i < n; i++) v += r.P.thickness_km[i] * r.P.surface_area[i]; return v; };
+
+    // (1) Uniform shortening.
+    await plate.loadState(H.state(pts, a, bonds));
+    const delta = 0.004;
+    const rows = [];
+    const phiExpected = new Map();
+    let r = await plate.debug.edges();
+    const v0 = volume(r);
+    for (const e of r.pairs.values()) phiExpected.set(e, 1);
+    for (let s = 1; s <= 12; s++) {
+      const k = (1 - delta) ** s;
+      H.move(pts.map((p) => [p[0] * k, p[1] * k, p[2]]));
+      await plate.runSteps(1);
+      r = await plate.debug.edges();
+      for (const [e, phi] of phiExpected) phiExpected.set(e, Math.max(phi - r.E.work_mpa_km[e] / WD, 0));
+      rows.push({ s, h: r.P.thickness_km[centre], area: r.P.surface_area[centre], volume: volume(r) });
+    }
+    let phiErr = 0, phiMin = 1;
+    for (const [e, phi] of phiExpected) { phiErr = Math.max(phiErr, Math.abs(r.E.integrity[e] - phi)); phiMin = Math.min(phiMin, phi); }
+
+    // (2) Pure shear.
+    await plate.loadState(H.state(pts, a, bonds));
+    r = await plate.debug.edges();
+    const area0 = Array.from(r.P.surface_area.subarray(0, n));
+    const ds = 2e-4;
+    const work = new Map();
+    for (let s = 1; s <= 5; s++) {
+      H.move(pts.map((p) => [p[0] * (1 + ds) ** s, p[1] * (1 - ds) ** s, p[2]]));
+      await plate.runSteps(1);
+      r = await plate.debug.edges();
+      for (const [key, e] of r.pairs) work.set(key, (work.get(key) ?? 0) + r.E.work_mpa_km[e]);
+    }
+    let areaChange = 0;
+    for (let i = 0; i < n; i++) areaChange = Math.max(areaChange, Math.abs(Math.log(r.P.surface_area[i] / area0[i])));
+    const byAngle = { stretched: 0, other: 0, stretchedWork: Infinity, otherWork: 0 };
+    for (const [key, w] of work) {
+      const [i, j] = key.split(',').map(Number);
+      const along = Math.abs(pts[i][1] - pts[j][1]) < 1e-9; // edges along x are stretched
+      if (along) { byAngle.stretched++; byAngle.stretchedWork = Math.min(byAngle.stretchedWork, w); }
+      else { byAngle.other++; byAngle.otherWork = Math.max(byAngle.otherWork, w); }
+    }
+    return { rows, v0, phiErr, phiMin, areaChange, byAngle, delta };
+  }, [PATCH_HELPERS, BRITTLE]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+
+  const at = (s) => out.rows.find((x) => x.s === s);
+  const measured = Math.log(at(12).h / at(6).h), expected = -2 * 6 * Math.log(1 - out.delta);
+  console.log(`  uniform shortening 0.4%/step, steps 6-12: centre crust thickens by ln ${measured.toFixed(4)}, predicted ${expected.toFixed(4)}`);
+  assert.ok(Math.abs(measured / expected - 1) < 0.03, `thickening ${measured} vs ${expected}`);
+  for (const x of out.rows) assert.ok(Math.abs(x.volume / out.v0 - 1) < 1e-5, `step ${x.s}: volume ${x.volume} vs ${out.v0}`);
+  console.log(`  integrity: worst difference from 1 - sum(work) / W_D ${out.phiErr.toExponential(1)} (lowest ${out.phiMin.toFixed(4)})`);
+  assert.ok(out.phiErr < 1e-4 && out.phiMin < 0.99);
+  console.log(`  pure shear: largest area change ${out.areaChange.toExponential(1)}; work on ${out.byAngle.stretched} stretched edges >= ${out.byAngle.stretchedWork.toFixed(2)}, on ${out.byAngle.other} others <= ${out.byAngle.otherWork}`);
+  assert.ok(out.areaChange < 1e-6);
+  assert.ok(out.byAngle.stretchedWork > 0 && out.byAngle.otherWork === 0);
+});
+
+test('below yield nothing irreversible happens; the GPE push matches the reference', { timeout: 300_000 }, async () => {
+  // Phase D (design 9). (1) A bonded patch of old ocean with real profiles,
+  // slightly jittered, solved for 30 steps (no mantle flow): no plastic work,
+  // integrity stays 1, areas do not drift. (2) A patch with an age ramp across
+  // it (GPE falls with age): one step with no solve moves each column by the
+  // reference's push down the least-squares GPE gradient (flow.js).
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async (helperSrc) => {
+    const H = eval(helperSrc);
+    const a = 0.0175, pts = H.patch(2, a), n = pts.length;
+    const d = (i, j) => Math.hypot(...pts[i].map((v, c) => v - pts[j][c]));
+    const bonds = [];
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (d(i, j) < 2.1 * a) bonds.push([i, j, 0]);
+    await plate.setParams({ mantle_drive: 0 });
+    let seed = 5;
+    const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
+    // The flat-built patch is pre-stretched ~3e-4 by the sphere's curvature
+    // (~25 MPa, above cohesion): load it, declare that state stress-free (as
+    // the generated planet is), then jitter by strains ~1e-5 (~1 MPa), far
+    // below the 20 MPa cohesion even after the hot base's load moves to the lid.
+    await plate.loadState(H.state(pts, a, bonds));
+    {
+      const E = plate.layout.Edge, buf = (await plate.readBuffers(['edges'])).edges, f = new Float32Array(buf);
+      bonds.forEach((_, k) => { f.fill(0, E.words * k + E.offsets.slice_stress_mpa, E.words * k + E.offsets.slice_stress_mpa + 8); });
+      plate.sim.device.queue.writeBuffer(plate.sim.buffers.edges, 0, buf);
+    }
+    H.move(pts.map((p) => p.map((v) => v + 2e-5 * a * rand())));
+    let r = await plate.debug.edges();
+    const area0 = Array.from(r.P.surface_area.subarray(0, n));
+    await plate.runSteps(30);
+    r = await plate.debug.edges();
+    let work = 0, phi = 1, areaChange = 0;
+    for (const e of r.pairs.values()) { work = Math.max(work, r.E.work_mpa_km[e]); phi = Math.min(phi, r.E.integrity[e]); }
+    for (let i = 0; i < n; i++) areaChange = Math.max(areaChange, Math.abs(Math.log(r.P.surface_area[i] / area0[i])));
+
+    // (2) GPE push (off by default until integration; on here).
+    await plate.setParams({ solver_iterations: 0, gpe_force_factor: 1 });
+    const st = H.state(pts, a, bonds);
+    st.particles.age = Float32Array.from(pts, (p) => 30 + 300 * p[0]); // 9 .. 51 Myr across the patch
+    await plate.loadState(st);
+    await plate.runSteps(1);
+    r = await plate.debug.edges();
+    const G = (await plate.debug.profiles()).G;
+    const F = plate.debug.flow, p = plate.sim.params;
+    const nbrs = new Map();
+    for (const key of r.pairs.keys()) { const [i, j] = key.split(',').map(Number); for (const [u, v] of [[i, j], [j, i]]) (nbrs.get(u) ?? nbrs.set(u, []).get(u)).push(v); }
+    let worst = 0, mean = 0;
+    for (let i = 0; i < n; i++) {
+      const x0 = pts[i].map((v) => v / Math.hypot(...pts[i]));
+      const grad = F.gradient(x0, G.gpe_mpa_km[i], (nbrs.get(i) ?? []).map((j) => ({ x: pts[j].map((v) => v / Math.hypot(...pts[j])), f: G.gpe_mpa_km[j] })));
+      if (!grad) continue;
+      const want = F.gpeDisplacement(grad, G.lithosphere_km[i], p);
+      const got = [0, 1, 2].map((c) => r.P.position[4 * i + c] - x0[c]);
+      const size = Math.hypot(...want);
+      worst = Math.max(worst, Math.hypot(...got.map((v, c) => v - want[c])) / size);
+      mean += size / n;
+    }
+    return { work, phi, areaChange, worst, meanKmPerStep: mean * 6371, dt: p.dt_crust_myr };
+  }, PATCH_HELPERS);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  console.log(`  30 steps below yield: max plastic work ${out.work}, min integrity ${out.phi}, largest area change ${out.areaChange.toExponential(1)}`);
+  assert.equal(out.work, 0);
+  assert.equal(out.phi, 1);
+  assert.ok(out.areaChange < 1e-5);
+  console.log(`  GPE push: mean ${out.meanKmPerStep.toFixed(2)} km per step (${(out.meanKmPerStep * 1e5 / (out.dt * 1e6)).toFixed(0)} cm/yr for a free column); worst relative difference from the reference ${out.worst.toExponential(1)}`);
+  assert.ok(out.worst < 1e-2);
 });
 
 test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 , ...PLANET }, async () => {

@@ -1,4 +1,4 @@
-// Crust thermal state, isostasy (the free radial coordinate) and edge healing.
+// Crust thermal state and isostasy (the free radial coordinate).
 
 @compute @workgroup_size(64)
 fn crust_thermo_isostasy(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -69,15 +69,4 @@ fn crust_refresh_derived(@builtin(global_invocation_id) id: vec3<u32>) {
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     update_density(idx);
     if ((bitcast<u32>(particles[idx].elevation) & 0x7f800000u) == 0x7f800000u) { particles[idx].elevation = airy_elevation(idx); }
-}
-
-// Healing restores integrity, faster when hot. An edge at zero integrity
-// does not heal (no re-welding until suturing, phase F); stand-in until the
-// integrity law of phase D.
-@compute @workgroup_size(64)
-fn crust_edge_healing(@builtin(global_invocation_id) id: vec3<u32>) {
-    let c_idx = id.x;
-    if (c_idx >= sim.max_edges || edges[c_idx].is_active == 0u || edges[c_idx].integrity <= 0.0) { return; }
-    let rate = 100000.0 * arrhenius(edge_temperature(edges[c_idx]));
-    edges[c_idx].integrity = clamp(edges[c_idx].integrity + rate * sim.dt_crust_myr, 0.0, 1.0);
 }

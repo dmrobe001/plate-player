@@ -86,18 +86,9 @@ fn hash_index(c: vec3i) -> u32 {
     return u32(c.x) + u32(c.y) * d + u32(c.z) * d * d;
 }
 
-// Arrhenius factor exp(-Ea / (R T)), used by healing.
-fn arrhenius(temp: f32) -> f32 {
-    let exponent = -sim.activation_energy / (sim.gas_constant * max(temp, 1.0));
-    return select(0.0, exp(exponent), exponent > -50.0);
-}
-
 // An edge's rest length is always the sum of its particles' apothems, whatever
 // changed them (growth, splitting, ...).
 fn rest_length(c: Edge) -> f32 {
     return particles[c.particle_a].apothem + particles[c.particle_b].apothem;
 }
 
-fn edge_temperature(c: Edge) -> f32 {
-    return max((particles[c.particle_a].temperature + particles[c.particle_b].temperature) * 0.5, 1.0);
-}

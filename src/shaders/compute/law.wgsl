@@ -6,7 +6,10 @@
 //                  step's linear force law (stiffness, zero-force gap) and the
 //                  multiplier bounds (depth-integrated caps)
 //   edges_maxwell  after the solve: advance each slice's Maxwell stress by the
-//                  step's strain, cap it, store it; mean stress; stand-in damage
+//                  step's strain, cap it, store it; mean stress; then the
+//                  irreversible part (phase D): inelastic strain (accumulated
+//                  on both columns for volumetric flow, flow.wgsl), plastic
+//                  work, and the integrity law (damage by work, thermal healing)
 
 const EDGE_SLICES: u32 = 8u;
 
@@ -32,6 +35,7 @@ struct EdgeSlices {
     comp: array<f32, 8>,    // caps, MPa
     tens: array<f32, 8>,
     cracks: array<u32, 8>,  // 1 = brittle (cracks in tension), 0 = ductile (flows)
+    temp: array<f32, 8>,    // K, mean of the two columns at this depth
 }
 
 fn edge_slices(a: u32, b: u32, phi: f32) -> EdgeSlices {
@@ -62,6 +66,7 @@ fn edge_slices(a: u32, b: u32, phi: f32) -> EdgeSlices {
         s.comp[k] = min(brittle_comp, ductile_cap);
         s.tens[k] = select(ductile_cap * (1.0 - sim.ductile_damage_weakening * (1.0 - phi)), phi * sim.cohesion_mpa, brittle);
         s.cracks[k] = select(0u, 1u, brittle);
+        s.temp[k] = 0.5 * (temp_at(ca, da) + temp_at(cb, db));
     }
     return s;
 }
@@ -87,44 +92,72 @@ fn edges_law(@builtin(global_invocation_id) id: vec3<u32>) {
     let rest = rest_length(c);
     let scale = sim.bond_rate_myr_inv * sim.dt_crust_myr * rest / (E * sim.stiffness_reference_km);
     edges[e].stiffness = keff / (E * sim.stiffness_reference_km);
-    edges[e].reference_gap = (c.strain - S0 / keff) * rest;
+    // Zero-force length: the law is S = S0 + K (d - length) / rest.
+    edges[e].reference_gap = c.length - S0 / keff * rest - rest;
     edges[e].lambda_min = -scale * stens;
     edges[e].lambda_max = scale * scomp;
     edges[e].overlap_km = s.overlap;
 }
 
-// After the solve; replaces the stand-in stress rule. Damage is still the
-// stand-in (overstress of the mean normal stress vs an Arrhenius yield)
-// until the integrity law of phase D.
+// After the solve (CPU reference: law.js, maxwellUpdate and integrityStep).
+// Expects particle_deltas cleared: it accumulates each edge's inelastic
+// strain on both columns (fixed point in dx, count in count) for columns_flow.
 @compute @workgroup_size(64)
 fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
     let e = id.x;
     if (e >= sim.max_edges || edges[e].is_active == 0u) { return; }
     let c = edges[e];
     let rest = rest_length(c);
-    let strain = (distance(particles[c.particle_b].predicted_pos.xyz, particles[c.particle_a].predicted_pos.xyz) - rest) / rest;
+    let len = distance(particles[c.particle_b].predicted_pos.xyz, particles[c.particle_a].predicted_pos.xyz);
+    let d_strain = (len - c.length) / rest;
     let s = edge_slices(c.particle_a, c.particle_b, c.integrity);
     let E = sim.crust_youngs_modulus_gpa * 1000.0;
     var S = 0.0;
+    var work = 0.0;
+    var inelastic = 0.0;
+    var r_max = -1.0;
+    var w_sum = 0.0;
+    var wt_sum = 0.0;
     for (var k = 0u; k < EDGE_SLICES; k++) {
-        let elastic = c.slice_stress_mpa[k] + E * (strain - c.strain);
+        let elastic = c.slice_stress_mpa[k] + E * d_strain;
         let relaxed = elastic * s.r[k];
         let capped = clamp(relaxed, -s.comp[k], s.tens[k]);
-        var stored = capped;
-        if (relaxed > s.tens[k] && s.cracks[k] == 1u) { stored = elastic - (1.0 / s.r[k] - 1.0) * s.tens[k]; }
-        edges[e].slice_stress_mpa[k] = stored;
+        let crack = relaxed > s.tens[k] && s.cracks[k] == 1u;
+        var kept = capped;
+        if (crack) {
+            kept = elastic - (1.0 / s.r[k] - 1.0) * s.tens[k];
+            work += s.tens[k] * max(d_strain, 0.0) * s.dz;
+        } else if (relaxed != capped) {
+            work += abs(capped * (relaxed - capped) / (E * max(s.r[k], 1e-30))) * s.dz;
+        }
+        edges[e].slice_stress_mpa[k] = kept;
         S += capped * s.dz;
+        // Inelastic strain of the stiffest slice (law.js, maxwellUpdate).
+        if (s.r[k] > r_max) { r_max = s.r[k]; inelastic = d_strain - (kept - c.slice_stress_mpa[k]) / E; }
+        let w = (s.r[k] + 1e-9) * s.dz;
+        w_sum += w;
+        wt_sum += w * s.temp[k];
     }
-    edges[e].strain = strain;
-    let sigma_n = select(0.0, S / s.overlap, s.overlap > 0.0);
-    edges[e].stress_normal_mpa = sigma_n;
+    edges[e].length = len;
+    edges[e].strain = (len - rest) / rest;
+    edges[e].stress_normal_mpa = select(0.0, S / s.overlap, s.overlap > 0.0);
     edges[e].stress_shear_mpa = 0.0;
-    if (c.integrity <= 0.0) { return; }
+    if (!(s.overlap > 0.0)) { inelastic = 0.0; }
+    edges[e].inelastic_strain = inelastic;
+    edges[e].work_mpa_km = work;
 
-    // Stand-in damage (phase D replaces it): overstress lowers integrity.
-    let temp = edge_temperature(c);
-    let y = c.yield_stress_mpa * exp(clamp((sim.activation_energy / sim.gas_constant) * (1.0 / temp - 1.0 / sim.reference_temp), -10.0, 10.0));
-    if (abs(sigma_n) > y) {
-        edges[e].integrity = max(c.integrity - ((abs(sigma_n) - y) / y) * 50.0 * sim.dt_crust_myr, 0.0);
-    }
+    // Volumetric flow: both columns collect this edge's inelastic strain.
+    let fixed = i32(round(inelastic * FIXED_POINT));
+    atomicAdd(&particle_deltas[c.particle_a].dx, fixed);
+    atomicAdd(&particle_deltas[c.particle_a].count, 1i);
+    atomicAdd(&particle_deltas[c.particle_b].dx, fixed);
+    atomicAdd(&particle_deltas[c.particle_b].count, 1i);
+
+    // Integrity law: damage by plastic work, then exact exponential healing
+    // at the temperature of the load-bearing part of the interface.
+    let t_heal = select(sim.mantle_temp, wt_sum / w_sum, w_sum > 0.0);
+    let damaged = max(c.integrity - work / sim.damage_work_mpa_km, 0.0);
+    let exponent = min((sim.heal_activation_kj / sim.gas_constant) * (1.0 / max(t_heal, 1.0) - 1.0 / sim.mantle_temp), 80.0);
+    let tau = sim.heal_time_myr * exp(exponent);
+    edges[e].integrity = 1.0 - (1.0 - damaged) * exp(-sim.dt_crust_myr / tau);
 }
