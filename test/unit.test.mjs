@@ -554,14 +554,13 @@ test('irreversible: pure shear of a hexagon of edges leaves the area unchanged; 
   const edge = law.edgeSlices(oldOcean(-3), oldOcean(-3), 1, p);
   const e = 1e-3;
   const shear = [0, 60, 120, 180, 240, 300].map((deg) => law.maxwellUpdate(new Array(8).fill(0), edge, e * Math.cos(2 * deg * Math.PI / 180), p));
-  const col = { area: 1e-3, thicknessKm: 7 };
+  const col = { area: 1e-3 };
   const sheared = flow.columnFlow(col, shear.map((u) => u.inelastic));
   assert.ok(Math.abs(sheared.area / col.area - 1) < 1e-9, `pure shear changed the area by ${sheared.area / col.area - 1}`);
   assert.ok(shear.some((u) => u.work > 0), 'the stretched edges should crack (work against cohesion)');
   const atCap = edge.slices.map((s) => -s.comp);
   const squeezed = flow.columnFlow(col, new Array(6).fill(law.maxwellUpdate(atCap, edge, -e, p).inelastic));
   assert.ok(Math.abs(Math.log(squeezed.area / col.area) - -2 * e) < 1e-9);
-  assert.ok(Math.abs(squeezed.area * squeezed.thicknessKm - col.area * col.thicknessKm) < 1e-15, 'volume changed');
 });
 
 test('irreversible: integrity falls by work / W_D and heals exponentially with an Arrhenius time', () => {
@@ -595,4 +594,116 @@ test('irreversible: the least-squares gradient is exact for linear fields; the G
   assert.equal(flow.gradient(xi, 7, nbrs.slice(0, 1)), null);
   const dx = flow.gpeDisplacement(grad, 100, { ...PARAMS, gpe_force_factor: 1 });
   assert.ok(dx.every((v, c) => Math.sign(v) === -Math.sign(grad[c]) || grad[c] === 0), 'push should run down the gradient');
+});
+
+// --- area, volume, melt and splits (design 4.8, phase E): CPU reference ----
+import * as area from '../src/columns/area.js';
+import * as volume from '../src/columns/volume.js';
+
+/** Icosphere vertices, jittered by `jitter` x spacing, with apothems varied by +-`spread`. */
+function sphereColumns(subdivisions, { jitter = 0, spread = 0, seed = 1 } = {}) {
+  const v = createIcosphere(subdivisions).vertices;
+  const rng = mulberry32(seed);
+  const spacing = Math.sqrt((4 * Math.PI) / v.length / (Math.sqrt(3) / 2));
+  const positions = new Float64Array(3 * v.length);
+  v.forEach((x, i) => {
+    const y = x.map((c) => c + jitter * spacing * (rng() - 0.5));
+    const l = Math.hypot(...y);
+    positions.set(y.map((c) => c / l), 3 * i);
+  });
+  const apothems = Array.from(v, () => (spacing / 2) * (1 + spread * (rng() - 0.5)));
+  return { positions, apothems, spacing };
+}
+
+test('tessellation: weighted cells tile the sphere (sum 4 pi) on lattice and jittered, weighted configurations', () => {
+  for (const [name, cfg] of [
+    ['icosphere lattice, equal weights', sphereColumns(3)],
+    ['jittered, apothems +-20%', sphereColumns(3, { jitter: 0.3, spread: 0.4, seed: 2 })],
+    ['jittered, apothems +-40%', sphereColumns(2, { jitter: 0.4, spread: 0.8, seed: 3 })],
+  ]) {
+    const cells = area.tessellate(cfg.positions, cfg.apothems, 1.2 * cfg.spacing);
+    const total = cells.reduce((s, c) => s + c.area, 0);
+    const clipped = cells.filter((c) => c.clipped).length;
+    console.log(`  ${name}: ${cells.length} cells, sum - 4 pi = ${(total - 4 * Math.PI).toExponential(1)}, ${clipped} clipped`);
+    assert.equal(clipped, 0);
+    assert.ok(Math.abs(total / (4 * Math.PI) - 1) < 1e-12, `sum ${total}`);
+    assert.ok(cells.every((c) => c.area > 0));
+  }
+});
+
+test('tessellation: the boundary between touching columns passes through their contact point', () => {
+  const r1 = 0.02, r2 = 0.035, D = r1 + r2; // touching: centre distance = apothem sum (as angles)
+  const p1 = [0, 0, 1], p2 = [Math.sin(D), 0, Math.cos(D)];
+  const [e1, e2] = flow.tangentBasis(p1);
+  const { c, n } = area.halfPlane(p2.map((v, k) => v - p1[k]), area.excessWeight(r1), area.excessWeight(r2), e1, e2);
+  // Gnomonic distance of the boundary along the pair's direction = tan(r1).
+  assert.ok(Math.abs(-c / Math.hypot(...n) / Math.tan(r1) - 1) < 1e-9); // (rounding of p2 - p1)
+});
+
+test('tessellation: cell shape gives a rectangle its long axis; a split puts the halves at the half-cells', () => {
+  // Rectangular lattice, spacing 2s along x and s along y, near the north pole:
+  // the centre column's cell is a 2s x s rectangle.
+  const s = 0.01;
+  const pts = [];
+  for (let i = -3; i <= 3; i++) for (let j = -3; j <= 3; j++) {
+    const x = 2 * s * i, y = s * j, l = Math.hypot(x, y, 1);
+    pts.push([x / l, y / l, 1 / l]);
+  }
+  const positions = Float64Array.from(pts.flat());
+  const centre = pts.findIndex((q) => q[0] === 0 && q[1] === 0);
+  const cell = area.cellOf(centre, (k) => pts[k], () => 0.004, pts.keys(), 0.05);
+  assert.ok(!cell.clipped);
+  const [e1] = cell.basis;
+  const axisAlongX = Math.abs(Math.cos(cell.axis) * e1[0] + Math.sin(cell.axis) * cell.basis[1][0]);
+  assert.ok(Math.abs(axisAlongX - 1) < 1e-6, `axis ${cell.axis}`);
+  assert.ok(Math.abs(cell.spread - (2 * s) / Math.sqrt(12)) < 1e-3 * s);
+  const sp = volume.splitColumn(pts[centre], cell, 1, 2);
+  // Halves at x = -+ s/2 (the half-rectangles' centroids), to SPLIT_OFFSET's accuracy.
+  assert.ok(Math.abs(Math.abs(sp.parent[0]) - s / 2) < 0.01 * s && Math.abs(sp.child[0] + sp.parent[0]) < 1e-12);
+  assert.equal(sp.volume + sp.volume, 1);
+  assert.equal(sp.areaRef + sp.areaRef, 2);
+  void positions;
+});
+
+test('melt: a stretched column makes 7 km of crust per unit new area at L = 0 and none at L >= H_m', () => {
+  const p = PARAMS;
+  // A ridge column (thermal age 0, L = 0), stretched in 10 steps from area 1e-3 to 2e-3.
+  let c = { volume: 7e-3, area: 1e-3, areaPrev: 1e-3, thermalAgeMyr: 0, compositionDensity: 3000, ageMyr: 0 };
+  let added = 0;
+  for (let s = 1; s <= 10; s++) {
+    const r = volume.volumeStep({ ...c, areaPrev: c.area, area: 1e-3 * (1 + s / 10) }, p);
+    added += r.added;
+    c = { ...c, ...r, area: 1e-3 * (1 + s / 10) };
+  }
+  assert.ok(Math.abs(added / 1e-3 - p.melt_fraction * p.melt_depth_km) < 1e-9, `${added / 1e-3} km per unit new area`);
+  assert.ok(Math.abs(c.thicknessKm - 7) < 1e-9, 'steady ridge crust stays 7 km');
+  // Old ocean (L = 100 km) and a continent (L = 150 km): stretching by 10% only thins.
+  for (const [rho, t] of [[3000, 100], [2700, 1000]]) {
+    const cap = volume.thermalAgeCapMyr(rho, p);
+    const r = volume.volumeStep({ volume: 7e-3, area: 1.1e-3, areaPrev: 1e-3, thermalAgeMyr: Math.min(t, cap), compositionDensity: rho, ageMyr: t }, p);
+    assert.equal(r.added, 0);
+    const L0 = rho < 2850 ? p.continental_lithosphere_km : p.oceanic_lithosphere_max_km;
+    assert.ok(Math.abs(r.lithosphereKm - L0 / 1.1) < 1e-9, `lithosphere ${r.lithosphereKm} vs ${L0 / 1.1}`);
+    assert.ok(Math.abs(r.thicknessKm - 7 / 1.1) < 1e-12);
+  }
+  // Partial: halfway between, L = H_m / 2 makes half the melt.
+  const tHalf = ((p.melt_depth_km / 2 * 1e3 / 2.32) ** 2 / p.thermal_diffusivity_m2_s) / profile.SECONDS_PER_MYR;
+  const half = volume.volumeStep({ volume: 7e-3, area: 1.0001e-3, areaPrev: 1e-3, thermalAgeMyr: tHalf * 1.0001 ** 2, compositionDensity: 3000, ageMyr: 10 }, p);
+  assert.ok(Math.abs(half.added / 1e-7 - 3.5) < 1e-6, `${half.added / 1e-7}`);
+});
+
+test('melt: a stretched continent thins until it melts; mixing in melt makes it oceanic (breakup)', () => {
+  const p = PARAMS;
+  let c = { volume: 35e-3, area: 1e-3, thermalAgeMyr: volume.thermalAgeCapMyr(2700, p), compositionDensity: 2700, ageMyr: 1000 };
+  let firstMelt = null, breakup = null;
+  for (let s = 1; s <= 400 && !breakup; s++) {
+    const A = c.area * 1.01;
+    const r = volume.volumeStep({ ...c, areaPrev: c.area, area: A }, p);
+    if (r.added > 0 && firstMelt === null) firstMelt = { beta: A / 1e-3, L: r.lithosphereKm };
+    if (r.breakup) breakup = { beta: A / 1e-3, h: r.thicknessKm, age: r.ageMyr };
+    c = { ...c, ...r, area: A };
+  }
+  console.log(`  continent: melting starts at stretching factor ${firstMelt.beta.toFixed(2)} (L ${firstMelt.L.toFixed(1)} km); breakup at ${breakup.beta.toFixed(2)}, crust ${breakup.h.toFixed(1)} km`);
+  assert.ok(Math.abs(firstMelt.beta - p.continental_lithosphere_km / p.melt_depth_km) < 0.02);
+  assert.ok(breakup && breakup.age === 0 && c.compositionDensity >= 2850);
 });

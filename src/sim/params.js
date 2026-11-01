@@ -48,20 +48,28 @@ export const SIM_PARAMS = [
   ['stiffness_reference_km', 'f32', 150.0],
   ['bond_rate_myr_inv', 'f32', null],   // derived: bond stiffness / reference drag of a base-size particle, 1/Myr
   ['base_apothem', 'f32', 0.0175],      // reference particle apothem
-  ['split_area_factor', 'f32', 3.0],    // particle splits when area > factor * base hexagon area
+  // A surface column splits when its actual (tessellated) area exceeds this
+  // factor x the base hexagon area (design 4.8).
+  ['split_area_factor', 'f32', 2.0],
   ['subduction_overlap', 'f32', 0.012], // overlap depth that triggers subduction
   // An edge exists while its pair's map-view gap is below this fraction of the
   // apothem sum (and their depth intervals overlap); design 3.2.
   ['edge_range_margin', 'f32', 0.1],
-  // Spreading proxy (until design phase 8): crust over diverging mantle grows
-  // in area at the divergence rate. With ~1%/Myr divergence over upwellings,
-  // global crust production is ~0.5%/Myr of the surface (Earth: ~0.6%/Myr).
-  ['spreading_divergence_threshold', 'f32', 0.002], // 1/Myr
-  ['spreading_efficiency', 'f32', 1.0],             // area growth rate / mantle divergence
-  ['max_spreading_rate', 'f32', 0.05],              // cap on fractional area growth, 1/Myr
   ['max_particles', 'u32', null],
   ['max_edges', 'u32', null],
   ['hash_grid_dim', 'u32', null],
+
+  // --- area, volume and melt (design 4.8; src/columns/area.js, volume.js) ---
+  // Tessellation cells are clipped to a disc of this radius (unit sphere).
+  // Exact tiling needs every neighbour that can cut it to be in the hash
+  // cells scanned: keep it below half the hash cell size, 3 / hash_grid_dim.
+  ['cell_clip_radius', 'f32', 0.04],
+  // Decompression melting (McKenzie & Bickle 1988): new area makes
+  // melt_fraction x melt_depth_km of crust (7 km) where the lithosphere is
+  // thin, none where it is thicker than melt_depth_km.
+  ['melt_depth_km', 'f32', 70.0],         // where rising mantle crosses its solidus
+  ['melt_fraction', 'f32', 0.1],          // mean melt fraction of the melting column
+  ['melt_density', 'f32', 3000.0],        // composition of melt (basalt), mixed into the column by volume
 
   // --- constants ---
   ['gas_constant', 'f32', 0.008314],    // kJ/(mol K)

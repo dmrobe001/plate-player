@@ -5,9 +5,10 @@
 //                      the least-squares gradient of GPE over its listed
 //                      neighbours (ridge push, plateau collapse), as a change
 //                      of this step's predicted position against basal drag
-//   columns_flow       after edges_maxwell: volumetric flow at fixed crust
-//                      volume, d ln area_ref = 2 x mean inelastic strain of
-//                      the column's edges; thickness changes inversely
+//   columns_flow       after edges_maxwell: volumetric flow, d ln area_ref =
+//                      2 x mean inelastic strain of the column's edges. Crust
+//                      volume is unchanged; thickness follows the actual
+//                      (tessellated) area, area.wgsl
 
 @compute @workgroup_size(64)
 fn columns_flow(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -17,9 +18,8 @@ fn columns_flow(@builtin(global_invocation_id) id: vec3<u32>) {
     if (n == 0i) { return; }
     let mean = f32(atomicLoad(&particle_deltas[idx].dx)) / FIXED_POINT / f32(n);
     let f = exp(2.0 * sim.volumetric_flow_factor * mean);
-    particles[idx].surface_area *= f;
-    particles[idx].thickness_km /= f;
-    particles[idx].apothem = sqrt(particles[idx].surface_area / 3.4641016);
+    particles[idx].area_ref *= f;
+    particles[idx].apothem = sqrt(particles[idx].area_ref / 3.4641016);
 }
 
 @compute @workgroup_size(64)

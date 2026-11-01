@@ -5,8 +5,9 @@ identification from phase 5, Chebyshev acceleration, and the lava-lamp mantle wi
 grounded basal drag. **The physics is being redesigned around one pair-interaction
 law** (sections 3.2, 4.0, 4.5, 4.7, 6): no bond/contact distinction, graded and
 history-dependent integrity, area and volume as exact budgets. Of the redesign, phases
-A (persistent edges), B (column profiles), C (the edge law, normal part) and D (the
-irreversible step, without slip) are done. The rest is a proposal.
+A (persistent edges), B (column profiles), C (the edge law, normal part), D (the
+irreversible step, without slip) and E (area, volume, melt, splits) are done. The rest
+is a proposal.
 This document says where the model is going and why.
 
 **Development strategy (current).** No more full-planet runs until all the physics
@@ -133,13 +134,13 @@ crust and tilted for slabs.
 | `director` | vec3 | unit vector | column axis; carries bending (new) |
 | `orientation` | f32 | rad | rotation about the director, from the polar decomposition (new) |
 | `area_ref` | f32 | unit sphere² | stress-free (reference) area; apothem a = √(area_ref / 2√3) sets rest lengths and contact size. Changed only by plastic/viscous dilatation (4.7) and splits |
-| `area` (derived) | f32 | unit sphere² | actual area: the column's cell in the tessellation of the markers (4.8). Not state; recomputed each step. area/area_ref − 1 is the column's elastic dilatation |
-| `crust_volume` | f32 | km·unit sphere² | crust volume V; crust thickness h = V / area. Changes only at sources and sinks (4.8) |
-| `crust_thickness` (derived) | f32 | km | crust_volume / area |
+| `cell_area` (derived) | f32 | unit sphere² | actual area: the column's cell in the tessellation of the markers (4.8; done in phase E). Recomputed each step, with `cell_area_prev`, `cell_shape` (centroid, major axis) and `cell_clipped` |
+| `crust_volume` | f32 | km·unit sphere² | crust volume V; crust thickness h = V / area. Changes only at sources and sinks (4.8; done in phase E) |
+| `thickness_km` (derived) | f32 | km | crust_volume / cell_area |
 | `lith_mantle_thickness` | f32 | km | cold mantle layer that moves with the crust (new) |
 | `crust_density` | f32 | kg/m³ | at mantle temperature, as now |
-| `age` | f32 | Myr | time since formation; drives oceanic cooling |
-| `thermal_age` | f32 | Myr | reset by reheating (rifting, arcs); sets lith_mantle_thickness (new) |
+| `age` | f32 | Myr | time since formation (reset at breakup) |
+| `thermal_age_myr` | f32 | Myr | sets the lithosphere, 2.32√(κt) capped by composition, for oceans and continents alike; scaled by stretching (done in phase E); reset by arcs (phase F) |
 | `plastic_strain` | f32 | – | accumulated irreversible strain (diagnostic; weakening lives in edge integrity, 3.2) |
 | `plate` | u32 | – | plate slot, from labelling; diagnostic only, never read by forces |
 | `kind` | u32 | – | surface / slab / ghost (boundary-driven) / inactive |
@@ -501,16 +502,70 @@ between them starts at full integrity, and edges to former neighbours are reassi
 by side. This replaces the spreading proxy (inflation over diverging mantle), which
 is removed.
 
+*As built (phase E; `src/columns/area.js`, `src/columns/volume.js`, `area.wgsl`,
+`split.wgsl`).*
+- **Cells are weighted, not plain bisectors.** Between columns i and j the boundary
+  is the great circle in the plane x·(aⱼpⱼ − aᵢpᵢ) = 0 with a = 1/cos(apothem).
+  - Between touching columns it passes exactly through the contact point; between
+    equal columns it is the perpendicular bisector.
+  - The normals of any three such planes sum to zero, so the planes share a line and
+    the cells meet at common vertices: the cells tile the sphere exactly, whatever
+    the weights. (A spherical cousin of the power diagram.)
+- **Each cell is computed alone**, in the gnomonic projection about its column, where
+  great circles are straight lines. The cell is a convex polygon: a regular 12-gon of
+  radius `cell_clip_radius` (0.04) clipped by one half-plane per candidate
+  (Sutherland–Hodgman). Its spherical area is the sum of fan triangles (Van
+  Oosterom–Strackee formula). Everything is in the column's own tangent coordinates,
+  so float32 is enough.
+- **Candidates are all columns in the 27 hash cells around**, not the ≤12 listed
+  edges. Edges exist only within the range margin, so a column at an opening gap
+  would lose the neighbours that bound its cell. The hash scan reaches at least one
+  hash cell (0.094), and the clip radius is kept below half of that, so every
+  column whose boundary can cut the clip polygon is seen.
+- **Clipped cells.** A cell still touching its clip polygon has a free side (nothing
+  within reach): there the tiling is not exact. Such cells are counted, and they never
+  split (their area is not a measure of stretching).
+- **Thickness is derived:** h = V / cell area, every step. At load, V is set from the
+  loaded thickness × the tessellated area.
+- **Lithosphere thinning uses thermal age.** Every column, oceanic or continental,
+  has a lithosphere 2.32√(κt) capped by composition (100 km oceanic, 150 km
+  continental). Per step t ← min(t, cap)·(A₀/A)², which thins the lithosphere by
+  A₀/A, McKenzie's (1978) uniform stretching factor β. It then recovers by ageing:
+  a continent re-thickens to 150 km in ~130 Myr.
+- **Melt** per step: dV = F·H_m·max(A − A₀, 0)·max(1 − L/H_m, 0), with L the thinned
+  lithosphere. Melt (`melt_density` 3000) is mixed into the column's composition by
+  volume. A continental column crossing 2850 kg/m³ this way has broken up: it is
+  counted and its formation age reset.
+- **Plumes (w_mantle) and arcs are not built.** The mantle model has no plume source
+  yet; arcs are phase F.
+- **Splits** use the actual cell area (> `split_area_factor` 2 × the base hexagon).
+  The halves go to the cell centroid ∓ 0.87 × the cell's major-axis spread
+  (√ of its largest second moment). That puts them on the two half-cells' centroids
+  for a domino of hexagons (0.885), a rectangle (0.866) or an ellipse (0.849).
+  - Parent and child share volume and area_ref equally.
+  - The child copies the parent's material (no fresh oceanic crust).
+  - The edge between them starts intact and stress-free.
+  - Every edge touching either half restarts its strain measure from the new
+    geometry (its `length`), keeping its stored stresses, so a split adds no stress.
+  - Neither half counts dilatation (melt, thinning) in the step after the split.
+- **Volume budget:** sources (melt) and sinks (columns becoming slabs) are summed on
+  the GPU in 64-bit fixed point (10¹² units per km·unit²), since load. Slab
+  assimilation no longer touches the surface budget.
+- **Removed:** the spreading proxy (area growth over diverging mantle) and its three
+  parameters.
+
 ---
 
 ## 5. The time step
 
 ### 5.1 Schedule
 
-Target order once the pair law is assembled (today's code runs stage 1 without the
-tessellated area, stage 2 including the edge law's normal part, stages 3–4, stage 5
-without slip, melt, thermal reheating or edge state transitions, and stages 6–7; the
-GPE force is implemented but off by default; see phase A–D findings):
+Target order once the pair law is assembled (today's code runs stage 1, stage 2
+including the edge law's normal part, stages 3–4, stage 5 without slip, arcs or edge
+state transitions, and stages 6–7; the GPE force is implemented but off by default;
+see phase A–E findings). As built, splits run at the start of the step on last step's
+cells, and the tessellation (with melt) runs after the hash grid is built, before the
+profiles:
 
 ```
 1. profiles                   per column: T(z), ρ(z), η(z), envelope (4.0); tessellated area (4.8)
@@ -835,7 +890,7 @@ written here.
 | B ✅ | **Column profile** (4.0): T(z) from thermal age / continental geotherm, ρ(z), η(z), envelope; lithosphere thickness; GPE | Oceanic profile matches half-space cooling; Airy elevation from the profile reproduces depth ∝ √age on a synthetic age ramp; envelope peak at the brittle–ductile transition where the two curves cross (analytic). **Met**, plus GPE differences = half-space ridge push, and the kernel matches the reference (kept as tests; phase B findings) |
 | C ✅ (normal part) | **Edge law** (4.5): effective stiffness integral, caps as λ clamps, Maxwell stored-stress decay | Single edge under constant separation rate: stress approaches η_eff·rate with the Maxwell time (implicit-Euler sequence, exact); cold pair behaves as a spring, hot pair as a dashpot; tension cap of a φ = 0 cold pair is ≈ 0; two-particle relaxation test from phase 2 still passes when k is set from a uniform profile. **Met** for the normal part (kept as tests; phase C findings). Tangential part deferred: needs particle orientation |
 | D ✅ (without slip) | **Irreversible step** (4.7): volumetric flow at fixed volume, slip, integrity (work-driven damage, thermal healing), neighbour exchange; plus the GPE force (4.6) | Uniform compression of a patch thickens at the predicted rate with Σ volume constant; pure shear leaves every area_ref unchanged and produces slip; φ decays in proportion to work input and heals with τ_heal(T); a patch below yield accumulates no plastic strain over many steps with solver noise. **Met**, with "slip" read as crack opening and plastic work, since edges have no tangential channel; neighbour exchange is the range rule of phase A (kept as tests; phase D findings) |
-| E | **Area, volume, melt, splits** (4.8); remove the spreading proxy | Tessellated areas sum to 4π to float precision on random and lattice configurations; a stretched strip produces 7 km crust per unit new area at L = 0 and none at L ≥ H_m; a split conserves volume and area_ref; budget identity: Δ(Σ V) = logged sources − sinks exactly |
+| E ✅ | **Area, volume, melt, splits** (4.8); remove the spreading proxy | Tessellated areas sum to 4π to float precision on random and lattice configurations; a stretched strip produces 7 km crust per unit new area at L = 0 and none at L ≥ H_m; a split conserves volume and area_ref; budget identity: Δ(Σ V) = logged sources − sinks exactly. **Met** ("exactly" = to the float32 rounding of each column's V; kept as tests; phase E findings) |
 | F | **Subduction and suturing as edge-state transitions**; slab particles, bending directors (4.3); arcs | Timer-based initiation fires on a synthetic convergent pair with a dense side and never with two buoyant sides; line-load flexure profile within 10% (a mechanism test on a strip, not a planet) |
 | **Integration** | Assemble A–F; first planet runs since the redesign | Calibrate together, recorded once: plate speeds (rms ~4 cm/yr, slab-attached plates fastest), interior rigidity (non-rigid strain rate ≲ 10⁻⁹/yr), ridge depth ∝ √age, ~7 km oceanic crust, orogen heights bounded by collapse, coverage exact, volume budget closed, damage localised into narrow boundaries |
 | 9 | **Adaptivity** (refine first, coarsen second) | Benchmarks of Integration give the same continuum answer at 220/110/50 km within stated tolerances |
@@ -852,6 +907,82 @@ lava-lamp mantle with grounded basal drag, and bond rest length = apothem sum
 **Resolved:** how new crust is made. Not by inflation inside plates, and not by a
 separate gap-filling rule: by stretching (tessellated area grows at fixed volume) plus
 decompression melt where the lithosphere is thin (4.8).
+
+### Phase E findings: area, volume, melt and splits
+
+**What was built** (rules: 4.8, "As built").
+- **`columns_area`**: each surface column's weighted Voronoi cell, from the hash grid.
+- **`columns_volume`**: dilatation since last step thins the lithosphere (thermal
+  age) and brings decompression melt; volume, composition, thickness = V / area.
+- **`columns_split`** (replaces `crust_accumulation`): splits on the actual cell area,
+  along the cell's major axis, stress-free.
+- **`columns_init_volume`**: V = loaded thickness × cell area.
+- **New particle fields:** `crust_volume`, `thermal_age_myr`, `cell_area`,
+  `cell_area_prev`, `cell_shape`, `cell_clipped`, `volume_added`; `surface_area` is
+  renamed `area_ref`. The solver buffer's header grew to 12 words (clipped cells,
+  volume budget, breakups). The record schema is 0.5.0.
+- **Lithosphere from thermal age for continents too** (capped at 150 km), so that
+  stretching can thin it. The CPU references (`lithosphereThicknessKm`, `geotherm`)
+  changed with it.
+- **`?grid=N`** sets the hash grid (coarse test worlds need larger cells).
+
+**Parameters:** `cell_clip_radius` 0.04, `melt_depth_km` 70, `melt_fraction` 0.1,
+`melt_density` 3000, `split_area_factor` 2 (now on the actual area; was 3 on
+area_ref).
+
+**Tests** (kept). Unit tests of the references:
+- **Tiling:** cells sum to 4π to 5×10⁻¹⁴ on an icosphere lattice, and on jittered
+  configurations with apothems varied ±20% and ±40%.
+- **Contact point:** the boundary between touching columns passes through it.
+- **Cell shape:** a 2s × s rectangle has its long axis along x and spread 2s/√12; a
+  split puts the halves at ±s/2 to 1%.
+- **Melt:** a ridge column stretched to twice its area makes exactly 7 km of crust
+  per unit new area and stays 7 km thick; old ocean and a continent stretched 10%
+  make none, and their lithosphere thins by 1/1.1; L = H_m/2 makes half.
+- **Breakup:** a continent stretched 1% per step starts melting at β = 2.15 (L just
+  below 70 km), and crosses into oceanic density at β ≈ 10.6, with 6.6 km of crust.
+
+GPU tests, on a whole sphere of 2562 columns (jittered icosphere, apothems ±15%,
+`?capacity=4096&grid=20`):
+- **Tiling:** Σ cell areas − 4π = −1.2×10⁻⁷ (relative 10⁻⁸); each cell matches the
+  reference to 7×10⁻⁷; none clipped; V = h × area at load.
+- **Melt, one step after a smooth displacement:** 454 stretched young columns made
+  7.0000 km of crust per unit new area; old ocean and continent made none; each column
+  matches the reference exactly.
+- **Budget:** Δ(Σ V) − (sources − sinks) = −3×10⁻⁸ against a float32 rounding bound of
+  10⁻⁶. The logged sink equals the volume of the one column pushed into a slab.
+- **Splits** (342 cells above 1.15 × base): Σ V and Σ area_ref unchanged; each pair
+  of halves equal; the parent–child edge intact with stress below 0.03 MPa (float32
+  position rounding); halves at the reference positions to 5×10⁻⁵ spacings (WGSL's
+  sin and cos are accurate only to 2⁻¹¹); after the split step the cells still sum to
+  4π to 4×10⁻⁸; edge storage invariants hold.
+
+**Found by the tests.**
+- **Isolated columns split.** In small test patches, columns with neighbours on one
+  side only have clipped cells several times the base hexagon, and split at once.
+  Clipped cells now never split.
+- **Thermal age must be clamped before it is scaled.** A continent loaded with age
+  1000 Myr took dozens of steps of stretching before its lithosphere started to thin.
+- **The coarse test sphere starts with overlaps** above `subduction_overlap`, so the
+  overlap stand-in for subduction (phase F) made dozens of slabs. The tests set it
+  out of reach.
+
+**On a generated planet, measured once** (20 steps, default parameters):
+- **Coverage:** cells sum to 4π − 0.08%. The deficit is in ~213 clipped cells (2%) at
+  voids in the initial state wider than the hash reach.
+- **No melt in 20 steps.** The initial oceans are 60 Myr old (L = 100 km), so they must
+  be stretched by β > 1.4 before melting starts. There are no ridges in the initial
+  state; making new sea floor depends on stretching by the mantle. Seeding young
+  ridges is an integration question.
+- **Cells next to voids take the void's area**, so their crust thins (7 → 4.8 km in
+  5 steps): what used to be a gap is now a stretched column, as intended. Only 29
+  splits happened, because the large cells there are clipped.
+- **Breakup needs β ≈ 10.** Mixing melt by volume and calling a column oceanic past
+  2850 kg/m³ means melt must outweigh the original crust. Real margins break up at
+  β ≈ 3–5; a rule on the melt's share of the crust's top, or on the lithosphere, may
+  be better. Decide at integration.
+- No capacity overflows; the free-list test and the 10× time step pass (p99 2.6,
+  max 23 cm/yr).
 
 ### Phase D findings: the irreversible step
 
@@ -1406,9 +1537,14 @@ separate.
 - **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity like the contact
   clamp, which has been tolerated so far. Check at integration that dense yielding
   zones do not slow or break convergence.
-- **Tessellated area on the sphere:** bisector polygons from ≤12 angle-sorted
-  neighbours are exact for a Delaunay neighbourhood; confirm the range-based neighbour
-  set is complete enough that the cells tile without gaps or double cover.
+- **Tessellated area on the sphere** (resolved in phase E): weighted cells from the
+  hash neighbourhood tile exactly; the only leak is at voids wider than the hash
+  reach (clipped cells, counted).
+- **Breakup criterion** (phase E): volume-mixed composition crosses into oceanic only
+  at β ≈ 10. Decide at integration whether breakup should key on the melt's share of
+  the upper crust or on lithosphere thickness.
+- **Initial ridges** (phase E): the generated planet's oceans are all 60 Myr old, so
+  nothing melts until stretched by β > 1.4. Seed young ridges at integration?
 
 - **Bending discretisation** (4.3): directors with a Kirchhoff penalty vs. dihedral
   constraints on edge pairs. Decide by the flexure benchmark.
@@ -1454,6 +1590,12 @@ separate.
 | half-space cooling | conductive cooling of sea floor moving away from a ridge: T follows erf(z / 2√(κ·age)), so depth and lithosphere thickness grow as √age |
 | ridge push | horizontal force from the GPE difference between young (hot, high) and old (cold, low) ocean lithosphere |
 | tessellation cell (Voronoi cell) | the region of the sphere closer to a marker than to any other |
+| power diagram | a Voronoi diagram with weights: each site's boundary moves toward the smaller neighbour. Here: planes x·(aⱼpⱼ − aᵢpᵢ) = 0, a = 1/cos(apothem) |
+| gnomonic projection | projection of the sphere from its centre onto a tangent plane; great circles become straight lines |
+| Sutherland–Hodgman | clipping a polygon by one half-plane at a time |
+| Van Oosterom–Strackee formula | the solid angle of a triangle of three vectors: tan(Ω/2) = det / (products of lengths + dot products) |
+| stretching factor β | ratio of stretched to original length (McKenzie 1978); here of area, A/A₀, which thins the lithosphere by 1/β |
+| decompression melting | rising mantle melts as pressure drops below the solidus; ~10% melt from ~70 km gives 7 km of oceanic crust |
 | solidus | temperature (at a given pressure) at which rock begins to melt |
 | T1 event | neighbour exchange in a foam or cell network: one contact is lost and another forms |
 | integrity φ | an edge's undamaged fraction: scales cohesion, friction and optionally ductile viscosity |

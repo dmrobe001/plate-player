@@ -45,17 +45,18 @@ export const isContinental = (compositionDensity) => compositionDensity < CONTIN
  * model's flattening, approximated).
  * Continental: steady conduction with heat production A in the top
  * min(radiogenic_layer_km, crust) of the crust, T(0) = Ts and T(L) = T_L,
- * L = continental_lithosphere_km; below L the gradient continues until T = Tm.
+ * L = 2.32 sqrt(kappa t) of the thermal age t, capped at continental_lithosphere_km
+ * (stretching thins it; src/columns/volume.js); below L the gradient continues until T = Tm.
  */
 export function geotherm(col, p) {
   const Ts = p.ambient_ocean_temp, Tm = p.mantle_temp, dT = Tm - Ts;
   const k = p.thermal_conductivity_w_m_k;
   if (isContinental(col.compositionDensity)) {
-    const L = p.continental_lithosphere_km;
+    const L = lithosphereThicknessKm(col.compositionDensity, col.ageMyr, p);
     const hr = Math.min(p.radiogenic_layer_km, col.crustKm) * 1e3;
     const A = p.radiogenic_heat_uw_m3 * 1e-6;
     const TL = Ts + 0.9 * dT;
-    const qm = Math.max((k * (TL - Ts) - 0.5 * A * hr * hr) / (L * 1e3), 1e-3); // W/m^2 from below
+    const qm = Math.max((k * (TL - Ts) - 0.5 * A * hr * hr) / (Math.max(L, 1) * 1e3), 1e-3); // W/m^2 from below
     const T = (zKm) => {
       const z = zKm * 1e3;
       const t = z < hr ? Ts + ((qm + A * hr) * z - 0.5 * A * z * z) / k : Ts + (qm * z + 0.5 * A * hr * hr) / k;
@@ -245,7 +246,7 @@ export function columnProfile(col, p) {
 
 /** The column inputs of particle i, from unpacked Particle arrays (layout.js). */
 export const columnOfParticle = (P, i) => ({
-  crustKm: P.thickness_km[i], compositionDensity: P.composition_density[i], ageMyr: P.age[i], elevationKm: P.elevation[i],
+  crustKm: P.thickness_km[i], compositionDensity: P.composition_density[i], ageMyr: (P.thermal_age_myr ?? P.age)[i], elevationKm: P.elevation[i],
 });
 
 /**

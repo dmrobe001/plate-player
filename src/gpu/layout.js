@@ -90,12 +90,14 @@ export const Particle = defineStruct('Particle', [
   ['velocity', 'vec4f'],        // radians / Myr, tangent to sphere
   ['iter_start', 'vec4f'],      // solver iterate x_k at the start of the current iteration (Chebyshev)
   ['iter_prev', 'vec4f'],       // solver iterate x_{k-1} (Chebyshev)
-  ['thickness_km', 'f32'],
+  ['cell_shape', 'vec4f'],      // tessellation cell (derived, design 4.8): centroid (x, y) and major-axis
+                                //   angle (z) in the gnomonic tangent basis, sqrt of the major second moment (w)
+  ['thickness_km', 'f32'],      // crust thickness, derived: crust_volume / cell_area (slabs: / area_ref)
   ['composition_density', 'f32'], // kg/m^3 at mantle temperature
   ['temperature', 'f32'],       // K
   ['age', 'f32'],               // Myr
-  ['surface_area', 'f32'],      // unit-sphere area = 2*sqrt(3)*apothem^2 (hexagon)
-  ['apothem', 'f32'],           // unit-sphere length
+  ['area_ref', 'f32'],          // stress-free (reference) area, unit sphere = 2*sqrt(3)*apothem^2 (hexagon)
+  ['apothem', 'f32'],           // unit-sphere length; sets rest lengths and range
   ['state', 'u32'],             // 1 = surface, 2 = subducting slab
   ['is_active', 'u32'],
   ['next_idx', 'u32'],          // linked list through the collision hash grid
@@ -105,6 +107,13 @@ export const Particle = defineStruct('Particle', [
   ['mantle_node', 'u32'],       // nearest mantle grid node, updated by a local walk each step
   ['next_state', 'u32'],        // state requested during contact detection, applied at the end of the step
   ['edge_count', 'u32'],        // edges touching the particle this step; scales Jacobi updates
+  // Area, volume and melt (design 4.8, phase E):
+  ['crust_volume', 'f32'],      // km x unit-sphere area; changes only at sources (melt) and sinks (slabs)
+  ['thermal_age_myr', 'f32'],   // sets the lithosphere (2.32 sqrt(kappa t), capped); scaled by stretching
+  ['cell_area', 'f32'],         // actual area: the column's tessellation cell (derived; 0 = just split)
+  ['cell_area_prev', 'f32'],    // last step's cell_area (dilatation; 0 = none this step)
+  ['volume_added', 'f32'],      // melt added this step (diagnostic)
+  ['cell_clipped', 'u32'],      // 1 = the cell touched its clip polygon (a free side): its area is not real, it never splits
 ]);
 
 /**

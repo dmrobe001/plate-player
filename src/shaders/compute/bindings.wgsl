@@ -11,7 +11,7 @@ const NONE: u32 = 0xFFFFFFFFu;
 const FIXED_POINT: f32 = 100000000.0;
 
 // Stack of free slot indices. `requests` is used by two-phase allocation
-// (crust_accumulation reserves, crust_commit_splits pops; see growth.wgsl).
+// (columns_split reserves, crust_commit_splits pops; see split.wgsl).
 struct FreeList { counter: atomic<u32>, requests: atomic<u32>, pad2: u32, pad3: u32, indices: array<u32> }
 // Per-particle scratch: summed position corrections (reset every
 // iteration) and the particle's slot list: the edges touching it, sorted by
@@ -34,13 +34,36 @@ struct ParticleDelta {
 @group(0) @binding(6) var<storage, read_write> hash_grid: array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> particle_deltas: array<ParticleDelta>;
 
-// Solver iteration counter, capacity-overflow counters (since load; read by
-// tests and the debug panel) and the Chebyshev weight for each iteration
-// (written by simulation.js; see chebyshevWeights).
-struct SolverState { iteration: u32, edge_pool_empty: atomic<u32>, slot_overflow: atomic<u32>, pad3: u32, omega: array<f32> }
+// Solver iteration counter; counters since load, read by tests and the debug
+// panel (SOLVER_HEADER in simulation.js): capacity overflows, tessellation
+// cells that touched their clip polygon (coverage not exact there), the crust
+// volume budget (design 4.8) as two 64-bit fixed-point sums (lo, hi words;
+// VOLUME_FIXED units per km x unit-sphere area), continental breakups; then
+// the Chebyshev weight for each iteration (written by simulation.js; see
+// chebyshevWeights).
+struct SolverState {
+    iteration: u32, edge_pool_empty: atomic<u32>, slot_overflow: atomic<u32>, clipped_cells: atomic<u32>,
+    budget: array<atomic<u32>, 4>,   // source lo, hi; sink lo, hi
+    breakups: atomic<u32>, pad9: u32, pad10: u32, pad11: u32,
+    omega: array<f32>,
+}
+const BUDGET_SOURCE: u32 = 0u;
+const BUDGET_SINK: u32 = 2u;
+const VOLUME_FIXED: f32 = 1e12;
 @group(0) @binding(8) var<storage, read_write> solver: SolverState;
 // Per-column vertical profiles (design 4.0), recomputed every step by column_profile (profile.wgsl).
 @group(0) @binding(9) var<storage, read_write> profiles: array<ColumnProfile>;
+
+// Add a (non-negative) crust volume to a budget sum: 64-bit fixed point,
+// split into words, with the carry from the low word.
+fn add_budget(slot: u32, v: f32) {
+    let q = max(v, 0.0) * VOLUME_FIXED;
+    let hi = floor(q / 4294967296.0);
+    let lo = u32(q - hi * 4294967296.0);
+    let old = atomicAdd(&solver.budget[slot], lo);
+    let carry = select(0u, 1u, old + lo < old);
+    if (hi > 0.0 || carry > 0u) { atomicAdd(&solver.budget[slot + 1u], u32(hi) + carry); }
+}
 
 fn chebyshev_omega() -> f32 {
     return solver.omega[min(solver.iteration, arrayLength(&solver.omega) - 1u)];

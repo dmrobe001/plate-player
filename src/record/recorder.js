@@ -11,7 +11,7 @@ import { BUILD_INFO } from '../build-info.js';
 import { eastNorth, latLonDeg, sampleToMesh } from './sampling.js';
 import { readZip, writeZip } from './zip.js';
 
-export const SCHEMA = { name: 'plate-player-record', version: '0.4.0' };
+export const SCHEMA = { name: 'plate-player-record', version: '0.5.0' };
 const EARTH_RADIUS_KM = 6371;
 
 /** Field series written for every sample. Order here is order in the manifest. */
@@ -113,7 +113,7 @@ export class Recorder {
     active.forEach((i, k) => {
       const x = P.position[4 * i], y = P.position[4 * i + 1], z = P.position[4 * i + 2];
       position.set([x, y, z], 3 * k);
-      area[k] = P.surface_area[i];
+      area[k] = P.cell_area[i] > 0 ? P.cell_area[i] : P.area_ref[i]; // actual (tessellated) area
       const surface = P.state[i] === 1;
       const nan = (v) => (surface ? v : NaN); // slabs only contribute to slab_fraction
       const [east, north] = eastNorth(x, y, z);

@@ -7,12 +7,13 @@ import { packSimParams, SIM_PARAMS, SIM_PARAMS_BYTES, simParamsWGSL } from './pa
 import bindingsWGSL from '../shaders/compute/bindings.wgsl';
 import locateWGSL from '../shaders/compute/locate.wgsl';
 import thermalWGSL from '../shaders/compute/thermal.wgsl';
-import growthWGSL from '../shaders/compute/growth.wgsl';
+import splitWGSL from '../shaders/compute/split.wgsl';
 import solverWGSL from '../shaders/compute/solver.wgsl';
 import edgesWGSL from '../shaders/compute/edges.wgsl';
 import profileWGSL from '../shaders/compute/profile.wgsl';
 import lawWGSL from '../shaders/compute/law.wgsl';
 import flowWGSL from '../shaders/compute/flow.wgsl';
+import areaWGSL from '../shaders/compute/area.wgsl';
 
 export const CAPACITY = {
   maxParticles: 25000,
@@ -25,6 +26,13 @@ const EARTH_RADIUS_M = 6.371e6;
 const SECONDS_PER_MYR = 3.15576e13;
 const FREE_LIST_HEADER_WORDS = 4;
 const MAX_SOLVER_ITERATIONS = 1024; // size of the Chebyshev weight table
+/**
+ * Words before the Chebyshev weights in the solver buffer (SolverState in
+ * bindings.wgsl): counters since load. Volume sums are 64-bit fixed point.
+ */
+export const SOLVER_HEADER = {
+  words: 12, edgePoolEmpty: 1, slotOverflow: 2, clippedCells: 3, source: 4, sink: 6, breakups: 8, volumeFixed: 1e12,
+};
 const WORKGROUP = 64;
 // Solver iterations per GPU submission. Long stretches of GPU work can exceed
 // the browser's GPU watchdog on slow GPUs (the device is then lost), so a
@@ -66,7 +74,7 @@ export class Simulation {
       hashGrid: device.createBuffer({ label: 'hash grid', size: hashGridDim ** 3 * 4, usage: S }),
       // ParticleDelta in bindings.wgsl: position corrections + slot list (SLOTS in layout.js)
       deltas: device.createBuffer({ label: 'particle deltas and slot lists', size: maxParticles * SLOTS.wordsPerParticle * 4, usage: S }),
-      solver: device.createBuffer({ label: 'solver state', size: (4 + MAX_SOLVER_ITERATIONS) * 4, usage: S }),
+      solver: device.createBuffer({ label: 'solver state', size: (SOLVER_HEADER.words + MAX_SOLVER_ITERATIONS) * 4, usage: S }),
       profiles: device.createBuffer({ label: 'column profiles (derived)', size: maxParticles * ColumnProfile.byteSize, usage: S }),
       plateIds: device.createBuffer({ label: 'plate ids (drawing only)', size: maxParticles * 4, usage: S }),
       params: device.createBuffer({ label: 'sim params', size: SIM_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
@@ -100,12 +108,12 @@ export class Simulation {
     const rho = this.params.chebyshev_rho < 0 ? jacobiSpectralRadius(this.params) : this.params.chebyshev_rho;
     this.chebyshevRho = rho;
     const omega = chebyshevWeights(rho, this.params.chebyshev_delay, MAX_SOLVER_ITERATIONS);
-    this.device.queue.writeBuffer(this.buffers.solver, 16, omega);
+    this.device.queue.writeBuffer(this.buffers.solver, 4 * SOLVER_HEADER.words, omega);
   }
 
   #createPipelines(onError) {
     const { device, buffers } = this;
-    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL, flowWGSL].join('\n');
+    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL, flowWGSL, areaWGSL, splitWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
     const order = ['grid', 'adjacency', 'particles', 'edges', 'particlePool', 'edgePool', 'hashGrid', 'deltas', 'solver', 'profiles'];
@@ -134,7 +142,8 @@ export class Simulation {
     const entryPoints = [
       'crust_locate', 'column_profile',
       'crust_thermo_isostasy', 'crust_refresh_derived', 'columns_flow', 'columns_gpe_force',
-      'crust_accumulation', 'crust_commit_splits', 'crust_rewire_edges', 'crust_clean_split',
+      'columns_split', 'crust_commit_splits', 'crust_rewire_edges', 'crust_clean_split',
+      'columns_area', 'columns_volume', 'columns_init_volume',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
       'edges_begin', 'edges_prune', 'edges_note_listed', 'edges_create', 'edges_finish', 'edges_law', 'edges_maxwell',
       'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine',
@@ -175,7 +184,8 @@ export class Simulation {
       pf[base + po.composition_density] = P.compositionDensity[i];
       pf[base + po.temperature] = P.temperature[i];
       pf[base + po.age] = P.age[i];
-      pf[base + po.surface_area] = 2 * Math.sqrt(3) * P.apothem[i] ** 2;
+      pf[base + po.thermal_age_myr] = P.thermalAge ? P.thermalAge[i] : P.age[i]; // clamped to its cap on the GPU
+      pf[base + po.area_ref] = 2 * Math.sqrt(3) * P.apothem[i] ** 2;
       pf[base + po.apothem] = P.apothem[i];
       pu[base + po.state] = 1;
       pu[base + po.next_state] = 1;
@@ -213,15 +223,24 @@ export class Simulation {
     // Free lists hold every slot not used by the initial state.
     device.queue.writeBuffer(buffers.particlePool, 0, freeList(P.count, maxParticles));
     device.queue.writeBuffer(buffers.edgePool, 0, freeList(B.count, maxEdges));
-    device.queue.writeBuffer(buffers.solver, 0, new Uint32Array(4)); // iteration and overflow counters
+    device.queue.writeBuffer(buffers.solver, 0, new Uint32Array(SOLVER_HEADER.words)); // iteration and counters since load
     this.steps = 0;
     this.timeMyr = 0;
 
-    // Density and elevation are derived; compute them now so step 0 is complete.
+    // Cells, volume, density and elevation are derived; compute them now so
+    // step 0 is complete. Crust volume = loaded thickness x tessellated area.
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginComputePass({ label: 'refresh derived' });
     pass.setBindGroup(0, this.memoryBindGroup);
     pass.setBindGroup(1, this.uniformBindGroup);
+    pass.setPipeline(this.pipelines.crust_hash_clear);
+    pass.dispatchWorkgroups(Math.ceil(CAPACITY.hashGridDim ** 3 / WORKGROUP));
+    pass.setPipeline(this.pipelines.crust_hash_build);
+    pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
+    pass.setPipeline(this.pipelines.columns_area);
+    pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
+    pass.setPipeline(this.pipelines.columns_init_volume);
+    pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
     pass.setPipeline(this.pipelines.column_profile);
     pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
     pass.setPipeline(this.pipelines.crust_refresh_derived);
@@ -278,21 +297,27 @@ export class Simulation {
 
     run('crust_locate', crust);
 
-    // Column profiles (design 4.0), then thermal state and isostasy, healing,
-    // growth and splitting
-    run('column_profile', crust);
-    run('crust_thermo_isostasy', crust);
-    run('crust_accumulation', crust);
+    // Splits (design 4.8), on last step's cells.
+    run('columns_split', crust);
     run('crust_commit_splits', 1);
     run('crust_rewire_edges', edges);
     run('crust_clean_split', crust);
 
-    // Crust motion: overdamped XPBD. Predict where the mantle alone would
-    // carry each particle, update the edges (pairs in range), then iterate
-    // all edges toward the minimum of drag + elastic energy.
+    // Predict where the mantle alone would carry each particle; hash grid.
     run('crust_predict', crust);
     run('crust_hash_clear', cells);
     run('crust_hash_build', crust);
+
+    // Tessellated area; dilatation thins the lithosphere and brings melt;
+    // crust thickness = volume / area (design 4.8). Then column profiles
+    // (design 4.0), thermal state and isostasy.
+    run('columns_area', crust);
+    run('columns_volume', crust);
+    run('column_profile', crust);
+    run('crust_thermo_isostasy', crust);
+
+    // Crust motion: overdamped XPBD. Update the edges (pairs in range), then
+    // iterate all edges toward the minimum of drag + elastic energy.
     run('solver_begin', 1);
     run('edges_begin', crust);       // clear slot lists
     run('edges_prune', edges);       // drop pairs out of range; list survivors; reset lambda
@@ -326,6 +351,20 @@ export class Simulation {
   #writeTime() {
     const index = SIM_PARAMS.findIndex(([n]) => n === 'time_myr');
     this.device.queue.writeBuffer(this.buffers.params, 4 * index, Float32Array.of(this.timeMyr));
+  }
+
+  /**
+   * Counters since load (SOLVER_HEADER): crust volume added by sources (melt)
+   * and removed by sinks (slabs), km x unit-sphere area; breakups; clipped
+   * tessellation cells (cell-steps); capacity overflows.
+   */
+  async counters() {
+    const h = new Uint32Array((await this.readBuffers(['solver'])).solver, 0, SOLVER_HEADER.words);
+    const sum = (k) => (h[k + 1] * 4294967296 + h[k]) / SOLVER_HEADER.volumeFixed;
+    return {
+      volumeSource: sum(SOLVER_HEADER.source), volumeSink: sum(SOLVER_HEADER.sink), breakups: h[SOLVER_HEADER.breakups],
+      clippedCells: h[SOLVER_HEADER.clippedCells], edgePoolEmpty: h[SOLVER_HEADER.edgePoolEmpty], slotOverflow: h[SOLVER_HEADER.slotOverflow],
+    };
   }
 
   /** Plate id per particle slot, from PlateTracker; used only for drawing. */

@@ -6,6 +6,7 @@ fn crust_thermo_isostasy(@builtin(global_invocation_id) id: vec3<u32>) {
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
 
     particles[idx].age += sim.dt_crust_myr;
+    particles[idx].thermal_age_myr = min(particles[idx].thermal_age_myr + sim.dt_crust_myr, thermal_age_cap_myr(particles[idx].composition_density));
     var temp = particles[idx].temperature;
 
     if (particles[idx].state == 1u) {
@@ -16,7 +17,9 @@ fn crust_thermo_isostasy(@builtin(global_invocation_id) id: vec3<u32>) {
         // in proportion to the heat it absorbs (assimilation).
         let temp_inc = (sim.mantle_temp - temp) * (1.0 - exp(-sim.slab_heating_rate * sim.dt_crust_myr));
         temp += temp_inc;
-        particles[idx].thickness_km -= temp_inc * sim.slab_assimilation_km_per_k;
+        // (Slab volume already left the surface budget when it became a slab.)
+        particles[idx].crust_volume -= temp_inc * sim.slab_assimilation_km_per_k * particles[idx].area_ref;
+        particles[idx].thickness_km = particles[idx].crust_volume / particles[idx].area_ref;
         if (particles[idx].thickness_km <= 1.0) {
             particles[idx].is_active = 0u;
             release(true, idx);

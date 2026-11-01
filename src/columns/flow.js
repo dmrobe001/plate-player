@@ -6,16 +6,17 @@ import { SECONDS_PER_MYR } from './profile.js';
 export const EARTH_RADIUS_M = 6.371e6;
 
 /**
- * Volumetric flow at fixed crust volume: a column's reference area changes by
- * the isotropic part of its edges' inelastic strain, d ln area_ref =
- * 2 x mean(inelastic) (area scales as length squared); crust thickness
- * changes inversely. Deviatoric parts (pure shear) cancel in the mean.
+ * Volumetric flow: a column's reference area changes by the isotropic part of
+ * its edges' inelastic strain, d ln area_ref = 2 x mean(inelastic) (area
+ * scales as length squared). Deviatoric parts (pure shear) cancel in the
+ * mean. Crust volume does not change; thickness is volume / actual area
+ * (src/columns/area.js), so it follows the geometry, not area_ref.
  */
-export function columnFlow({ area, thicknessKm }, inelastic, factor = 1) {
-  if (!inelastic.length) return { area, thicknessKm };
+export function columnFlow({ area }, inelastic, factor = 1) {
+  if (!inelastic.length) return { area, apothem: Math.sqrt(area / (2 * Math.sqrt(3))) };
   const mean = inelastic.reduce((a, b) => a + b, 0) / inelastic.length;
   const f = Math.exp(2 * factor * mean);
-  return { area: area * f, thicknessKm: thicknessKm / f, apothem: Math.sqrt((area * f) / (2 * Math.sqrt(3))) };
+  return { area: area * f, apothem: Math.sqrt((area * f) / (2 * Math.sqrt(3))) };
 }
 
 /** Tangent basis at unit vector n (the slot-angle basis: e1 = normalize(ref x n), e2 = n x e1). */

@@ -18,6 +18,8 @@ import { ColumnProfile, Edge, Particle, SLOTS, unpack } from './gpu/layout.js';
 import * as profile from './columns/profile.js';
 import * as law from './edges/law.js';
 import * as flow from './columns/flow.js';
+import * as area from './columns/area.js';
+import * as volume from './columns/volume.js';
 import * as topology from './edges/topology.js';
 import { CAPACITY } from './sim/simulation.js';
 
@@ -83,6 +85,10 @@ async function main() {
   // every dispatch and readback costs in proportion to capacity.
   const capacity = Number.parseInt(query.get('capacity'), 10);
   if (capacity > 0) Object.assign(CAPACITY, { maxParticles: capacity, maxEdges: 8 * capacity });
+  // ?grid=N: hash grid cells per axis (default 32). Coarse test worlds with
+  // few, large columns need larger cells (tessellation reach, design 4.8).
+  const grid = Number.parseInt(query.get('grid'), 10);
+  if (grid > 0) CAPACITY.hashGridDim = grid;
   const canvas = $('gpuCanvas');
   const { device, context, format } = await initDevice(canvas, reportError);
   const mantleMesh = new SphereMesh(MANTLE_DEFAULTS.subdivisions);
@@ -231,6 +237,9 @@ async function main() {
       profiles: () => exclusive(() => inspectProfiles(sim)),
       law,
       flow,
+      area,
+      volume,
+      counters: () => exclusive(() => sim.counters()),
     },
   };
 

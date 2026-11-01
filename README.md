@@ -96,7 +96,8 @@ from its state on 8 depth slices (3 in the crust, 5 in the lithospheric mantle):
 
 So sea floor deepens with √age (ridge 2.9 km deep, old basins 5.6 km), and GPE
 differences give the ridge push of half-space cooling. Isostasy and the edge law read
-the profile; GPE forces come with design phase D.
+the profile, and so does the GPE push (below). Lithosphere thickness comes from a
+thermal age for continents too (capped at 150 km), so stretching can thin it.
 
 **Edges** (`Edge`, `shaders/compute/edges.wgsl`). There is one kind of edge: the
 interface between two neighbouring columns. An edge exists exactly while its pair is
@@ -129,10 +130,9 @@ linear, with the total force clamped to the depth-integrated caps. Only the norm
 - **Inelastic strain.** Each edge records the strain its stiffest slice could not
   store elastically.
 - **Volumetric flow.** Each column changes its reference area by twice the mean of
-  its edges' inelastic strain, at fixed crust volume. Shortening past the strength
-  limits thickens crust (and isostasy raises it); stretching thins it; pure shear
-  leaves areas alone. The rest length (sum of apothems) follows the area. Edges
-  remember the pair's distance, not its strain, so that change adds no stress.
+  its edges' inelastic strain; pure shear leaves areas alone. The rest length (sum of
+  apothems) follows the area. Edges remember the pair's distance, not its strain, so
+  that change adds no stress.
 - **Integrity.** Edges lose integrity in proportion to the plastic work done on them,
   and heal toward 1 with a thermally activated time: 0.1 Myr at mantle temperature,
   ~50 Myr at 1200 K, never in cold lithosphere.
@@ -162,9 +162,24 @@ id most of its particles had), so splits and merges show up as events. Each plat
 an Euler pole fitted to its particles' displacement over the interval, plus its rms
 speed and the rms of the non-rigid part.
 
-**Growth and subduction** (`growth.wgsl`, `solver.wgsl`, `thermal.wgsl`). Particles
-over strong divergence grow in area. Past 3× the base area they split, and the
-child is fresh oceanic crust. When two surface discs overlap deeply, the lower one
+**Area, volume and melt** (`shaders/compute/area.wgsl`, `split.wgsl`; references
+`src/columns/area.js`, `src/columns/volume.js`). A column's actual area is its cell in
+a weighted Voronoi tessellation of the column positions, recomputed every step; the
+cells tile the sphere exactly (boundaries through the contact points of touching
+columns). Each column carries a crust **volume**; its thickness is volume / area, so
+stretching thins crust and squeezing thickens it, with no rule beyond geometry.
+Stretching also thins the lithosphere (its thermal age scales by (A₀/A)²), and where
+the lithosphere is thinner than 70 km, new area brings decompression melt: 7 km of
+crust per unit new area at a ridge, none under thick lithosphere. Melt is mixed into
+the column's composition, so a stretched continent eventually becomes oceanic
+(breakup). A column whose cell exceeds twice the base hexagon **splits** along the
+cell's long axis into two halves that share its volume and reference area, joined by
+an intact, stress-free edge. Sources (melt) and sinks (slabs) are logged, so the crust
+volume budget closes. This replaced the old spreading stand-in (area growth over
+diverging mantle).
+
+**Subduction** (`solver.wgsl`, `thermal.wgsl`; a stand-in until phase F). When two
+surface discs overlap deeply, the lower one
 becomes a slab (state 2): its top drops below the lithosphere, so its edges to
 surface columns leave range (it also loses its attachment to the trailing plate
 until design phase F), and it sinks, heats up, and thins until it melts. Its index then
@@ -222,7 +237,9 @@ plate-player/
 │   │   └── law.js             CPU reference for the edge law: slices, Maxwell stresses, caps, integrity
 │   ├── columns/
 │   │   ├── profile.js         CPU reference for column profiles: geotherm, Airy, GPE, strength
-│   │   └── flow.js            CPU reference for volumetric flow and the GPE push
+│   │   ├── flow.js            CPU reference for volumetric flow and the GPE push
+│   │   ├── area.js            CPU reference for the tessellated area (weighted Voronoi cells)
+│   │   └── volume.js          CPU reference for crust volume, thinning, melt, breakup and splits
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
@@ -240,7 +257,7 @@ plate-player/
 │   │   ├── renderer.js        render pipelines and draw calls
 │   │   └── camera.js          orbit camera
 │   └── shaders/
-│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver, edges, profile, law, flow
+│       ├── compute/           bindings.wgsl, locate, thermal, solver, edges, profile, law, flow, area, split
 │       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
 ├── test/
 │   ├── unit.test.mjs          CPU tests (Node only)
@@ -303,10 +320,12 @@ Tests on a generated planet are skipped unless `PLATE_PLANET=1`.
 Page options (URL query): `?paused` starts paused, which scripts use to control
 stepping exactly; `?empty` skips generating a world (load one with
 `plate.loadState`); `?capacity=N` sizes the buffers for N particles (8 edge slots
-each) instead of the planet default. `plate.debug` holds the CPU reference functions
-and two readbacks checked against them: `plate.debug.edges()` (edge storage and its
-invariants) and `plate.debug.profiles()` (column profiles vs the reference, worst
-difference per field).
+each) instead of the planet default; `?grid=N` sets the hash grid's cells per axis
+(coarse test worlds need larger cells). `plate.debug` holds the CPU reference
+functions and readbacks checked against them: `plate.debug.edges()` (edge storage
+and its invariants), `plate.debug.profiles()` (column profiles vs the reference,
+worst difference per field) and `plate.debug.counters()` (crust volume sources and
+sinks, breakups, clipped cells and capacity overflows since load).
 
 **What belongs in the test suite.** Keep tests cheap and about *mechanisms*:
 invariants (every slot free or active exactly once), small analytic cases (two
@@ -475,11 +494,13 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [ ] **Crust → mantle feedback** is not coupled: continents should blanket (warm)
       the mantle beneath them, and slabs should be the main cold downwellings,
       replacing the random cold drips.
-- [ ] **The spreading proxy stresses plates.** It inflates particles *inside* plates
-      over upwellings. Since bonds and contacts agree on rest length it no longer tears
-      them outright, but stress climbs ~60 MPa per 0.5 Myr with it on and stays ~20 MPa
-      with it off (design.md, phase 3 findings). New crust should only appear where
-      plates separate; this is a design decision (options in design.md).
+- [x] ~~**The spreading proxy stresses plates.**~~ Removed in phase E: new crust now
+      comes from stretching (tessellated area at fixed volume) plus decompression melt
+      where the lithosphere is thin.
+- [ ] **No young ridges in the initial state:** its oceans are all 60 Myr old, so
+      nothing melts until stretched by β > 1.4 (design.md, phase E findings).
+- [ ] **Breakup needs β ≈ 10** with melt mixed by volume; real margins break at
+      β ≈ 3–5. Decide the criterion at integration.
 - [ ] **Residual non-rigidity** of plate interiors (~1 mm/yr against ~0.1 mm/yr for
       ideal elastic plates) is solver under-convergence: measure at higher resolution
       before changing the solver.

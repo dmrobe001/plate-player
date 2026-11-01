@@ -18,17 +18,22 @@ const SECONDS_PER_MYR = 3.15576e13;
 /** Columns lighter than this (kg/m^3 at mantle temperature) are continental. */
 export const CONTINENTAL_DENSITY_MAX = 2850;
 
-/** Depth of the column's base below its top, km (lithosphere_thickness_km in solver.wgsl). */
-export function lithosphereThicknessKm(compositionDensity, ageMyr, params) {
-  if (compositionDensity < CONTINENTAL_DENSITY_MAX) return params.continental_lithosphere_km;
-  const ageS = Math.max(ageMyr, 0) * SECONDS_PER_MYR;
-  return Math.min((2.32 * Math.sqrt(params.thermal_diffusivity_m2_s * ageS)) / 1000, params.oceanic_lithosphere_max_km);
+/**
+ * Lithosphere thickness, km (lithosphere_thickness_km in solver.wgsl): half-space
+ * cooling 2.32 sqrt(kappa t) of the thermal age t, capped at the full thickness
+ * for the composition (oceanic plate model; continental keel). Stretching thins
+ * it by scaling t (src/columns/volume.js).
+ */
+export function lithosphereThicknessKm(compositionDensity, thermalAgeMyr, params) {
+  const cap = compositionDensity < CONTINENTAL_DENSITY_MAX ? params.continental_lithosphere_km : params.oceanic_lithosphere_max_km;
+  const ageS = Math.max(thermalAgeMyr, 0) * SECONDS_PER_MYR;
+  return Math.min((2.32 * Math.sqrt(params.thermal_diffusivity_m2_s * ageS)) / 1000, cap);
 }
 
 /**
  * Columns as plain arrays, for the functions below.
  * @param P  per-particle arrays: position (stride `stride`), apothem, elevation,
- *           composition_density, age, state, is_active (as unpacked from the
+ *           composition_density, thermal_age_myr (or age), state, is_active (as unpacked from the
  *           Particle buffer, or built by hand in tests)
  * @param positionField  which position to use (the GPU decides on predicted_pos)
  */
@@ -40,7 +45,7 @@ export function columnsFrom(P, params, { stride = 4, positionField = 'predicted_
     for (let c = 0; c < 3; c++) position[3 * i + c] = pos[stride * i + c];
     top[i] = P.elevation[i];
     // The column spans its crust and its lithosphere, whichever reaches deeper (column_bottom in edges.wgsl).
-    bottom[i] = P.elevation[i] - Math.max(lithosphereThicknessKm(P.composition_density[i], P.age[i], params), P.thickness_km?.[i] ?? 0);
+    bottom[i] = P.elevation[i] - Math.max(lithosphereThicknessKm(P.composition_density[i], (P.thermal_age_myr ?? P.age)[i], params), P.thickness_km?.[i] ?? 0);
   }
   return {
     count, position, top, bottom,

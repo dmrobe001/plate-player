@@ -55,7 +55,7 @@ fn column_of(i: u32) -> Column {
         c.a_w_m3 = sim.radiogenic_heat_uw_m3 * 1e-6;
         let tl = ts + 0.9 * (tm - ts);
         let produced = 0.5 * c.a_w_m3 * c.hr_m * c.hr_m;
-        c.qm = max((k * (tl - ts) - produced) / (c.lith_km * 1000.0), 1e-3);
+        c.qm = max((k * (tl - ts) - produced) / (max(c.lith_km, 1.0) * 1000.0), 1e-3);
         c.z_mantle_km = max((k * (tm - ts) - produced) / c.qm / 1000.0, c.lith_km);
         c.heat_flow = (c.qm + c.a_w_m3 * c.hr_m) * 1000.0;
     } else {

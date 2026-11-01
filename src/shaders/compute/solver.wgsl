@@ -17,12 +17,21 @@ fn base_area() -> f32 {
     return 3.4641 * sim.base_apothem * sim.base_apothem;
 }
 
-// Depth of the plate's base (lithosphere-asthenosphere boundary), km.
-// Oceanic: half-space cooling, 2.32 sqrt(kappa age), capped; continental: fixed keel.
+// Depth of the plate's base (lithosphere-asthenosphere boundary), km:
+// half-space cooling 2.32 sqrt(kappa t) of the thermal age, capped at the full
+// thickness for the composition (CPU reference: lithosphereThicknessKm in
+// src/edges/topology.js). Stretching thins it by scaling t (area.wgsl).
+fn lithosphere_cap_km(rho: f32) -> f32 {
+    return select(sim.oceanic_lithosphere_max_km, sim.continental_lithosphere_km, rho < 2850.0);
+}
 fn lithosphere_thickness_km(i: u32) -> f32 {
-    if (particles[i].composition_density < 2850.0) { return sim.continental_lithosphere_km; }
-    let age_s = max(particles[i].age, 0.0) * 3.15576e13;
-    return min(2.32 * sqrt(sim.thermal_diffusivity_m2_s * age_s) / 1000.0, sim.oceanic_lithosphere_max_km);
+    let age_s = max(particles[i].thermal_age_myr, 0.0) * 3.15576e13;
+    return min(2.32 * sqrt(sim.thermal_diffusivity_m2_s * age_s) / 1000.0, lithosphere_cap_km(particles[i].composition_density));
+}
+// Thermal age at which the lithosphere reaches its cap, Myr (thermalAgeCapMyr in src/columns/volume.js).
+fn thermal_age_cap_myr(rho: f32) -> f32 {
+    let x = lithosphere_cap_km(rho) * 1000.0 / 2.32;
+    return x * x / sim.thermal_diffusivity_m2_s / 3.15576e13;
 }
 
 // Couette shear across the asthenosphere: drag per area = viscosity / h, with
@@ -30,7 +39,7 @@ fn lithosphere_thickness_km(i: u32) -> f32 {
 // relative to a base-size particle over the reference channel (w = 1).
 fn inverse_drag(i: u32) -> f32 {
     let channel = max(sim.asthenosphere_base_km - lithosphere_thickness_km(i), sim.min_channel_km);
-    return (base_area() / particles[i].surface_area) * (channel / sim.drag_reference_channel_km);
+    return (base_area() / particles[i].area_ref) * (channel / sim.drag_reference_channel_km);
 }
 
 @compute @workgroup_size(64)
@@ -167,6 +176,7 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
     // below any lithosphere (a stand-in until slabs bend, design phase 7).
     if (particles[idx].next_state == 2u && particles[idx].state == 1u) {
         particles[idx].state = 2u;
+        add_budget(BUDGET_SINK, particles[idx].crust_volume); // leaves the surface: a volume sink (design 4.8)
         particles[idx].elevation = -sim.slab_initial_depth_km;
     }
     particles[idx].next_state = particles[idx].state;

@@ -7,8 +7,9 @@
 //
 // Under the software GPU every dispatch and readback costs in proportion to
 // buffer capacity, and a readback takes ~0.5 s. So mechanism tests run on an
-// empty page with small buffers (SMALL_PAGE: 1024 particle slots) and read
-// back as rarely as they can; the whole default suite takes about a minute.
+// empty page with small buffers (SMALL_PAGE: 1024 particle slots; the phase E
+// sphere tests 4096) and read back as rarely as they can; the whole default
+// suite takes about four minutes under SwiftShader.
 // Tests on a generated planet (full capacity, minutes each) run only with
 // PLATE_PLANET=1.
 //
@@ -28,6 +29,15 @@ import { checkEdgeStorage } from '../src/edges/topology.js';
 import { readZip } from '../src/record/zip.js';
 import { createIcosphere } from '../src/geometry/icosphere.js';
 import { CHAIN, chainExact, chainState } from './support/chain.mjs';
+import { tessellate } from '../src/columns/area.js';
+import { splitColumn, volumeStep } from '../src/columns/volume.js';
+
+// Typed arrays do not survive page.evaluate's JSON; send plain arrays (restored in the page).
+const jsonState = (st) => ({
+  ...st,
+  particles: Object.fromEntries(Object.entries(st.particles).map(([k, v]) => [k, ArrayBuffer.isView(v) ? Array.from(v) : v])),
+  bonds: Object.fromEntries(Object.entries(st.bonds).map(([k, v]) => [k, ArrayBuffer.isView(v) ? Array.from(v) : v])),
+});
 
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
@@ -46,12 +56,12 @@ test.before(async () => { browser = await chromium.launch({ headless: false, arg
 test.after(async () => { await browser?.close(); });
 
 /** A page with a generated planet, or (small = true) an empty page with small buffers. */
-async function openPage({ small = false } = {}) {
+async function openPage({ small = false, query = '' } = {}) {
   const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
   page.on('console', (m) => { if (m.type() === 'error' && !m.text().includes('favicon')) errors.push(m.text()); });
-  await page.goto(PAGE + (small ? SMALL_PAGE : ''));
+  await page.goto(PAGE + (small ? SMALL_PAGE : '') + query);
   await page.waitForFunction(() => window.plate?.ready, null, { timeout: 120_000 });
   page.errors = errors;
   return page;
@@ -683,8 +693,9 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
   // Phase D (design 9). A 19-column patch of old ocean, bonded, moved by
   // hand (no solve). (1) Uniform shortening by 0.4% per step: once every
   // slice sits at its compression cap, all further shortening is inelastic,
-  // so each column's area shrinks by 2 x 0.4% per step and its crust
-  // thickens inversely, with total crust volume constant; integrity falls by
+  // so each column's reference area shrinks by 2 x 0.4% per step; its crust
+  // (volume / tessellated area, phase E) thickens inversely, with total crust
+  // volume constant; integrity falls by
   // exactly the logged plastic work / W_D (cold: no healing). (2) Pure shear
   // (x stretched, y shortened by 0.02% per step) below the compression cap:
   // stretched edges crack, others stay elastic, and no area changes.
@@ -698,7 +709,7 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
     const centre = pts.findIndex((p) => Math.hypot(p[0], p[1]) < 1e-9);
     const WD = 1e5;
     await plate.setParams({ ...brittle, damage_work_mpa_km: WD, gpe_force_factor: 0, mantle_drive: 0, solver_iterations: 0 });
-    const volume = (r) => { let v = 0; for (let i = 0; i < n; i++) v += r.P.thickness_km[i] * r.P.surface_area[i]; return v; };
+    const volume = (r) => { let v = 0; for (let i = 0; i < n; i++) v += r.P.crust_volume[i]; return v; };
 
     // (1) Uniform shortening.
     await plate.loadState(H.state(pts, a, bonds));
@@ -714,7 +725,7 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
       await plate.runSteps(1);
       r = await plate.debug.edges();
       for (const [e, phi] of phiExpected) phiExpected.set(e, Math.max(phi - r.E.work_mpa_km[e] / WD, 0));
-      rows.push({ s, h: r.P.thickness_km[centre], area: r.P.surface_area[centre], volume: volume(r) });
+      rows.push({ s, h: r.P.thickness_km[centre], area: r.P.area_ref[centre], volume: volume(r), hv: r.P.crust_volume[centre] / r.P.cell_area[centre] });
     }
     let phiErr = 0, phiMin = 1;
     for (const [e, phi] of phiExpected) { phiErr = Math.max(phiErr, Math.abs(r.E.integrity[e] - phi)); phiMin = Math.min(phiMin, phi); }
@@ -722,7 +733,7 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
     // (2) Pure shear.
     await plate.loadState(H.state(pts, a, bonds));
     r = await plate.debug.edges();
-    const area0 = Array.from(r.P.surface_area.subarray(0, n));
+    const area0 = Array.from(r.P.area_ref.subarray(0, n));
     const ds = 2e-4;
     const work = new Map();
     for (let s = 1; s <= 5; s++) {
@@ -732,7 +743,7 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
       for (const [key, e] of r.pairs) work.set(key, (work.get(key) ?? 0) + r.E.work_mpa_km[e]);
     }
     let areaChange = 0;
-    for (let i = 0; i < n; i++) areaChange = Math.max(areaChange, Math.abs(Math.log(r.P.surface_area[i] / area0[i])));
+    for (let i = 0; i < n; i++) areaChange = Math.max(areaChange, Math.abs(Math.log(r.P.area_ref[i] / area0[i])));
     const byAngle = { stretched: 0, other: 0, stretchedWork: Infinity, otherWork: 0 };
     for (const [key, w] of work) {
       const [i, j] = key.split(',').map(Number);
@@ -747,8 +758,12 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
 
   const at = (s) => out.rows.find((x) => x.s === s);
   const measured = Math.log(at(12).h / at(6).h), expected = -2 * 6 * Math.log(1 - out.delta);
-  console.log(`  uniform shortening 0.4%/step, steps 6-12: centre crust thickens by ln ${measured.toFixed(4)}, predicted ${expected.toFixed(4)}`);
-  assert.ok(Math.abs(measured / expected - 1) < 0.03, `thickening ${measured} vs ${expected}`);
+  const flowed = -Math.log(at(12).area / at(6).area);
+  console.log(`  uniform shortening 0.4%/step, steps 6-12: centre area_ref shrinks by ln ${flowed.toFixed(4)} (inelastic), crust thickens by ln ${measured.toFixed(4)}, predicted ${expected.toFixed(4)}`);
+  assert.ok(Math.abs(flowed / expected - 1) < 0.03, `area_ref flow ${flowed} vs ${expected}`);
+  assert.ok(Math.abs(measured / expected - 1) < 1e-3, `thickening ${measured} vs ${expected}`);
+  // Thickness is volume over the tessellated area (one step behind the last move).
+  for (const x of out.rows) assert.ok(Math.abs(x.h / x.hv - 1) < 1e-6);
   for (const x of out.rows) assert.ok(Math.abs(x.volume / out.v0 - 1) < 1e-5, `step ${x.s}: volume ${x.volume} vs ${out.v0}`);
   console.log(`  integrity: worst difference from 1 - sum(work) / W_D ${out.phiErr.toExponential(1)} (lowest ${out.phiMin.toFixed(4)})`);
   assert.ok(out.phiErr < 1e-4 && out.phiMin < 0.99);
@@ -785,12 +800,12 @@ test('below yield nothing irreversible happens; the GPE push matches the referen
     }
     H.move(pts.map((p) => p.map((v) => v + 2e-5 * a * rand())));
     let r = await plate.debug.edges();
-    const area0 = Array.from(r.P.surface_area.subarray(0, n));
+    const area0 = Array.from(r.P.area_ref.subarray(0, n));
     await plate.runSteps(30);
     r = await plate.debug.edges();
     let work = 0, phi = 1, areaChange = 0;
     for (const e of r.pairs.values()) { work = Math.max(work, r.E.work_mpa_km[e]); phi = Math.min(phi, r.E.integrity[e]); }
-    for (let i = 0; i < n; i++) areaChange = Math.max(areaChange, Math.abs(Math.log(r.P.surface_area[i] / area0[i])));
+    for (let i = 0; i < n; i++) areaChange = Math.max(areaChange, Math.abs(Math.log(r.P.area_ref[i] / area0[i])));
 
     // (2) GPE push (off by default until integration; on here).
     await plate.setParams({ solver_iterations: 0, gpe_force_factor: 1 });
@@ -824,6 +839,196 @@ test('below yield nothing irreversible happens; the GPE push matches the referen
   assert.ok(out.areaChange < 1e-5);
   console.log(`  GPE push: mean ${out.meanKmPerStep.toFixed(2)} km per step (${(out.meanKmPerStep * 1e5 / (out.dt * 1e6)).toFixed(0)} cm/yr for a free column); worst relative difference from the reference ${out.worst.toExponential(1)}`);
   assert.ok(out.worst < 1e-2);
+});
+
+// --- Phase E: area, volume, melt and splits (design 4.8) ---------------------
+// A whole sphere of 2562 columns (icosphere 4, jittered, apothems +-15%), so
+// that the tessellation tiles it. Columns are ~4x the planet's, so the page
+// uses a coarser hash grid (cells 0.15) and a matching clip radius.
+const SPHERE_PAGE = { query: '&empty&capacity=4096&grid=20' };
+function sphereState({ jitter = 0.2, spread = 0.3, seed = 4, kind = () => 'old' } = {}) {
+  const v = createIcosphere(4).vertices;
+  let s = seed;
+  const rng = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  const spacing = Math.sqrt((4 * Math.PI) / v.length / (Math.sqrt(3) / 2));
+  const pts = v.map((x) => { const y = x.map((c) => c + jitter * spacing * (rng() - 0.5)); const l = Math.hypot(...y); return y.map((c) => c / l); });
+  const apothem = Float32Array.from(v, () => (spacing / 2) * (1 + spread * (rng() - 0.5)));
+  const n = pts.length;
+  const K = { young: [7, 3000, 0], old: [7, 3000, 100], continent: [35, 2700, 1000] };
+  const col = (f) => Float32Array.from(pts, (p, i) => K[kind(p, i)][f]);
+  return {
+    pts, spacing, apothem,
+    state: {
+      particles: { count: n, position: Float32Array.from(pts.flat()), thickness: col(0), compositionDensity: col(1), age: col(2), temperature: new Float32Array(n).fill(278), apothem },
+      bonds: { count: 0, a: new Uint32Array(0), b: new Uint32Array(0), damage: new Float32Array(0) },
+    },
+  };
+}
+const SPHERE_PARAMS = (spacing) => ({
+  cell_clip_radius: 0.065, base_apothem: spacing / 2, mantle_drive: 0, solver_iterations: 0, gpe_force_factor: 0, volumetric_flow_factor: 0,
+});
+// Read the first n particles' fields as plain arrays, plus the counters.
+const READ_COLUMNS = `async (n, fields) => {
+  const P = plate.debug.topology && plate.layout.Particle;
+  const f = new Float32Array((await plate.readBuffers(['particles'])).particles), u = new Uint32Array(f.buffer);
+  const out = {};
+  for (const [name, type] of P.fields) {
+    if (!fields.includes(name)) continue;
+    const o = P.offsets[name], len = type === 'vec4f' ? 4 : 1, src = type === 'u32' ? u : f;
+    out[name] = Array.from({ length: n * len }, (_, k) => src[P.words * Math.floor(k / len) + o + (k % len)]);
+  }
+  out.counters = await plate.debug.counters();
+  return out;
+}`;
+
+test('tessellated areas tile the sphere and match the reference; crust volume = thickness x area at load', { timeout: 300_000 }, async () => {
+  const { pts, spacing, apothem, state } = sphereState({ kind: (p) => (p[2] > 0 ? 'continent' : 'old') });
+  const page = await openPage(SPHERE_PAGE);
+  const out = await page.evaluate(async ([st, params, readSrc]) => {
+    const read = eval(readSrc);
+    await plate.setParams(params);
+    const restore = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? Float32Array.from(v) : v]));
+    await plate.loadState({ ...st, particles: restore(st.particles), bonds: restore(st.bonds) });
+    return read(st.particles.count, ['cell_area', 'crust_volume', 'thickness_km', 'cell_clipped']);
+  }, [jsonState(state), SPHERE_PARAMS(spacing), READ_COLUMNS]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  const n = pts.length;
+  const total = out.cell_area.reduce((a, b) => a + b, 0);
+  const ref = tessellate(Float64Array.from(pts.flat()), Array.from(apothem), 0.065);
+  let worst = 0;
+  for (let i = 0; i < n; i++) worst = Math.max(worst, Math.abs(out.cell_area[i] / ref[i].area - 1));
+  console.log(`  ${n} cells: sum - 4 pi = ${(total - 4 * Math.PI).toExponential(1)} (relative ${((total - 4 * Math.PI) / (4 * Math.PI)).toExponential(1)}); worst cell vs reference ${worst.toExponential(1)}; clipped ${out.counters.clippedCells}`);
+  assert.equal(out.counters.clippedCells, 0);
+  assert.equal(ref.filter((c) => c.clipped).length, 0);
+  assert.ok(Math.abs(total / (4 * Math.PI) - 1) < 1e-5);
+  assert.ok(worst < 1e-4);
+  for (let i = 0; i < n; i++) assert.ok(Math.abs(out.crust_volume[i] / (out.thickness_km[i] * out.cell_area[i]) - 1) < 1e-6);
+});
+
+test('melt: new area makes 7 km of crust where the lithosphere is thin, none under thick lithosphere; the volume budget closes', { timeout: 300_000 }, async () => {
+  // One step with the columns moved by hand (a smooth displacement field, so
+  // cells grow and shrink) and one column pushed deep onto a neighbour (the
+  // overlap stand-in turns the lower one into a slab: a volume sink). Young
+  // ocean (L = 0) in the north, old ocean at mid latitudes, continent in the south.
+  const kind = (p) => (p[2] > 0.3 ? 'young' : p[2] < -0.3 ? 'continent' : 'old');
+  const { pts, spacing, apothem, state } = sphereState({ kind });
+  const n = pts.length;
+  const amp = 0.01;
+  const moved = pts.map(([x, y, z]) => { const q = [x + amp * Math.sin(5 * y), y + amp * Math.sin(5 * z), z + amp * Math.sin(5 * x)]; const l = Math.hypot(...q); return q.map((c) => c / l); });
+  // The sink: an old-ocean column pushed onto its nearest neighbour.
+  const k = pts.findIndex((p) => kind(p) === 'old');
+  let j = -1, dj = Infinity;
+  pts.forEach((p, i) => { const d = Math.hypot(...p.map((c, m) => c - pts[k][m])); if (i !== k && d < dj) { dj = d; j = i; } });
+  moved[k] = (() => { const q = moved[j].map((c, m) => c + 0.3 * (moved[k][m] - c)); const l = Math.hypot(...q); return q.map((c) => c / l); })();
+  const page = await openPage(SPHERE_PAGE);
+  const fields = ['cell_area', 'crust_volume', 'thermal_age_myr', 'composition_density', 'volume_added', 'state', 'age'];
+  const out = await page.evaluate(async ([st, params, readSrc, movedPts, fields, helperSrc]) => {
+    const read = eval(readSrc), H = eval(helperSrc);
+    // Only the pushed pair (overlap ~0.05) may trigger the overlap stand-in for subduction.
+    await plate.setParams({ ...params, subduction_overlap: 0.03 });
+    const restore = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? Float32Array.from(v) : v]));
+    await plate.loadState({ ...st, particles: restore(st.particles), bonds: restore(st.bonds) });
+    const before = await read(st.particles.count, fields);
+    H.move(movedPts);
+    await plate.runSteps(1);
+    return { before, after: await read(st.particles.count, fields), params: plate.sim.params };
+  }, [jsonState(state), SPHERE_PARAMS(spacing), READ_COLUMNS, moved, fields, PATCH_HELPERS]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+
+  const { before: B, after: A, params: p } = out;
+  const sinkCol = [k, j].find((i) => A.state[i] === 2);
+  assert.ok(sinkCol !== undefined, 'the pushed pair should have produced a slab');
+  assert.equal(A.state.filter((x) => x === 2).length, 1, 'exactly one slab');
+  // Per column vs the reference (volume.js), from the GPU's own cell areas.
+  let worst = 0, young = { dA: 0, dV: 0, n: 0 }, thick = 0, added = 0;
+  for (let i = 0; i < n; i++) {
+    const r = volumeStep({ volume: B.crust_volume[i], area: A.cell_area[i], areaPrev: B.cell_area[i], thermalAgeMyr: B.thermal_age_myr[i], compositionDensity: B.composition_density[i], ageMyr: B.age[i] }, p);
+    worst = Math.max(worst, Math.abs(A.volume_added[i] - r.added) / (r.added + 1e-3 * B.crust_volume[i] * 1e-3));
+    added += A.volume_added[i];
+    const dA = A.cell_area[i] - B.cell_area[i];
+    if (kind(pts[i]) === 'young' && dA > 0) { young.dA += dA; young.dV += A.volume_added[i]; young.n++; }
+    if (kind(pts[i]) !== 'young') thick = Math.max(thick, A.volume_added[i]);
+  }
+  const surface = (S) => { let v = 0; for (let i = 0; i < n; i++) if (S.state[i] === 1) v += S.crust_volume[i]; return v; };
+  const source = A.counters.volumeSource - B.counters.volumeSource, sink = A.counters.volumeSink - B.counters.volumeSink;
+  const dV = surface(A) - surface(B);
+  console.log(`  ${young.n} stretched young columns: ${(young.dV / young.dA).toFixed(4)} km of crust per unit new area (F H_m = ${p.melt_fraction * p.melt_depth_km}); old ocean and continent: max melt ${thick}`);
+  console.log(`  worst column vs reference ${worst.toExponential(1)}; budget: d(sum V) ${dV.toExponential(6)}, sources ${source.toExponential(6)} (sum of columns ${added.toExponential(6)}), sinks ${sink.toExponential(6)} (slab V ${A.crust_volume[sinkCol].toExponential(6)})`);
+  assert.ok(young.n > 50 && Math.abs(young.dV / young.dA / (p.melt_fraction * p.melt_depth_km) - 1) < 1e-4);
+  assert.equal(thick, 0);
+  assert.ok(worst < 1e-3);
+  assert.ok(Math.abs(source / added - 1) < 1e-5, 'logged sources = sum of columns');
+  assert.ok(Math.abs(sink / A.crust_volume[sinkCol] - 1) < 1e-6, 'logged sink = slab volume');
+  // Identity to the float32 rounding of each column's V (at most 6e-8 V per column touched).
+  let rounding = 0;
+  for (let i = 0; i < n; i++) if (A.volume_added[i] > 0) rounding += 6e-8 * A.crust_volume[i];
+  console.log(`  budget mismatch ${(dV - (source - sink)).toExponential(1)}, float32 rounding bound ${rounding.toExponential(1)}`);
+  assert.ok(Math.abs(dV - (source - sink)) < rounding, `budget ${dV} vs ${source - sink}`);
+});
+
+test('splits: halves share volume and area_ref, sit on the cell axis, start bonded and stress-free; the tiling stays exact', { timeout: 300_000 }, async () => {
+  // Cells larger than 1.15 x the base hexagon split (jitter and apothem spread
+  // make a few dozen). No melt, so total volume and reference area are conserved.
+  const { pts, spacing, state } = sphereState({ kind: () => 'old' });
+  const n = pts.length;
+  const page = await openPage(SPHERE_PAGE);
+  const fields = ['cell_area', 'crust_volume', 'area_ref', 'position', 'cell_shape', 'cell_clipped', 'is_active'];
+  const out = await page.evaluate(async ([st, params, readSrc, fields]) => {
+    const read = eval(readSrc);
+    await plate.setParams({ ...params, split_area_factor: 1.15, melt_fraction: 0, subduction_overlap: 1 }); // no slabs
+    const restore = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? Float32Array.from(v) : v]));
+    await plate.loadState({ ...st, particles: restore(st.particles), bonds: restore(st.bonds) });
+    const cap = 4096;
+    const before = await read(cap, fields);
+    await plate.runSteps(1);
+    const after = await read(cap, fields);
+    const r = await plate.debug.edges();
+    const E = [];
+    for (const [key, e] of r.pairs) E.push({ key, integrity: r.E.integrity[e], stress: Array.from(r.E.slice_stress_mpa.subarray(8 * e, 8 * e + 8)) });
+    await plate.setParams({ split_area_factor: 100 });
+    await plate.runSteps(1);
+    return { before, after, E, next: await read(cap, ['cell_area', 'is_active', 'state']), problems: r.problems, base: Math.sqrt(3) * 2 * params.base_apothem ** 2 };
+  }, [jsonState(state), SPHERE_PARAMS(spacing), READ_COLUMNS, fields]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+
+  const { before: B, after: A, base } = out;
+  const splitters = [];
+  for (let i = 0; i < n; i++) if (B.cell_area[i] > 1.15 * base && !B.cell_clipped[i]) splitters.push(i);
+  const children = [];
+  for (let i = n; i < 4096; i++) if (A.is_active[i]) children.push(i);
+  const sum = (S, f, m) => { let v = 0; for (let i = 0; i < m; i++) if (S.is_active[i]) v += S[f][i]; return v; };
+  console.log(`  ${splitters.length} cells above 1.15 x base split into ${children.length} children; sum V ${sum(A, 'crust_volume', 4096) / sum(B, 'crust_volume', n) - 1}, sum area_ref ${sum(A, 'area_ref', 4096) / sum(B, 'area_ref', n) - 1} (relative change)`);
+  assert.ok(splitters.length > 5 && children.length === splitters.length);
+  assert.ok(Math.abs(sum(A, 'crust_volume', 4096) / sum(B, 'crust_volume', n) - 1) < 1e-6);
+  assert.ok(Math.abs(sum(A, 'area_ref', 4096) / sum(B, 'area_ref', n) - 1) < 1e-6);
+  assert.deepEqual(out.problems, []);
+  const edgeOf = new Map(out.E.map((x) => [x.key, x]));
+  let worstPos = 0;
+  for (const i of splitters) {
+    const p = B.position.slice(4 * i, 4 * i + 3), sh = B.cell_shape.slice(4 * i, 4 * i + 4);
+    const want = splitColumn(p, { centroid: [sh[0], sh[1]], axis: sh[2], spread: sh[3] }, 1, 1);
+    // The child: the new column nearest the reference child position.
+    const dist = (c) => Math.hypot(...want.child.map((v, m) => v - A.position[4 * c + m]));
+    const c = children.reduce((best, x) => (dist(x) < dist(best) ? x : best));
+    const pair = edgeOf.get(`${Math.min(i, c)},${Math.max(i, c)}`);
+    assert.ok(pair, `no edge from parent ${i} to its child ${c}`);
+    assert.equal(pair.integrity, 1);
+    // Stress-free up to the float32 rounding of positions: ~6e-8 over a rest
+    // length of ~0.05 is a strain of ~1e-6, x E = 0.1 MPa.
+    assert.ok(pair.stress.every((v) => Math.abs(v) < 0.2), `parent-child edge stressed: ${pair.stress}`);
+    assert.ok(Math.abs(A.crust_volume[i] / (B.crust_volume[i] / 2) - 1) < 1e-6 && A.crust_volume[c] === A.crust_volume[i]);
+    assert.ok(Math.abs(A.area_ref[i] / (B.area_ref[i] / 2) - 1) < 1e-6 && A.area_ref[c] === A.area_ref[i]);
+    const got = { parent: A.position.slice(4 * i, 4 * i + 3), child: A.position.slice(4 * c, 4 * c + 3) };
+    for (const w of ['parent', 'child']) worstPos = Math.max(worstPos, Math.hypot(...got[w].map((v, m) => v - want[w][m])) / spacing);
+  }
+  const total = out.next.cell_area.reduce((s, a, i) => s + (out.next.is_active[i] && out.next.state[i] === 1 ? a : 0), 0);
+  console.log(`  halves vs reference positions: worst ${worstPos.toExponential(1)} spacings; after the split step, sum of cells - 4 pi = ${(total - 4 * Math.PI).toExponential(1)}`);
+  // WGSL's cos and sin are accurate to 2^-11 (absolute): ~1e-5 of the offset.
+  assert.ok(worstPos < 2e-4);
+  assert.ok(Math.abs(total / (4 * Math.PI) - 1) < 1e-5);
 });
 
 test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 , ...PLANET }, async () => {
