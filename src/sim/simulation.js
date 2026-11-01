@@ -1,6 +1,6 @@
 // GPU-side simulation state and the per-frame compute schedule.
 
-import { Constraint, GridNode, NONE, Particle } from '../gpu/layout.js';
+import { Edge, GridNode, NONE, Particle, SLOTS } from '../gpu/layout.js';
 import { createShaderModule } from '../gpu/device.js';
 import { packSimParams, SIM_PARAMS, SIM_PARAMS_BYTES, simParamsWGSL } from './params.js';
 
@@ -9,13 +9,12 @@ import locateWGSL from '../shaders/compute/locate.wgsl';
 import thermalWGSL from '../shaders/compute/thermal.wgsl';
 import growthWGSL from '../shaders/compute/growth.wgsl';
 import solverWGSL from '../shaders/compute/solver.wgsl';
+import edgesWGSL from '../shaders/compute/edges.wgsl';
 
 export const CAPACITY = {
   maxParticles: 25000,
-  maxBonds: 65536,       // bond slots [0, maxBonds), managed by the constraint free list
-  maxContacts: 65536,    // contact slots follow, rebuilt every step
-  get maxConstraints() { return this.maxBonds + this.maxContacts; },
-  hashGridDim: 32,       // contact-search grid cells per axis over [-1.5, 1.5]
+  maxEdges: 131072,      // edge slots, managed by the edge free list
+  hashGridDim: 32,       // neighbour-search grid cells per axis over [-1.5, 1.5]
   adjacencyWidth: 6,     // neighbours stored per mantle node
 };
 
@@ -30,11 +29,12 @@ const WORKGROUP = 64;
 const ITERATIONS_PER_SUBMIT = 16;
 
 /** Buffers that together are the complete simulation state (snapshot / restore). */
-export const STATE_BUFFERS = ['grid', 'particles', 'constraints', 'particlePool', 'constraintPool'];
+// (Slot lists in `deltas` are an index rebuilt every step, not state.)
+export const STATE_BUFFERS = ['grid', 'particles', 'edges', 'particlePool', 'edgePool'];
 
 /** WGSL struct definitions shared by compute and render shaders. */
 export function structsWGSL() {
-  return Particle.wgsl() + Constraint.wgsl()
+  return Particle.wgsl() + Edge.wgsl()
     + GridNode.wgsl()
     + simParamsWGSL();
 }
@@ -50,18 +50,19 @@ export class Simulation {
     this.numNodes = icosphere.vertices.length;
     this.steps = 0;
     this.timeMyr = 0;
-    const { maxParticles, maxConstraints, hashGridDim, adjacencyWidth } = CAPACITY;
+    const { maxParticles, maxEdges, hashGridDim, adjacencyWidth } = CAPACITY;
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
 
     this.buffers = {
       grid: device.createBuffer({ label: 'grid', size: this.numNodes * GridNode.byteSize, usage: S }),
       adjacency: device.createBuffer({ label: 'adjacency', size: this.numNodes * adjacencyWidth * 4, usage: S }),
       particles: device.createBuffer({ label: 'particles', size: maxParticles * Particle.byteSize, usage: S }),
-      constraints: device.createBuffer({ label: 'constraints', size: maxConstraints * Constraint.byteSize, usage: S }),
+      edges: device.createBuffer({ label: 'edges', size: maxEdges * Edge.byteSize, usage: S }),
       particlePool: device.createBuffer({ label: 'particle free list', size: (FREE_LIST_HEADER_WORDS + maxParticles) * 4, usage: S }),
-      constraintPool: device.createBuffer({ label: 'bond free list', size: (FREE_LIST_HEADER_WORDS + CAPACITY.maxBonds) * 4, usage: S }),
+      edgePool: device.createBuffer({ label: 'edge free list', size: (FREE_LIST_HEADER_WORDS + maxEdges) * 4, usage: S }),
       hashGrid: device.createBuffer({ label: 'hash grid', size: hashGridDim ** 3 * 4, usage: S }),
-      deltas: device.createBuffer({ label: 'particle deltas', size: maxParticles * 80, usage: S }), // ParticleDelta in bindings.wgsl
+      // ParticleDelta in bindings.wgsl: position corrections + slot list (SLOTS in layout.js)
+      deltas: device.createBuffer({ label: 'particle deltas and slot lists', size: maxParticles * SLOTS.wordsPerParticle * 4, usage: S }),
       solver: device.createBuffer({ label: 'solver state', size: (4 + MAX_SOLVER_ITERATIONS) * 4, usage: S }),
       plateIds: device.createBuffer({ label: 'plate ids (drawing only)', size: maxParticles * 4, usage: S }),
       params: device.createBuffer({ label: 'sim params', size: SIM_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
@@ -87,8 +88,7 @@ export class Simulation {
       bond_rate_myr_inv: bondRate(this.params),
       num_nodes: this.numNodes,
       max_particles: CAPACITY.maxParticles,
-      max_constraints: CAPACITY.maxConstraints,
-      max_bonds: CAPACITY.maxBonds,
+      max_edges: CAPACITY.maxEdges,
       hash_grid_dim: CAPACITY.hashGridDim,
     });
     if (this.params.solver_iterations > MAX_SOLVER_ITERATIONS) throw new Error(`solver_iterations > ${MAX_SOLVER_ITERATIONS}`);
@@ -101,10 +101,10 @@ export class Simulation {
 
   #createPipelines(onError) {
     const { device, buffers } = this;
-    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL].join('\n');
+    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL, edgesWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
-    const order = ['grid', 'adjacency', 'particles', 'constraints', 'particlePool', 'constraintPool', 'hashGrid', 'deltas', 'solver'];
+    const order = ['grid', 'adjacency', 'particles', 'edges', 'particlePool', 'edgePool', 'hashGrid', 'deltas', 'solver'];
     const memoryLayout = device.createBindGroupLayout({
       entries: order.map((name, binding) => ({
         binding,
@@ -129,12 +129,12 @@ export class Simulation {
     const layout = device.createPipelineLayout({ bindGroupLayouts: [memoryLayout, uniformLayout] });
     const entryPoints = [
       'crust_locate',
-      'crust_thermo_isostasy', 'crust_refresh_derived', 'crust_constraint_healing',
-      'crust_accumulation', 'crust_commit_splits', 'crust_rewire_bonds', 'crust_clean_split',
+      'crust_thermo_isostasy', 'crust_refresh_derived', 'crust_edge_healing',
+      'crust_accumulation', 'crust_commit_splits', 'crust_rewire_edges', 'crust_clean_split',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
-      'crust_begin_constraints', 'crust_clear_contacts', 'crust_find_contacts', 'crust_store_edge_count',
-      'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine', 'crust_bond_stress',
-      'crust_clear_deltas', 'crust_solve_constraints', 'crust_apply_deltas',
+      'edges_begin', 'edges_prune', 'edges_note_listed', 'edges_create', 'edges_finish',
+      'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine', 'crust_edge_stress',
+      'crust_clear_deltas', 'crust_solve_edges', 'crust_apply_deltas',
       'crust_integrate',
     ];
     this.pipelines = Object.fromEntries(entryPoints.map((entryPoint) => [
@@ -149,10 +149,10 @@ export class Simulation {
    */
   load(state, mantle) {
     const { device, buffers } = this;
-    const { maxParticles, maxConstraints, maxBonds } = CAPACITY;
+    const { maxParticles, maxEdges } = CAPACITY;
     const { particles: P, bonds: B } = state;
     if (P.count > maxParticles) throw new Error(`initial particles ${P.count} exceed capacity ${maxParticles}`);
-    if (B.count > maxBonds) throw new Error(`initial bonds ${B.count} exceed capacity ${maxBonds}`);
+    if (B.count > maxEdges) throw new Error(`initial bonds ${B.count} exceed edge capacity ${maxEdges}`);
     if (mantle.mesh !== this.mantleMesh) throw new Error('mantle must use the simulation\'s mantle mesh');
     this.mantle = mantle;
     this.uploadMantle();
@@ -184,24 +184,26 @@ export class Simulation {
     }
     device.queue.writeBuffer(buffers.particles, 0, pbuf);
 
-    // Bonds
-    const cbuf = new ArrayBuffer(maxConstraints * Constraint.byteSize);
-    const cf = new Float32Array(cbuf);
-    const cu = new Uint32Array(cbuf);
-    const co = Constraint.offsets;
+    // Initial bonds become edges with integrity 1 - damage. Other in-range
+    // pairs get edges (integrity 0) in the first step.
+    const ebuf = new ArrayBuffer(maxEdges * Edge.byteSize);
+    const ef = new Float32Array(ebuf);
+    const eu = new Uint32Array(ebuf);
+    const eo = Edge.offsets;
     for (let k = 0; k < B.count; k++) {
-      const base = k * Constraint.words;
-      cu[base + co.particle_a] = B.a[k];
-      cu[base + co.particle_b] = B.b[k];
-      cf[base + co.yield_stress_mpa] = state.yieldStressMPa;
-      cu[base + co.is_active] = 1;
-      cf[base + co.damage] = B.damage[k];
+      const base = k * Edge.words;
+      eu[base + eo.particle_a] = B.a[k];
+      eu[base + eo.particle_b] = B.b[k];
+      eu[base + eo.is_active] = 1;
+      ef[base + eo.integrity] = 1 - B.damage[k];
+      ef[base + eo.yield_stress_mpa] = state.yieldStressMPa;
     }
-    device.queue.writeBuffer(buffers.constraints, 0, cbuf);
+    device.queue.writeBuffer(buffers.edges, 0, ebuf);
 
     // Free lists hold every slot not used by the initial state.
     device.queue.writeBuffer(buffers.particlePool, 0, freeList(P.count, maxParticles));
-    device.queue.writeBuffer(buffers.constraintPool, 0, freeList(B.count, maxBonds));
+    device.queue.writeBuffer(buffers.edgePool, 0, freeList(B.count, maxEdges));
+    device.queue.writeBuffer(buffers.solver, 0, new Uint32Array(4)); // iteration and overflow counters
     this.steps = 0;
     this.timeMyr = 0;
 
@@ -240,10 +242,10 @@ export class Simulation {
     if (this.mantle.advanceTo(this.timeMyr)) this.uploadMantle();
 
     const { device } = this;
-    const { maxParticles, maxConstraints, maxBonds, maxContacts, hashGridDim } = CAPACITY;
+    const { maxParticles, maxEdges, hashGridDim } = CAPACITY;
     const groups = (n) => Math.ceil(n / WORKGROUP);
-    const crust = groups(maxParticles), cells = groups(hashGridDim ** 3);
-    const bonds = groups(maxBonds), contacts = groups(maxContacts), edges = groups(maxConstraints);
+    const crust = groups(maxParticles), cells = groups(hashGridDim ** 3), edges = groups(maxEdges);
+    this.#writeTime();
 
     let encoder, pass;
     const open = () => {
@@ -263,24 +265,24 @@ export class Simulation {
 
     // Crust thermal state, healing, growth and splitting
     run('crust_thermo_isostasy', crust);
-    run('crust_constraint_healing', bonds);
+    run('crust_edge_healing', edges);
     run('crust_accumulation', crust);
     run('crust_commit_splits', 1);
-    run('crust_rewire_bonds', bonds);
+    run('crust_rewire_edges', edges);
     run('crust_clean_split', crust);
 
     // Crust motion: overdamped XPBD. Predict where the mantle alone would
-    // carry each particle, find contacts, then iterate all edges toward the
-    // minimum of drag + elastic energy.
+    // carry each particle, update the edges (pairs in range), then iterate
+    // all edges toward the minimum of drag + elastic energy.
     run('crust_predict', crust);
     run('crust_hash_clear', cells);
     run('crust_hash_build', crust);
-    run('crust_clear_deltas', crust);
     run('solver_begin', 1);
-    run('crust_begin_constraints', bonds); // reset lambda, count edges, list bond partners
-    run('crust_clear_contacts', contacts);
-    run('crust_find_contacts', crust);
-    run('crust_store_edge_count', crust);
+    run('edges_begin', crust);       // clear slot lists
+    run('edges_prune', edges);       // drop pairs out of range; list survivors; reset lambda
+    run('edges_note_listed', crust);
+    run('edges_create', crust);      // new pairs in range
+    run('edges_finish', crust);      // edge counts, angle-sorted slots, solver iterates
     for (let i = 0; i < this.params.solver_iterations; i++) {
       if (i > 0 && i % ITERATIONS_PER_SUBMIT === 0) {
         submit();
@@ -288,16 +290,22 @@ export class Simulation {
         open();
       }
       run('crust_clear_deltas', crust);
-      run('crust_solve_constraints', edges);
+      run('crust_solve_edges', edges);
       run('crust_apply_deltas', crust);
       run('crust_chebyshev_combine', crust);
       run('solver_next_iteration', 1);
     }
-    run('crust_bond_stress', edges);
+    run('crust_edge_stress', edges);
     run('crust_integrate', crust);
     submit();
     this.steps++;
     this.timeMyr += this.params.dt_crust_myr;
+  }
+
+  /** Upload the current time (stamps new edges' born_myr). */
+  #writeTime() {
+    const index = SIM_PARAMS.findIndex(([n]) => n === 'time_myr');
+    this.device.queue.writeBuffer(this.buffers.params, 4 * index, Float32Array.of(this.timeMyr));
   }
 
   /** Plate id per particle slot, from PlateTracker; used only for drawing. */

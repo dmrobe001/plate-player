@@ -95,29 +95,48 @@ export const Particle = defineStruct('Particle', [
   ['split_child', 'u32'],       // index of child created this frame, else NONE
   ['mantle_node', 'u32'],       // nearest mantle grid node, updated by a local walk each step
   ['next_state', 'u32'],        // state requested during contact detection, applied at the end of the step
-  ['edge_count', 'u32'],        // bonds + contacts this step; scales Jacobi updates
+  ['edge_count', 'u32'],        // edges touching the particle this step; scales Jacobi updates
 ]);
 
-/** Edge kinds. Bonds are persistent (cohesive, can be damaged); contacts are
- * rebuilt every step between touching, unbonded columns (no cohesion). */
-export const EDGE = { BOND: 0, CONTACT: 1 };
-
-/** An edge between two particles: a bond or a contact (`kind`, see EDGE). Its
- * rest length is not stored: it is always the sum of the two apothems
- * (rest_length() in bindings.wgsl). Bonds live in slots [0, maxBonds),
- * contacts in [maxBonds, maxConstraints). */
-export const Constraint = defineStruct('Constraint', [
+/**
+ * An edge: the interface between two neighbouring columns (design 3.2). There
+ * is one kind. Whether it acts as a weld, a fault or a gravel contact follows
+ * from its state (integrity) and the two columns, not from a type field.
+ *
+ * Existence is geometric: an edge exists while its pair is in range (map-view
+ * gap below edge_range_margin of the apothem sum, and overlapping depth
+ * intervals). Edges are keyed by pair and persist across steps in a
+ * free-listed array; per-particle slot lists (SLOTS) are an index rebuilt
+ * every step. Rest length is not stored: it is always the sum of the two
+ * apothems (rest_length() in bindings.wgsl).
+ */
+export const Edge = defineStruct('Edge', [
   ['particle_a', 'u32'],
   ['particle_b', 'u32'],
-  ['lambda', 'f32'],            // XPBD multiplier accumulated over this step's iterations
-  ['yield_stress_mpa', 'f32'],
   ['is_active', 'u32'],
-  ['damage', 'f32'],            // 0 intact .. 1 fully damaged
+  ['integrity', 'f32'],         // 0..1: 0 = no cohesion (pushes only), 1 = intact
+  ['lambda', 'f32'],            // XPBD multiplier accumulated over this step's iterations
+  ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
+  ['yield_stress_mpa', 'f32'],
   ['stress_normal_mpa', 'f32'], // diagnostic: + tension, - compression
   ['stress_shear_mpa', 'f32'],  // diagnostic: magnitude
-  ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
-  ['kind', 'u32'],              // EDGE.BOND or EDGE.CONTACT
+  // Carried across steps, not yet used (design 4.5, 4.7; phases C-F):
+  ['stored_stress_n', 'f32'],   // Maxwell memory, normal
+  ['stored_stress_t0', 'f32'],  // Maxwell memory, tangential (2 components)
+  ['stored_stress_t1', 'f32'],
+  ['slip_anchor0', 'f32'],      // tangential reference offset (2 components)
+  ['slip_anchor1', 'f32'],
+  ['timer', 'f32'],             // sustained-compression accumulator (subduction, suturing)
+  ['born_myr', 'f32'],          // creation time
 ]);
+
+/**
+ * Per-particle slot list, inside the `deltas` buffer (ParticleDelta in
+ * bindings.wgsl): `count` edges touching the particle (may exceed `capacity`,
+ * which flags an overflow), then up to `capacity` edge ids sorted by the
+ * angle of the partner around the particle. Rebuilt every step.
+ */
+export const SLOTS = { wordsPerParticle: 20, countWord: 4, firstSlotWord: 8, capacity: 12 };
 
 /** One node of the mantle grid; written from the CPU mantle model (src/mantle/). */
 export const GridNode = defineStruct('GridNode', [

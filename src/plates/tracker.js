@@ -7,7 +7,7 @@
 // one step moves a plate ~160 m at 1 cm/yr, comparable to the solver's
 // per-step tolerance, which would otherwise dominate the fit.
 
-import { Particle, Constraint, unpack } from '../gpu/layout.js';
+import { Edge, Particle, unpack } from '../gpu/layout.js';
 import { CAPACITY } from '../sim/simulation.js';
 import { latLonDeg } from '../record/sampling.js';
 import { eulerPole, labelPlates } from './plates.js';
@@ -37,7 +37,7 @@ export class PlateTracker {
   /** Relabel from a snapshot's buffers (see Simulation.snapshot). */
   update(snap) {
     const P = unpack(Particle, snap.buffers.particles, CAPACITY.maxParticles);
-    const C = unpack(Constraint, snap.buffers.constraints, CAPACITY.maxConstraints);
+    const C = unpack(Edge, snap.buffers.edges, CAPACITY.maxEdges);
     const result = labelPlates(P, C, this.state);
     // The first labelling of a run is not a sequence of splits.
     if (this.state) for (const e of result.events) this.events.push({ step: snap.step, time_myr: snap.timeMyr, ...e });

@@ -10,7 +10,7 @@ struct View {
 }
 
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
-@group(0) @binding(1) var<storage, read> constraints: array<Constraint>;
+@group(0) @binding(1) var<storage, read> edges: array<Edge>;
 @group(0) @binding(2) var<storage, read> grid: array<GridNode>;
 @group(0) @binding(3) var<storage, read> plate_ids: array<u32>;   // from PlateTracker
 @group(1) @binding(0) var<uniform> view: View;

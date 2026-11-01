@@ -14,10 +14,32 @@ import { OrbitCamera } from './render/camera.js';
 import { Recorder, snapshotFromZip } from './record/recorder.js';
 import { PlateTracker } from './plates/tracker.js';
 import { BUILD_INFO } from './build-info.js';
-import { Constraint, Particle } from './gpu/layout.js';
+import { Edge, Particle, SLOTS, unpack } from './gpu/layout.js';
+import * as topology from './edges/topology.js';
+import { CAPACITY } from './sim/simulation.js';
 
 
 const $ = (id) => document.getElementById(id);
+
+/**
+ * Read back particles, edges, the edge free list and slot lists, and check
+ * them (src/edges/topology.js). Returns the unpacked arrays, the columns as
+ * the edge kernels saw them (predicted positions), the edge set as pairKeys,
+ * the overflow counters and a list of problems (empty = consistent).
+ */
+async function inspectEdges(sim) {
+  const b = await sim.readBuffers(['particles', 'edges', 'edgePool', 'deltas', 'solver']);
+  const P = unpack(Particle, b.particles, CAPACITY.maxParticles);
+  const E = unpack(Edge, b.edges, CAPACITY.maxEdges);
+  const cols = topology.columnsFrom(P, sim.params);
+  const problems = topology.checkEdgeStorage({
+    E, pool: new Uint32Array(b.edgePool), slots: new Uint32Array(b.deltas), layout: SLOTS, particleActive: P.is_active, cols,
+  });
+  const pairs = new Map();
+  for (let e = 0; e < CAPACITY.maxEdges; e++) if (E.is_active[e]) pairs.set(topology.pairKey(E.particle_a[e], E.particle_b[e]), e);
+  const solver = new Uint32Array(b.solver);
+  return { P, E, cols, pairs, problems, edgePoolEmpty: solver[1], slotOverflow: solver[2] };
+}
 
 function reportError(message) {
   console.error(message);
@@ -174,7 +196,7 @@ async function main() {
 
   window.plate = {
     sim, recorder, plates, device, BUILD_INFO,
-    layout: { Particle, Constraint },           // struct offsets for reading raw buffers
+    layout: { Particle, Edge, SLOTS },          // struct offsets for reading raw buffers
     regenerate, loadState, runSteps, restoreFromZip,
     setParams: (overrides) => exclusive(() => sim.setParams(overrides)),
     snapshot: () => exclusive(() => sim.snapshot()),
@@ -182,6 +204,12 @@ async function main() {
     readBuffers: (names) => exclusive(() => sim.readBuffers(names)),
     exportRecord: () => exclusive(() => recorder.exportZip()),
     pause: (on = true) => { $('pause').checked = on; },
+    // Inspection (design 9, development strategy): CPU reference functions,
+    // and a readback of the edge storage checked against its invariants.
+    debug: {
+      topology,
+      edges: () => exclusive(() => inspectEdges(sim)),
+    },
   };
 
   await regenerate();

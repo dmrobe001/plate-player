@@ -5,13 +5,13 @@
 // exportZip() bundles them; snapshotFromZip() reads a snapshot back for Simulation.restore.
 
 import { createIcosphere } from '../geometry/icosphere.js';
-import { Constraint, describe, EDGE, GridNode, Particle, unpack } from '../gpu/layout.js';
+import { describe, Edge, GridNode, Particle, unpack } from '../gpu/layout.js';
 import { CAPACITY, STATE_BUFFERS } from '../sim/simulation.js';
 import { BUILD_INFO } from '../build-info.js';
 import { eastNorth, latLonDeg, sampleToMesh } from './sampling.js';
 import { readZip, writeZip } from './zip.js';
 
-export const SCHEMA = { name: 'plate-player-record', version: '0.1.0' };
+export const SCHEMA = { name: 'plate-player-record', version: '0.2.0' };
 const EARTH_RADIUS_KM = 6371;
 
 /** Field series written for every sample. Order here is order in the manifest. */
@@ -23,7 +23,7 @@ export const FIELDS = [
   { name: 'temperature', units: 'K', long_name: 'crust temperature', kind: 'intensive' },
   { name: 'velocity_east', units: 'mm yr-1', long_name: 'eastward surface velocity (1 mm/yr = 1 km/Myr)', kind: 'intensive' },
   { name: 'velocity_north', units: 'mm yr-1', long_name: 'northward surface velocity', kind: 'intensive' },
-  { name: 'bond_damage', units: '1', long_name: 'mean damage of bonds attached to the crust', kind: 'intensive' },
+  { name: 'edge_integrity', units: '1', long_name: 'mean integrity of the edges touching the crust (0 = no cohesion, 1 = intact)', kind: 'intensive' },
   { name: 'slab_fraction', units: '1', long_name: 'fraction of nearby crust that is subducting slab', kind: 'intensive' },
   { name: 'mantle_velocity_east', units: 'mm yr-1', long_name: 'eastward mantle flow beneath the plates (basal forcing)', kind: 'mantle' },
   { name: 'mantle_velocity_north', units: 'mm yr-1', long_name: 'northward mantle flow beneath the plates (basal forcing)', kind: 'mantle' },
@@ -91,15 +91,15 @@ export class Recorder {
 
   #sampleFields(buffers) {
     const P = unpack(Particle, buffers.particles, CAPACITY.maxParticles);
-    const C = unpack(Constraint, buffers.constraints, CAPACITY.maxConstraints);
+    const E = unpack(Edge, buffers.edges, CAPACITY.maxEdges);
     const params = this.sim.params;
 
-    // Mean damage of active bonds at each particle.
-    const damageSum = new Float32Array(CAPACITY.maxParticles);
-    const bondCount = new Uint16Array(CAPACITY.maxParticles);
-    for (let k = 0; k < CAPACITY.maxConstraints; k++) {
-      if (!C.is_active[k] || C.kind[k] !== EDGE.BOND) continue;
-      for (const p of [C.particle_a[k], C.particle_b[k]]) { damageSum[p] += C.damage[k]; bondCount[p]++; }
+    // Mean integrity of the active edges at each particle.
+    const integritySum = new Float32Array(CAPACITY.maxParticles);
+    const edgeCount = new Uint16Array(CAPACITY.maxParticles);
+    for (let k = 0; k < CAPACITY.maxEdges; k++) {
+      if (!E.is_active[k]) continue;
+      for (const p of [E.particle_a[k], E.particle_b[k]]) { integritySum[p] += E.integrity[k]; edgeCount[p]++; }
     }
 
     const active = [];
@@ -125,7 +125,7 @@ export class Recorder {
       ch.temperature[k] = nan(P.temperature[i]);
       ch.velocity_east[k] = nan((vx * east[0] + vy * east[1] + vz * east[2]) * EARTH_RADIUS_KM);
       ch.velocity_north[k] = nan((vx * north[0] + vy * north[1] + vz * north[2]) * EARTH_RADIUS_KM);
-      ch.bond_damage[k] = surface && bondCount[i] > 0 ? damageSum[i] / bondCount[i] : NaN;
+      ch.edge_integrity[k] = surface && edgeCount[i] > 0 ? integritySum[i] / edgeCount[i] : NaN;
       ch.slab_fraction[k] = surface ? 0 : 1;
       plateChannel[k] = plateIds ? plateIds[i] : 0;
     });
@@ -174,8 +174,8 @@ export class Recorder {
       },
       nondeterminism: [
         'Which free slot a splitting particle receives depends on GPU thread timing; physics is unaffected but indices differ between runs after the first split.',
-        'Contact neighbour lists are capped at 50 entries per hash cell, and list order depends on thread timing; the cap is rarely reached.',
-        'Contact edges get slots in thread-timing order, which changes the order of floating-point sums in the solve.',
+        'The neighbour search scans at most 50 particles per hash cell, and list order depends on thread timing; the cap is rarely reached.',
+        'New edges get free-list slots in thread-timing order (and so a different order in the edge array), which changes the order of floating-point sums in the solve.',
       ],
       mesh: {
         type: 'icosphere',
@@ -199,7 +199,7 @@ export class Recorder {
       },
       plates: this.plates && {
         file: 'plates/plates.json',
-        description: 'plates are connected components of intact bonds (damage < 0.5) between surface particles; ids persist across relabelling',
+        description: 'plates are connected components of edges with integrity > 0.5 between surface particles; ids persist across relabelling',
         interval_myr: this.plates.intervalMyr,
         columns: { size: 'particles', pole_lat_deg: 'Euler pole', pole_lon_deg: 'Euler pole', rate_deg_per_myr: 'rotation rate about the pole', rigidity_residual: 'rms(v - omega x r) / rms(v): 0 = perfectly rigid', rms_speed_mm_per_yr: 'rms particle speed', rms_nonrigid_speed_mm_per_yr: 'rms of v - omega x r' },
         kinematics: 'poles and rates fitted to each particle\'s displacement since the previous labelling (finite rotation over interval_myr)',
@@ -214,11 +214,11 @@ export class Recorder {
       })),
       structs: {
         Particle: describe(Particle),
-        Constraint: describe(Constraint),
+        Edge: describe(Edge),
         GridNode: describe(GridNode),
         FreeList: { layout: 'u32 counter, u32 requests, 2 x u32 padding, then u32 indices[capacity]; entries [0, counter) are free slots' },
       },
-      buffer_structs: { grid: 'GridNode', particles: 'Particle', constraints: 'Constraint', particlePool: 'FreeList', constraintPool: 'FreeList' },
+      buffer_structs: { grid: 'GridNode', particles: 'Particle', edges: 'Edge', particlePool: 'FreeList', edgePool: 'FreeList' },
     };
   }
 
@@ -264,7 +264,7 @@ export function snapshotFromZip(bytes, which = 'latest') {
   if (manifest.schema.version.split('.')[0] !== SCHEMA.version.split('.')[0]) {
     throw new Error(`record schema ${manifest.schema.version} is incompatible with ${SCHEMA.version}`);
   }
-  for (const [name, struct] of [['Particle', Particle], ['Constraint', Constraint], ['GridNode', GridNode]]) {
+  for (const [name, struct] of [['Particle', Particle], ['Edge', Edge], ['GridNode', GridNode]]) {
     if (JSON.stringify(manifest.structs[name]) !== JSON.stringify(describe(struct))) {
       throw new Error(`record's ${name} layout differs from this build; it was written by build ${manifest.model.build?.commit ?? '?'}`);
     }

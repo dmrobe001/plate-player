@@ -10,8 +10,8 @@ in a WebGPU-capable browser (recent Chrome or Edge; Firefox and Safari have part
 support). It works straight from disk, with no server needed.
 
 **Where this is going:** [`docs/design.md`](docs/design.md) is the plan for the next
-version: overdamped implicit solver, unified bond/contact edges, explicit slabs, plates as
-Euler-pole rotations, and the record/forcing contracts for nesting finer models below
+version: one pair-interaction law (no bonds vs. contacts; graded, history-dependent
+integrity), exact area and volume budgets, explicit slabs, and the record/forcing contracts for nesting finer models below
 this one. The to-do list at the end of this README is the problem inventory that plan
 answers.
 
@@ -37,9 +37,9 @@ the seed in the URL: `plate-player.html?seed=42`.
 | Glyph | Meaning |
 |---|---|
 | Disc | One crust particle. Radius = the particle's apothem; colour = elevation relative to sea level (blues below, greens/browns/white above). Darkened discs are subducting slabs. |
-| Black line between centres | Bond or contact in **compression**. Width ∝ \|normal stress\| |
-| White line between centres | Bond in **tension**. Width ∝ normal stress |
-| Black tick across a bond's midpoint | **Shear** stress on the bond. Width ∝ shear stress; length = one hexagon edge (the "face" between the two particles) |
+| Black line between centres | Edge in **compression**. Width ∝ \|normal stress\| |
+| White line between centres | Edge in **tension** (only edges with integrity > 0 carry tension). Width ∝ normal stress |
+| Black tick across an edge's midpoint | **Shear** stress on the edge. Width ∝ shear stress; length = one hexagon edge (the "face" between the two particles) |
 | Background sphere | Mantle grid, coloured by flow divergence: orange = upwelling, blue = downwelling |
 | **Colour by plate** | Each plate in its own colour; grey particles belong to no plate (fragments under 20 particles, or slabs) |
 
@@ -79,32 +79,40 @@ column) is a free coordinate that relaxes toward Airy isostasy, thickness × (1 
 plus water loading, with the viscous rebound time of a column-sized load
 (~30 kyr). It is not part of `position`, which stays on the unit sphere.
 
-**Edges** (`Constraint`). Bonds and contacts are one kind of object, solved by one
-kernel. A **bond** is a central spring with a yield stress and damage in [0, 1]. A
-**contact** is rebuilt every step between unbonded columns that touch (or nearly
-touch) in map view *and* overlap in depth; it only pushes, carries no cohesion, and is
-never damaged. A bond that reaches full damage is retired, and its pair interacts by
-contact from then on. Its rest length is always the sum of the two particles' apothems
-(computed, not stored), so it follows any change in particle size. Its stiffness comes from the lithosphere's Young's
-modulus and elastic thickness, k = (√3/2)·E·hₑ (the 2D modulus of a triangular spring
-network), with the physical E ≈ 70 GPa; contacts use the same stiffness. Stress beyond an Arrhenius-weakened yield stress accumulates damage;
-damage softens tension (never compression); heat slowly heals it.
+**Edges** (`Edge`, `shaders/compute/edges.wgsl`). There is one kind of edge: the
+interface between two neighbouring columns. An edge exists exactly while its pair is
+in range: a map-view gap below 10% of the apothem sum *and* overlapping depth
+intervals. It is created when the pair comes into range and dropped when it leaves,
+and in between it keeps its state across steps (integrity, plus stress memory,
+slip anchor and timer fields reserved for the coming edge law). **Integrity** in
+[0, 1] replaces the old bond/contact split: an edge with integrity 0 has no cohesion
+and only pushes (a contact); one with integrity > 0 is a central spring whose tension
+is softened by lost integrity (a bond). The initial bonds start at integrity
+1 − damage; edges made later start at 0, except the parent–child edge of a split,
+which starts at 1. Each particle also has a slot list of its edges, sorted by angle,
+rebuilt every step. Rest length is always the sum of the two particles' apothems
+(computed, not stored), so it follows any change in particle size. Stiffness comes
+from the lithosphere's Young's modulus and elastic thickness, k = (√3/2)·E·hₑ (the
+2D modulus of a triangular spring network), with the physical E ≈ 70 GPa. Stress
+beyond an Arrhenius-weakened yield stress lowers integrity, and heat slowly restores
+it, except at 0, which is final until suturing exists. These two rules are stand-ins
+until the edge law of design phases C–D.
 
 **Motion** (`shaders/compute/solver.wgsl`). Overdamped extended position-based
 dynamics (XPBD), with basal drag in the role of mass: each step minimises
 Σ (γᵢ/2dt)|xᵢ − x̃ᵢ|² + U(x), where x̃ is where the mantle flow alone would carry
-each particle, γ = area × asthenosphere viscosity / thickness, and U is the bond
+each particle, γ = area × asthenosphere viscosity / thickness, and U is the edge
 energy. There is no inertia, and velocity is only a diagnostic. All edges are solved
 by Jacobi sweeps that keep the multipliers consistent with the displacement,
-accelerated by Chebyshev extrapolation (32 iterations per step); contacts are found
-once per step with a uniform hash grid. Yield and damage are applied once per step,
-after the solve. With the default physical
-values a single bond relaxes in ~40 years, so every step (16 kyr) is effectively
+accelerated by Chebyshev extrapolation (32 iterations per step); pairs coming into
+range are found once per step with a uniform hash grid. Yield and integrity loss are
+applied once per step, after the solve. With the default physical
+values a single edge relaxes in ~40 years, so every step (16 kyr) is effectively
 quasi-static: what limits rigidity at plate scale is solver convergence, not E (see
 design.md, phase 2).
 
-**Plates** (`src/plates/`). A plate is a connected component of intact bonds
-(damage < 0.5) between surface particles, found exactly on the CPU every 0.25 Myr from a
+**Plates** (`src/plates/`). A plate is a connected component of edges with
+integrity > 0.5 between surface particles, found exactly on the CPU every 0.25 Myr from a
 readback. Plate ids persist from one labelling to the next (each component inherits the
 id most of its particles had), so splits and merges show up as events. Each plate gets
 an Euler pole fitted to its particles' displacement over the interval, plus its rms
@@ -113,8 +121,9 @@ speed and the rms of the non-rigid part.
 **Growth and subduction** (`growth.wgsl`, `solver.wgsl`, `thermal.wgsl`). Particles
 over strong divergence grow in area. Past 3× the base area they split, and the
 child is fresh oceanic crust. When two surface discs overlap deeply, the lower one
-becomes a slab (state 2): its top drops below the lithosphere, so it no longer touches
-surface columns, and it sinks, heats up, and thins until it melts. Its index then
+becomes a slab (state 2): its top drops below the lithosphere, so its edges to
+surface columns leave range (it also loses its attachment to the trailing plate
+until design phase F), and it sinks, heats up, and thins until it melts. Its index then
 returns to a free list for reuse. (Since contacts became stiff, deep overlaps hardly
 occur, so subduction rarely starts; see the to-do list.)
 
@@ -155,7 +164,7 @@ plate-player/
 │   ├── build-info.js          git commit injected at build time (written into records)
 │   ├── gpu/
 │   │   ├── device.js          WebGPU init, shader compile-error reporting
-│   │   └── layout.js          GPU struct definitions (Particle, Constraint, GridNode)
+│   │   └── layout.js          GPU struct definitions (Particle, Edge, GridNode) + slot-list layout
 │   ├── geometry/
 │   │   ├── icosphere.js       mantle grid mesh + adjacency
 │   │   └── vec.js             vector / matrix helpers
@@ -164,6 +173,8 @@ plate-player/
 │   │   ├── noise.js           seeded Perlin noise, fBm, quantiles
 │   │   ├── cell-list.js       CPU neighbour search
 │   │   └── random.js          seeded RNG, uniform points on the sphere
+│   ├── edges/
+│   │   └── topology.js        CPU reference for edge existence, slot order, storage checks
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
@@ -181,7 +192,7 @@ plate-player/
 │   │   ├── renderer.js        render pipelines and draw calls
 │   │   └── camera.js          orbit camera
 │   └── shaders/
-│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver
+│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver, edges
 │       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
 ├── test/
 │   ├── unit.test.mjs          CPU tests (Node only)
@@ -284,7 +295,7 @@ the full rationale):
 - **Field series** every *Fields every* Myr (default 1): particle quantities averaged
   onto a fixed icosphere mesh (10 242 nodes, ~220 km spacing) with a Gaussian kernel
   one particle-spacing wide. Fields: surface height, crust thickness, density, age,
-  temperature, east/north velocity (mm/yr), bond damage, slab fraction, and
+  temperature, east/north velocity (mm/yr), edge integrity, slab fraction, and
   `support` (~1 under continuous crust, →0 in gaps; NaN values mark "no crust here").
 - **Snapshots** every *Snapshot every* Myr (default 25), plus one at the start and on
   **Snapshot now**: the raw GPU buffers, enough to resume the run exactly.
@@ -324,8 +335,8 @@ floating-point contraction all vary. A resumed or re-run simulation should match
 - A snapshot restores the complete state, so resuming continues the same run. The
   test checks that the continuation matches to within a small tolerance.
 - Known sources of run-to-run variation are listed in each record's manifest (which
-  free slot a splitting particle receives; which slot each contact gets, which
-  changes the order of floating-point sums). We note them; we don't engineer them away.
+  free slot a splitting particle receives; which slot each new edge gets and its
+  position in the slot lists, which change the order of floating-point sums). We note them; we don't engineer them away.
 - The simulation advances one step per displayed frame, so simulated time per
   wall-clock second depends on the monitor's refresh rate and GPU speed. The
   panel reports steps and simulated Myr.
@@ -374,13 +385,19 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       are one edge array, and contacts skip bonded pairs.
 - [x] ~~Fully damaged bonds never died.~~ They are retired (phase 3) and the pair
       interacts by contact.
-- [ ] **Plates never weld.** Colliding plates don't suture, and broken bonds no longer
-      heal back (they are retired). Suturing needs persistent contacts (design phase 8).
+- [x] ~~Contacts were rebuilt every step.~~ Phase A: one kind of edge, keyed by pair,
+      persistent while in range (design 3.2). Stress-based subduction initiation,
+      suturing and friction can now keep state on the edge.
+- [ ] **Plates never weld.** Colliding plates don't suture, and edges at zero
+      integrity never heal. Suturing is design phase F.
 - [ ] **Subduction rarely starts.** The trigger is a deep overlap (34% of an apothem
       sum), which stiff contacts now prevent; converging plates lock instead. Design §6
-      replaces it with a stress-based rule on persistent contacts.
-- [ ] **No contact friction.** Contacts are frictionless; Coulomb friction needs
-      persistent contacts.
+      replaces it with a stress-based rule on the (now persistent) edges (phase F).
+- [ ] **No friction.** Edges are frictionless; Coulomb friction comes with the
+      strength caps of the edge law (phase C).
+- [ ] **Slabs detach from their plate.** A new slab's edges leave range when its top
+      drops below the lithosphere, so slab pull no longer reaches the plate through
+      edges (phase F replaces the drop with bending).
 - [x] ~~Water loading factor~~ was d·(1 + ρ_w/ρ_m); now ρ_w/(ρ_m − ρ_w) (phase 3).
 - [ ] **Mass is not conserved at splits.** The parent keeps its thickness at half
       the area, and the child is reset to 7 km oceanic crust, so continental
@@ -416,16 +433,16 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       stability.~~ They are integrated as exact exponentials, and area growth is a
       rate per Myr. A 10× time step runs stably (tested).
 - [ ] Healing is effectively off. At surface temperatures exp(−Eₐ/RT) underflows
-      the `> −50` guard, so only near-mantle-temperature bonds heal.
+      the `> −50` guard, so only near-mantle-temperature edges heal.
 
 **Performance**
 - [x] ~~`nearest_node` brute force over all mantle nodes.~~ Each particle caches
       its node and updates it by a greedy walk over the icosphere (`locate.wgsl`).
-- [ ] Every dispatch covers the full capacity (25 000 particles, 100 000 bonds)
+- [ ] Every dispatch covers the full capacity (25 000 particles, 131 072 edges)
       regardless of how many are active. An indirect dispatch on the live count
       would help.
-- [ ] Collision hash cells (3/32 ≈ 0.094) are about 2.7× the contact distance;
-      cells ≈ contact distance would scan about 10× fewer candidates.
+- [ ] Neighbour-search hash cells (3/32 ≈ 0.094) are about 2.7× the edge range;
+      cells ≈ edge range would scan about 10× fewer candidates.
 - [ ] Decouple simulation steps from display frames (fixed steps per frame, or a
       step budget) so speed doesn't depend on the monitor.
 

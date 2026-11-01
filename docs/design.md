@@ -173,15 +173,14 @@ pair comes into range, and removed when it leaves range. Neighbour exchange (a p
 leaving range while another enters) is how the network flows in shear, as T1 events
 do in a foam.
 
-**Storage.** Edges are keyed by pair and persist across steps, unlike today's
-contacts, which are rebuilt every step. A per-particle slot list (≤12 partners,
-sorted by angle) is the natural layout: it serves the edge lookup, the tessellated
-area (4.8) and the strain fit (4.2).
+**Storage** (done in phase A). Edges live in one free-listed array and persist
+across steps. Each particle has a slot list (≤12 edge ids, sorted by the partner's
+angle in the particle's tangent plane); it serves the edge lookup, the tessellated
+area (4.8) and the strain fit (4.2). The slot lists are an *index*, rebuilt every
+step from the edge array, not state: snapshots hold only the edge array.
 
 Boundary *classification* for display and export (divergent, convergent, transform)
 is derived from the relative velocity across low-integrity edges, not stored.
-*Today's code still has two kinds (bonds in a free-listed range, contacts rebuilt per
-step); see phase 3 findings.*
 
 ### 3.3 Plate (diagnostic only)
 
@@ -423,8 +422,8 @@ is removed.
 
 ### 5.1 Schedule
 
-Target order once the pair law is assembled (today's code runs a subset; see phase 3
-findings for the current kernel list):
+Target order once the pair law is assembled (today's code runs stages 2–4 and 6–7,
+with stand-in rules for stage 5; see phase A findings):
 
 ```
 1. profiles                   per column: T(z), ρ(z), η(z), envelope (4.0); tessellated area (4.8)

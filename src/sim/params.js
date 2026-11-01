@@ -30,7 +30,8 @@ export const SIM_PARAMS = [
   // basal drag gamma plays the role of mass. Bond stiffness and drag come from
   // the physical values below; only their ratio enters (bond_rate_myr_inv).
   ['dt_crust_myr', 'f32', 0.016],
-  ['solver_iterations', 'u32', 32],     // edge (bond + contact) iterations per step (read by simulation.js)
+  ['time_myr', 'f32', 0],               // current time, written by simulation.js each step
+  ['solver_iterations', 'u32', 32],     // Jacobi sweeps over all edges per step (read by simulation.js)
   // Chebyshev semi-iterative acceleration of the Jacobi sweeps (Wang 2015).
   // rho is the spectral radius of one plain sweep: negative = derive it
   // (simulation.js, jacobiSpectralRadius), 0 = off (plain Jacobi), else as given.
@@ -47,7 +48,9 @@ export const SIM_PARAMS = [
   ['base_apothem', 'f32', 0.0175],      // reference particle apothem
   ['split_area_factor', 'f32', 3.0],    // particle splits when area > factor * base hexagon area
   ['subduction_overlap', 'f32', 0.012], // overlap depth that triggers subduction
-  ['contact_margin', 'f32', 0.1],       // contacts are created for gaps below this fraction of the apothem sum
+  // An edge exists while its pair's map-view gap is below this fraction of the
+  // apothem sum (and their depth intervals overlap); design 3.2.
+  ['edge_range_margin', 'f32', 0.1],
   // Spreading proxy (until design phase 8): crust over diverging mantle grows
   // in area at the divergence rate. With ~1%/Myr divergence over upwellings,
   // global crust production is ~0.5%/Myr of the surface (Earth: ~0.6%/Myr).
@@ -55,8 +58,7 @@ export const SIM_PARAMS = [
   ['spreading_efficiency', 'f32', 1.0],             // area growth rate / mantle divergence
   ['max_spreading_rate', 'f32', 0.05],              // cap on fractional area growth, 1/Myr
   ['max_particles', 'u32', null],
-  ['max_constraints', 'u32', null],     // bonds + contacts
-  ['max_bonds', 'u32', null],           // bond slots come first; contact slots follow
+  ['max_edges', 'u32', null],
   ['hash_grid_dim', 'u32', null],
 
   // --- rheology: Arrhenius temperature dependence ---

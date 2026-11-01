@@ -100,22 +100,22 @@ import { eulerPole, labelPlates } from '../src/plates/plates.js';
 function chains(lengths, { damagedBetween = [] } = {}) {
   const n = lengths.reduce((a, b) => a + b, 0);
   const P = { is_active: new Uint32Array(n).fill(1), state: new Uint32Array(n).fill(1), position: new Float32Array(4 * n), velocity: new Float32Array(4 * n) };
-  const a = [], b = [], damage = [];
+  const a = [], b = [], integrity = [];
   let i = 0;
   lengths.forEach((len, c) => {
     for (let k = 0; k < len; k++, i++) {
       const phi = i * 0.03, lat = c * 0.01;
       P.position.set([Math.cos(lat) * Math.sin(phi), Math.sin(lat), Math.cos(lat) * Math.cos(phi)], 4 * i);
-      if (k > 0) { a.push(i - 1); b.push(i); damage.push(0); }
+      if (k > 0) { a.push(i - 1); b.push(i); integrity.push(1); }
     }
-    if (c > 0) { a.push(i - len - 1); b.push(i - len); damage.push(damagedBetween.includes(c) ? 1 : 0); } // link to previous chain
+    if (c > 0) { a.push(i - len - 1); b.push(i - len); integrity.push(damagedBetween.includes(c) ? 0 : 1); } // link to previous chain
   });
-  const C = { is_active: new Uint32Array(a.length).fill(1), particle_a: Uint32Array.from(a), particle_b: Uint32Array.from(b), damage: Float32Array.from(damage) };
+  const C = { is_active: new Uint32Array(a.length).fill(1), particle_a: Uint32Array.from(a), particle_b: Uint32Array.from(b), integrity: Float32Array.from(integrity) };
   return { P, C };
 }
 
-test('plates: components of intact bonds, persistent ids, split and merge events', () => {
-  // Two chains joined by an intact bond: one plate.
+test('plates: components of intact edges, persistent ids, split and merge events', () => {
+  // Two chains joined by an intact edge: one plate.
   const joined = chains([30, 30]);
   const first = labelPlates(joined.P, joined.C);
   assert.equal(first.plates.length, 1);
@@ -213,4 +213,93 @@ test('initial bonds are stress-free with rest length = apothem sum, and unbonded
     if (!bonded.has(Math.min(i, j) * P.count + Math.max(i, j))) overlap = Math.max(overlap, (a[i] + a[j] - d) / (a[i] + a[j]));
   });
   assert.ok(overlap < 2e-5, `worst unbonded overlap ${overlap}`);
+});
+
+// --- edge topology (design 3.2, phase A): CPU reference ---------------------
+import { columnsFrom, inRange, partnerAngle, rangeMargin, updateEdges, pairKey } from '../src/edges/topology.js';
+
+const EDGE_PARAMS = {
+  edge_range_margin: 0.1, subduction_overlap: 0.012,
+  continental_lithosphere_km: 150, oceanic_lithosphere_max_km: 100, thermal_diffusivity_m2_s: 1e-6,
+};
+
+/** Columns at given unit-sphere positions (stride 3), old ocean at the surface unless overridden. */
+function cols(points, { apothem = 0.0175, elevation = null, state = null } = {}) {
+  const n = points.length;
+  const P = {
+    position: Float32Array.from(points.flat()),
+    apothem: new Float32Array(n).fill(apothem),
+    elevation: elevation ? Float32Array.from(elevation) : new Float32Array(n).fill(-3),
+    composition_density: new Float32Array(n).fill(3000),
+    age: new Float32Array(n).fill(100),
+    state: state ? Uint32Array.from(state) : new Uint32Array(n).fill(1),
+    is_active: new Uint32Array(n).fill(1),
+  };
+  return columnsFrom(P, EDGE_PARAMS, { stride: 3, positionField: 'position' });
+}
+
+/** Triangular lattice of spacing 2a around the north pole: `rings` hexagonal rings. */
+function hexPatch(rings, a = 0.0175) {
+  const pts = [];
+  for (let q = -rings; q <= rings; q++)
+    for (let r = -rings; r <= rings; r++) {
+      if (Math.abs(q + r) > rings) continue;
+      const x = 2 * a * (q + r / 2), y = 2 * a * (r * Math.sqrt(3) / 2);
+      const z = Math.sqrt(1 - x * x - y * y);
+      pts.push([x, y, z]);
+    }
+  return pts;
+}
+
+test('edges: a triangular lattice links each column to its 6 nearest neighbours only', () => {
+  // Chords are 2a, so the gap is 0 for nearest neighbours and ~0.73 of the
+  // apothem sum for the next shell (sqrt 3 spacing): far outside the 10% margin.
+  // (The lattice is flat; on the sphere the chords shrink by ~1e-4, still in range.)
+  const c = cols(hexPatch(3));
+  const { edges, created } = updateEdges(c, new Set(), EDGE_PARAMS);
+  assert.equal(created.size, edges.size);
+  const degree = new Uint8Array(c.count);
+  for (const k of edges) for (const i of k.split(',').map(Number)) degree[i]++;
+  // 37 columns: 3*3*(3+1)+1; interior (2 rings, 19 columns) has 6 neighbours each.
+  assert.equal(c.count, 37);
+  const interior = hexPatch(2).length;
+  assert.equal(degree[18], 6); // the centre
+  assert.equal([...degree].filter((d) => d === 6).length, interior);
+  // Angles of the centre's partners are 60 degrees apart.
+  const centre = 18;
+  const angles = [...edges].map((k) => k.split(',').map(Number)).filter(([i, j]) => i === centre || j === centre)
+    .map(([i, j]) => partnerAngle(c, centre, i === centre ? j : i)).sort((x, y) => x - y);
+  for (let k = 1; k < 6; k++) assert.ok(Math.abs(angles[k] - angles[k - 1] - Math.PI / 3) < 1e-3, `angles ${angles}`);
+});
+
+test('edges: a pair is in range exactly while its gap is below the margin and the columns overlap in depth', () => {
+  const a = 0.0175;
+  const pairAt = (gapFraction, elevation = null) => {
+    const half = Math.asin((2 * a * (1 + gapFraction)) / 2); // chord = (1 + gap) * apothem sum
+    return cols([[-Math.sin(half), 0, Math.cos(half)], [Math.sin(half), 0, Math.cos(half)]], { elevation });
+  };
+  assert.ok(inRange(pairAt(0.099), 0, 1, EDGE_PARAMS));
+  assert.ok(!inRange(pairAt(0.101), 0, 1, EDGE_PARAMS));
+  assert.ok(Math.abs(rangeMargin(pairAt(0.05), 0, 1, EDGE_PARAMS) - 0.05) < 1e-6);
+  // Same map view, but one column's top is below the other's 100 km lithosphere.
+  assert.ok(inRange(pairAt(-0.05, [-3, -90]), 0, 1, EDGE_PARAMS));
+  assert.ok(!inRange(pairAt(-0.05, [-3, -110]), 0, 1, EDGE_PARAMS));
+});
+
+test('edges: update keeps, creates and removes by range; deep overlap creates no edge but keeps an old one', () => {
+  const a = 0.0175;
+  const at = (phi) => [Math.sin(phi), 0, Math.cos(phi)];
+  // 0-1 touching, 1-2 far apart; then 2 moves next to 1.
+  const before = cols([at(0), at(2 * a), at(10 * a)]);
+  const e0 = updateEdges(before, new Set(), EDGE_PARAMS);
+  assert.deepEqual([...e0.edges], [pairKey(0, 1)]);
+  const after = cols([at(0), at(2 * a * 1.15), at(2 * a * 2.15)]); // 0-1 gap 15%: out; 1-2 gap 0: in
+  const e1 = updateEdges(after, e0.edges, EDGE_PARAMS);
+  assert.deepEqual([...e1.removed], [pairKey(0, 1)]);
+  assert.deepEqual([...e1.created], [pairKey(1, 2)]);
+  // Two surface columns overlapping by more than subduction_overlap: no new edge...
+  const deep = cols([at(0), at(2 * a - 0.02)]);
+  assert.equal(updateEdges(deep, new Set(), EDGE_PARAMS).edges.size, 0);
+  // ...but an existing edge between them is kept (removal is purely geometric).
+  assert.deepEqual([...updateEdges(deep, new Set([pairKey(0, 1)]), EDGE_PARAMS).kept], [pairKey(0, 1)]);
 });

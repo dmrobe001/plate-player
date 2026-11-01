@@ -32,7 +32,7 @@ export class Renderer {
     });
     this.storageBindGroup = device.createBindGroup({
       layout: storageLayout,
-      entries: [sim.buffers.particles, sim.buffers.constraints, sim.buffers.grid, sim.buffers.plateIds]
+      entries: [sim.buffers.particles, sim.buffers.edges, sim.buffers.grid, sim.buffers.plateIds]
         .map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
     this.uniformBindGroup = device.createBindGroup({
@@ -107,7 +107,7 @@ export class Renderer {
     pass.draw(6, CAPACITY.maxParticles);
     if (view.showNormal || view.showShear) {
       pass.setPipeline(this.pipelines.bonds);
-      pass.draw(12, CAPACITY.maxConstraints);
+      pass.draw(12, CAPACITY.maxEdges);
     }
     pass.end();
   }

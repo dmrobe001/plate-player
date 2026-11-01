@@ -1,6 +1,6 @@
 // Crust creation at divergent mantle flow: particles over upwellings grow in
 // area, and split in two once large enough. The child is fresh oceanic crust.
-// Bonds that now sit closer to the child than to the parent are re-attached.
+// Edges that now sit closer to the child than to the parent are re-attached.
 
 // Slot allocation for splits is two-phase so that the free lists never
 // change while being read: each splitting thread takes a ticket t from
@@ -28,10 +28,10 @@ fn crust_accumulation(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let ticket = atomicAdd(&particle_pool.requests, 1u);
     let p_count = atomicLoad(&particle_pool.counter);
-    let c_count = atomicLoad(&constraint_pool.counter);
+    let c_count = atomicLoad(&edge_pool.counter);
     if (ticket >= min(p_count, c_count)) { return; } // out of slots; try again next step
     let child = particle_pool.indices[p_count - 1u - ticket];
-    let bond = constraint_pool.indices[c_count - 1u - ticket];
+    let edge = edge_pool.indices[c_count - 1u - ticket];
 
     particles[idx].surface_area *= 0.5;
     particles[idx].apothem = sqrt(particles[idx].surface_area / 3.4641);
@@ -52,49 +52,42 @@ fn crust_accumulation(@builtin(global_invocation_id) id: vec3<u32>) {
     particles[idx].position = vec4f(normalize(particles[idx].position.xyz - offset), 1.0);
     particles[child].position = vec4f(normalize(particles[child].position.xyz + offset), 1.0);
 
-    constraints[bond].particle_a = idx;
-    constraints[bond].particle_b = child;
-    constraints[bond].lambda = 0.0;
-    constraints[bond].yield_stress_mpa = sim.yield_stress_mpa;
-    constraints[bond].is_active = 1u;
-    constraints[bond].damage = 0.0;
-    constraints[bond].stress_normal_mpa = 0.0;
-    constraints[bond].stress_shear_mpa = 0.0;
-    constraints[bond].kind = BOND;
+    edges[edge] = new_edge(idx, child, 1.0); // parent and child start welded
 }
 
 // Single thread: pop the slots claimed in crust_accumulation.
 @compute @workgroup_size(1)
 fn crust_commit_splits() {
     let p_count = atomicLoad(&particle_pool.counter);
-    let c_count = atomicLoad(&constraint_pool.counter);
+    let c_count = atomicLoad(&edge_pool.counter);
     let granted = min(atomicLoad(&particle_pool.requests), min(p_count, c_count));
     atomicStore(&particle_pool.counter, p_count - granted);
-    atomicStore(&constraint_pool.counter, c_count - granted);
+    atomicStore(&edge_pool.counter, c_count - granted);
     atomicStore(&particle_pool.requests, 0u);
 }
 
+// Integrity is kept: re-attaching an edge does not weld or break it. An edge
+// re-attached out of range is dropped by edges_prune.
 @compute @workgroup_size(64)
-fn crust_rewire_bonds(@builtin(global_invocation_id) id: vec3<u32>) {
+fn crust_rewire_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
-    if (c_idx >= sim.max_bonds || constraints[c_idx].is_active == 0u) { return; }
-    var pA = constraints[c_idx].particle_a;
-    var pB = constraints[c_idx].particle_b;
-    var rewired = false;
+    if (c_idx >= sim.max_edges || edges[c_idx].is_active == 0u) { return; }
+    let pA = edges[c_idx].particle_a;
+    let pB = edges[c_idx].particle_b;
 
     let childA = particles[pA].split_child;
     if (childA != NONE && childA != pB) {
         if (distance(particles[childA].position.xyz, particles[pB].position.xyz) < distance(particles[pA].position.xyz, particles[pB].position.xyz)) {
-            pA = childA; constraints[c_idx].particle_a = childA; rewired = true;
+            edges[c_idx].particle_a = childA;
         }
     }
+    let a = edges[c_idx].particle_a;
     let childB = particles[pB].split_child;
-    if (childB != NONE && childB != pA) {
-        if (distance(particles[pA].position.xyz, particles[childB].position.xyz) < distance(particles[pA].position.xyz, particles[pB].position.xyz)) {
-            pB = childB; constraints[c_idx].particle_b = childB; rewired = true;
+    if (childB != NONE && childB != a) {
+        if (distance(particles[a].position.xyz, particles[childB].position.xyz) < distance(particles[a].position.xyz, particles[pB].position.xyz)) {
+            edges[c_idx].particle_b = childB;
         }
     }
-    if (rewired) { constraints[c_idx].damage = 0.0; }
 }
 
 @compute @workgroup_size(64)

@@ -16,7 +16,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { Constraint, EDGE, Particle, unpack } from '../src/gpu/layout.js';
+import { Edge, Particle, SLOTS, unpack } from '../src/gpu/layout.js';
+import { checkEdgeStorage } from '../src/edges/topology.js';
 import { readZip } from '../src/record/zip.js';
 import { createIcosphere } from '../src/geometry/icosphere.js';
 import { CHAIN, chainExact, chainState } from './support/chain.mjs';
@@ -26,8 +27,7 @@ const { chromium } = require('playwright');
 
 const PAGE = pathToFileURL(fileURLToPath(new URL('../dist/plate-player.html', import.meta.url))).href + '?paused';
 const MAX_PARTICLES = 25000;
-const MAX_BONDS = 65536;          // CAPACITY in src/sim/simulation.js
-const MAX_CONSTRAINTS = 2 * MAX_BONDS; // bonds, then contacts
+const MAX_EDGES = 131072;         // CAPACITY in src/sim/simulation.js
 const ARGS = process.env.PLATE_GPU === 'hardware'
   ? ['--enable-unsafe-webgpu']
   : ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=swiftshader', '--use-webgpu-adapter=swiftshader', '--disable-vulkan-surface'];
@@ -54,7 +54,7 @@ const fromB64 = (s) => { const b = Buffer.from(s, 'base64'); return b.buffer.sli
 async function readState(page) {
   const b64 = await page.evaluate(async (toB64Src) => {
     const toB64 = eval(toB64Src);
-    const bufs = await plate.readBuffers(['particles', 'constraints', 'particlePool', 'constraintPool', 'grid']);
+    const bufs = await plate.readBuffers(['particles', 'edges', 'particlePool', 'edgePool', 'grid', 'deltas']);
     return Object.fromEntries(Object.entries(bufs).map(([k, v]) => [k, toB64(v)]));
   }, toB64);
   return Object.fromEntries(Object.entries(b64).map(([k, v]) => [k, fromB64(v)]));
@@ -62,40 +62,30 @@ async function readState(page) {
 
 function checkFreeLists(state) {
   const P = unpack(Particle, state.particles, MAX_PARTICLES);
-  const C = unpack(Constraint, state.constraints, MAX_CONSTRAINTS);
-  for (const [name, pool, active, cap] of [
-    ['particle', new Uint32Array(state.particlePool), P.is_active, MAX_PARTICLES],
-    ['bond', new Uint32Array(state.constraintPool), C.is_active.subarray(0, MAX_BONDS), MAX_BONDS],
-  ]) {
-    const count = pool[0];
-    assert.equal(pool[1], 0, `${name} pool: split requests not cleared`);
-    const free = new Uint8Array(cap);
-    for (let k = 0; k < count; k++) {
-      const idx = pool[4 + k];
-      assert.ok(idx < cap, `${name} pool holds out-of-range index ${idx}`);
-      assert.equal(free[idx], 0, `${name} slot ${idx} is in the free list twice`);
-      assert.equal(active[idx], 0, `${name} slot ${idx} is both free and active`);
-      free[idx] = 1;
-    }
-    let activeCount = 0;
-    for (let i = 0; i < cap; i++) activeCount += active[i] ? 1 : 0;
-    assert.equal(activeCount + count, cap, `${name}: ${activeCount} active + ${count} free != ${cap}`);
+  const pool = new Uint32Array(state.particlePool);
+  const count = pool[0];
+  assert.equal(pool[1], 0, 'particle pool: split requests not cleared');
+  const free = new Uint8Array(MAX_PARTICLES);
+  for (let k = 0; k < count; k++) {
+    const idx = pool[4 + k];
+    assert.ok(idx < MAX_PARTICLES, `particle pool holds out-of-range index ${idx}`);
+    assert.equal(free[idx], 0, `particle slot ${idx} is in the free list twice`);
+    assert.equal(P.is_active[idx], 0, `particle slot ${idx} is both free and active`);
+    free[idx] = 1;
   }
-  // Edge kinds match their slot ranges, and no contact duplicates a bond.
-  const bondPairs = new Set();
-  for (let k = 0; k < MAX_BONDS; k++) {
-    if (!C.is_active[k]) continue;
-    assert.equal(C.kind[k], EDGE.BOND, `slot ${k} in the bond range is not a bond`);
-    bondPairs.add(`${Math.min(C.particle_a[k], C.particle_b[k])},${Math.max(C.particle_a[k], C.particle_b[k])}`);
-  }
-  let contacts = 0;
-  for (let k = MAX_BONDS; k < MAX_CONSTRAINTS; k++) {
-    if (!C.is_active[k]) continue;
-    contacts++;
-    assert.equal(C.kind[k], EDGE.CONTACT, `slot ${k} in the contact range is not a contact`);
-    assert.ok(!bondPairs.has(`${C.particle_a[k]},${C.particle_b[k]}`), `contact ${k} duplicates a bond`);
-  }
-  assert.ok(contacts > 0, 'no contacts found');
+  let activeCount = 0;
+  for (let i = 0; i < MAX_PARTICLES; i++) activeCount += P.is_active[i] ? 1 : 0;
+  assert.equal(activeCount + count, MAX_PARTICLES, `particles: ${activeCount} active + ${count} free != ${MAX_PARTICLES}`);
+
+  // Edges: free list, no duplicate pairs, slot lists symmetric (design 3.2).
+  const E = unpack(Edge, state.edges, MAX_EDGES);
+  const problems = checkEdgeStorage({
+    E, pool: new Uint32Array(state.edgePool), slots: new Uint32Array(state.deltas), layout: SLOTS, particleActive: P.is_active,
+  });
+  assert.deepEqual(problems.slice(0, 10), [], `${problems.length} edge storage problems`);
+  let cohesive = 0, loose = 0;
+  for (let e = 0; e < MAX_EDGES; e++) if (E.is_active[e]) (E.integrity[e] > 0 ? cohesive++ : loose++);
+  assert.ok(cohesive > 0 && loose > 0, `edges: ${cohesive} cohesive, ${loose} without cohesion`);
   return P;
 }
 
@@ -331,6 +321,188 @@ test('columns touch only if they overlap in map view and in depth', { timeout: 3
   console.log(`  separation after one step: surface pair +${((out.surface - out.before) / out.overlap * 100).toFixed(0)}% of the overlap, deep pair +${((out.deep - out.before) / out.overlap * 100).toFixed(2)}%`);
   assert.ok(out.surface - out.before > 0.5 * out.overlap, `surface pair not pushed apart: ${out.surface}`);
   assert.ok(Math.abs(out.deep - out.before) < 1e-6, `deep pair moved: ${out.deep}`);
+});
+
+// Page-side helpers for synthetic edge tests: a triangular lattice patch of
+// spacing 2a around the north pole, and a writer for particle positions.
+const PATCH_HELPERS = `({
+  patch(rings, a) {
+    const pts = [];
+    for (let q = -rings; q <= rings; q++) for (let r = -rings; r <= rings; r++) {
+      if (Math.abs(q + r) > rings) continue;
+      const x = 2 * a * (q + r / 2), y = 2 * a * r * Math.sqrt(3) / 2;
+      pts.push([x, y, Math.sqrt(1 - x * x - y * y)]);
+    }
+    return pts;
+  },
+  state(pts, a, bonds = []) {
+    const n = pts.length, fill = (v) => new Float32Array(n).fill(v);
+    return {
+      particles: { count: n, position: Float32Array.from(pts.flat()), thickness: fill(7), compositionDensity: fill(3000), temperature: fill(278), age: fill(100), apothem: fill(a) },
+      bonds: { count: bonds.length, a: Uint32Array.from(bonds.map((b) => b[0])), b: Uint32Array.from(bonds.map((b) => b[1])), damage: Float32Array.from(bonds.map((b) => b[2])) },
+      yieldStressMPa: 1e9,
+    };
+  },
+  // Set positions (and predicted positions) of particles 0..n-1 to f(i, [x, y, z]), normalised.
+  async move(n, f) {
+    const buf = (await plate.readBuffers(['particles'])).particles;
+    const v = new Float32Array(buf), W = plate.layout.Particle.words, o = plate.layout.Particle.offsets;
+    for (let i = 0; i < n; i++) {
+      const p = f(i, [v[W * i + o.position], v[W * i + o.position + 1], v[W * i + o.position + 2]]);
+      const l = Math.hypot(...p);
+      v.set([p[0] / l, p[1] / l, p[2] / l, 1], W * i + o.position);
+      v.set([p[0] / l, p[1] / l, p[2] / l, 1], W * i + o.predicted_pos);
+    }
+    plate.sim.device.queue.writeBuffer(plate.sim.buffers.particles, 0, buf);
+  },
+  // GPU edge set vs the CPU reference, skipping pairs within rounding of the range boundary.
+  compare(r, n, previous) {
+    const T = plate.debug.topology, params = plate.sim.params;
+    const cols = T.columnsFrom(r.P, params, { count: n });
+    const expected = T.updateEdges(cols, previous, params);
+    const mismatches = [];
+    for (const k of new Set([...expected.edges, ...r.pairs.keys()])) {
+      if (expected.edges.has(k) === r.pairs.has(k)) continue;
+      const [i, j] = k.split(',').map(Number);
+      if (Math.abs(T.rangeMargin(cols, i, j, params)) < 1e-5) continue;
+      mismatches.push(k + (r.pairs.has(k) ? ' on GPU only' : ' expected but missing'));
+    }
+    return { expected, mismatches };
+  },
+})`;
+
+test('edge storage stays consistent and matches the reference under random motion', { timeout: 600_000 }, async () => {
+  // Phase A (design 9): 127 columns on a triangular lattice, moved by a
+  // random walk with a pull back to their sites (stationary rms ~0.1 apothem),
+  // so pairs keep leaving and re-entering range. No solver iterations and no
+  // mantle flow: only the edge kernels act. Every step: slot lists symmetric
+  // and sorted, no duplicate pairs, free list exact, and the edge set equal to
+  // the CPU reference's.
+  const page = await openPage();
+  const out = await page.evaluate(async (helperSrc) => {
+    const H = eval(helperSrc);
+    const a = 0.0175, pts = H.patch(6, a), n = pts.length;
+    await plate.setParams({ mantle_drive: 0, solver_iterations: 0 });
+    await plate.loadState(H.state(pts, a));
+    let seed = 12345;
+    const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
+    let previous = new Set();
+    const res = { steps: 0, problems: [], mismatches: [], created: 0, removed: 0, minEdges: Infinity, maxEdges: 0, slabs: 0 };
+    for (let s = 0; s < 100; s++) {
+      if (s > 0) await H.move(n, (i, p) => p.map((v, c) => v + 0.1 * (pts[i][c] - v) + 0.04 * a * 3.46 * rand()));
+      await plate.runSteps(1);
+      const r = await plate.debug.edges();
+      res.problems.push(...r.problems.map((m) => `step ${s}: ${m}`));
+      const { expected, mismatches } = H.compare(r, n, previous);
+      res.mismatches.push(...mismatches.map((m) => `step ${s}: ${m}`));
+      if (s > 0) { res.created += expected.created.size; res.removed += expected.removed.size; }
+      res.minEdges = Math.min(res.minEdges, r.pairs.size);
+      res.maxEdges = Math.max(res.maxEdges, r.pairs.size);
+      for (let i = 0; i < n; i++) res.slabs += r.P.state[i] !== 1 ? 1 : 0;
+      res.overflow = [r.edgePoolEmpty, r.slotOverflow];
+      previous = new Set(r.pairs.keys());
+      res.steps++;
+    }
+    return res;
+  }, PATCH_HELPERS);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  console.log(`  ${out.steps} steps: ${out.minEdges}-${out.maxEdges} edges, ${out.created} created and ${out.removed} removed after step 0`);
+  assert.deepEqual(out.problems.slice(0, 10), [], `${out.problems.length} storage problems`);
+  assert.deepEqual(out.mismatches.slice(0, 10), [], `${out.mismatches.length} mismatches with the reference`);
+  assert.equal(out.slabs, 0, 'a column became a slab; the test assumes none');
+  assert.deepEqual(out.overflow, [0, 0], 'edge pool or slot list overflowed');
+  assert.ok(out.created > 50 && out.removed > 50, 'too little turnover to test anything');
+});
+
+test('an edge keeps its state while its pair stays in range and is dropped exactly when it leaves', { timeout: 600_000 }, async () => {
+  // Phase A (design 9). Seven columns (a centre and its ring), all 12 lattice
+  // pairs bonded at integrity 0.7, with distinct values written into every
+  // carried field. 100 steps of small motion within range must leave every
+  // edge, its slot and its state untouched. Then one ring column moves
+  // outward by 1.5% of the apothem sum per step: its edges must vanish at the
+  // step the reference says they leave range, the others stay as they were.
+  // Moved back, the pair gets a fresh edge: no cohesion and no history.
+  const page = await openPage();
+  const out = await page.evaluate(async (helperSrc) => {
+    const H = eval(helperSrc);
+    const a = 0.0175, pts = H.patch(1, a), n = pts.length; // 7 columns; index 3 is the centre
+    const d = (i, j) => Math.hypot(...pts[i].map((v, c) => v - pts[j][c]));
+    const bonds = [];
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (d(i, j) < 2.1 * a) bonds.push([i, j, 0.3]);
+    await plate.setParams({ mantle_drive: 0, solver_iterations: 0 });
+    await plate.loadState(H.state(pts, a, bonds));
+
+    // Distinct values in every carried field.
+    const E = plate.layout.Edge, fields = ['stored_stress_n', 'stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1', 'timer'];
+    const buf = (await plate.readBuffers(['edges'])).edges, v = new Float32Array(buf);
+    bonds.forEach((_, k) => fields.forEach((f, m) => { v[E.words * k + E.offsets[f]] = 10 * (m + 1) + k; }));
+    plate.sim.device.queue.writeBuffer(plate.sim.buffers.edges, 0, buf);
+
+    const snapshotEdges = (r) => [...r.pairs.entries()].map(([k, e]) => ({ k, e, integrity: r.E.integrity[e], born: r.E.born_myr[e], ...Object.fromEntries(fields.map((f) => [f, r.E[f][e]])) }));
+    let seed = 99;
+    const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
+    let r = null, previous = new Set();
+    const problems = [], mismatches = [];
+    const step = async (label) => {
+      await plate.runSteps(1);
+      r = await plate.debug.edges();
+      problems.push(...r.problems.map((m) => `${label}: ${m}`));
+      const c = H.compare(r, n, previous);
+      mismatches.push(...c.mismatches.map((m) => `${label}: ${m}`));
+      previous = new Set(r.pairs.keys());
+      return c.expected;
+    };
+    await step('start');
+    const start = snapshotEdges(r);
+    for (let s = 0; s < 100; s++) {
+      await H.move(n, (i, p) => p.map((v, c) => v + 0.5 * (pts[i][c] - v) + 0.01 * a * 3.46 * rand()));
+      await step(`jitter ${s}`);
+    }
+    const afterJitter = snapshotEdges(r);
+
+    // Move column 0 (on the ring) radially away from the centre (3).
+    const out = pts[0].map((v, c) => v - pts[3][c]), lo = Math.hypot(...out);
+    const drops = [];
+    for (let s = 1; s <= 30; s++) {
+      await H.move(n, (i, p) => (i === 0 ? pts[0].map((v, c) => v + (s * 0.015 * 2 * a) * out[c] / lo) : pts[i]));
+      const expected = await step(`pull ${s}`);
+      if (expected.removed.size) drops.push({ s, removed: [...expected.removed] });
+    }
+    const afterPull = snapshotEdges(r);
+    await H.move(n, (i) => pts[i]);
+    await step('return');
+    const returned = snapshotEdges(r);
+    return { start, afterJitter, afterPull, returned, drops, problems, mismatches, time: plate.sim.timeMyr };
+  }, PATCH_HELPERS);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+
+  assert.deepEqual(out.problems.slice(0, 10), []);
+  assert.deepEqual(out.mismatches.slice(0, 10), []);
+  assert.equal(out.start.length, 12);
+  assert.ok(out.start.every((e) => Math.abs(e.integrity - 0.7) < 1e-6 && e.timer >= 60), 'carried state not as written');
+  assert.deepEqual(out.afterJitter, out.start, 'edge state changed while every pair stayed in range');
+
+  // The ring column has 3 edges (centre and two ring neighbours); all leave range.
+  const touching0 = out.start.filter((e) => e.k.split(',').includes('0'));
+  assert.equal(touching0.length, 3);
+  const dropped = out.drops.flatMap((d) => d.removed);
+  assert.deepEqual(dropped.sort(), touching0.map((e) => e.k).sort());
+  console.log(`  ring column pulled out by 1.5% of the apothem sum per step; edges dropped at steps ${out.drops.map((d) => `${d.s} (${d.removed.join(' ')})`).join(', ')}`);
+  // The centre edge leaves first (gap 10.5% at step 7); the ring edges see
+  // half the motion along their length (gap 10.5% at step 14).
+  assert.deepEqual(out.drops.map((d) => [d.s, d.removed.length]), [[7, 1], [14, 2]]);
+  const kept = out.start.filter((e) => !e.k.split(',').includes('0'));
+  assert.deepEqual(out.afterPull, kept, 'edges of the other columns changed');
+
+  // Back in range: fresh edges with no cohesion and no history, born now.
+  for (const e of out.returned.filter((x) => x.k.split(',').includes('0'))) {
+    assert.equal(e.integrity, 0);
+    for (const f of ['stored_stress_n', 'stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1', 'timer']) assert.equal(e[f], 0);
+    assert.ok(e.born > 0, `born_myr ${e.born}`);
+  }
+  assert.equal(out.returned.length, 12);
 });
 
 test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 }, async () => {

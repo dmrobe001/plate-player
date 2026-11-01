@@ -1,10 +1,10 @@
 // Crust particles as discs of radius = apothem, coloured by elevation.
-// Bonds as stress glyphs:
+// Edges as stress glyphs:
 //   - a line joining the two particle centres; black = compression,
 //     white = tension, width proportional to |normal stress|
 //   - a black tick across the bond midpoint, perpendicular to it, with
 //     width proportional to shear stress. Its length is the shared edge of
-//     two hexagons of the bonded particles' apothems, i.e. the "face" the
+//     two hexagons of the two particles' apothems, i.e. the "face" the
 //     shear acts across.
 // Width = mean apothem * |stress| / view.stress_ref_mpa, capped at one apothem.
 
@@ -78,10 +78,10 @@ struct BondOut {
     @location(0) @interpolate(flat) shade: f32,
 }
 
-// 12 vertices per bond: 0-5 the normal-stress line, 6-11 the shear tick.
+// 12 vertices per edge: 0-5 the normal-stress line, 6-11 the shear tick.
 @vertex
 fn vs_bond(@builtin(vertex_index) v: u32, @builtin(instance_index) ci: u32) -> BondOut {
-    let c = constraints[ci];
+    let c = edges[ci];
     var out: BondOut;
     out.clip = HIDDEN;
     out.shade = 0.0;
