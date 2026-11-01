@@ -5,6 +5,13 @@
 //
 //   npm run build && npm run test:gpu
 //
+// Under the software GPU every dispatch and readback costs in proportion to
+// buffer capacity, and a readback takes ~0.5 s. So mechanism tests run on an
+// empty page with small buffers (SMALL_PAGE: 1024 particle slots) and read
+// back as rarely as they can; the whole default suite takes about a minute.
+// Tests on a generated planet (full capacity, minutes each) run only with
+// PLATE_PLANET=1.
+//
 // Needs Playwright with Chromium (`npx playwright install chromium` if it is
 // not already installed). By default the browser uses SwiftShader, a CPU
 // implementation of WebGPU, so results do not depend on the local GPU; set
@@ -26,7 +33,9 @@ const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
 const PAGE = pathToFileURL(fileURLToPath(new URL('../dist/plate-player.html', import.meta.url))).href + '?paused';
-const MAX_PARTICLES = 25000;
+const SMALL_PAGE = '&empty&capacity=1024';
+const PLANET = process.env.PLATE_PLANET === '1' ? {} : { skip: 'planet-scale; set PLATE_PLANET=1' };
+const MAX_PARTICLES = 25000;      // planet pages only
 const MAX_EDGES = 131072;         // CAPACITY in src/sim/simulation.js
 const ARGS = process.env.PLATE_GPU === 'hardware'
   ? ['--enable-unsafe-webgpu']
@@ -36,13 +45,14 @@ let browser;
 test.before(async () => { browser = await chromium.launch({ headless: false, args: ARGS }); });
 test.after(async () => { await browser?.close(); });
 
-async function openPage() {
-  const page = await browser.newPage({ viewport: { width: 640, height: 480 } });
+/** A page with a generated planet, or (small = true) an empty page with small buffers. */
+async function openPage({ small = false } = {}) {
+  const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
   page.on('console', (m) => { if (m.type() === 'error' && !m.text().includes('favicon')) errors.push(m.text()); });
-  await page.goto(PAGE);
-  await page.waitForFunction(() => window.plate?.recorder.samples.length > 0, null, { timeout: 120_000 });
+  await page.goto(PAGE + (small ? SMALL_PAGE : ''));
+  await page.waitForFunction(() => window.plate?.ready, null, { timeout: 120_000 });
   page.errors = errors;
   return page;
 }
@@ -89,9 +99,9 @@ function checkFreeLists(state) {
   return P;
 }
 
-test('free lists account for every slot; cached mantle node matches brute force', { timeout: 300_000 }, async () => {
+test('free lists account for every slot; cached mantle node matches brute force', { timeout: 300_000 , ...PLANET }, async () => {
   const page = await openPage();
-  await page.evaluate(() => plate.runSteps(20));
+  await page.evaluate(() => plate.runSteps(5));
   const state = await readState(page);
   const P = checkFreeLists(state);
 
@@ -118,7 +128,7 @@ test('free lists account for every slot; cached mantle node matches brute force'
   await page.close();
 });
 
-test('a 10x time step stays finite and bounded', { timeout: 300_000 }, async () => {
+test('a 10x time step stays finite and bounded', { timeout: 300_000 , ...PLANET }, async () => {
   const page = await openPage();
   await page.evaluate(async () => { await plate.setParams({ dt_crust_myr: 0.16 }); await plate.runSteps(10); });
   const state = await readState(page);
@@ -147,9 +157,9 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
   // One stretched bond, no mantle flow. Drag-as-mass XPBD should reproduce
   // implicit Euler for  dC/dt = -C / tau  exactly: C_n = C_0 (1 + dt/tau)^-n,
   // for time steps far below, at, and far above tau.
-  const page = await openPage();
+  const page = await openPage({ small: true });
   const results = await page.evaluate(async () => {
-    const a = 0.0175, L = 3 * a, eps = 0.1;
+    const a = 0.0175, L = 3 * a, eps = 0.05; // stretch well inside edge range (10%)
     // base_apothem = L/2: these particles have the reference drag (w = 1).
     await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: L / 2 });
     const kappa70 = plate.sim.params.bond_rate_myr_inv;
@@ -170,7 +180,7 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
     const stretch = async () => {
       const buf = (await plate.readBuffers(['particles'])).particles;
       const f = new Float32Array(buf);
-      const w = buf.byteLength / 4 / 25000; // words per particle
+      const w = plate.layout.Particle.words;
       return Math.hypot(f[w] - f[0], f[w + 1] - f[1], f[w + 2] - f[2]) - L;
     };
     const out = [];
@@ -196,7 +206,7 @@ test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi 
   // lithosphere): the exact implicit step is a tridiagonal solve. Plain Jacobi
   // propagates the end displacement about one bond per sweep.
   const K = 200;
-  const page = await openPage();
+  const page = await openPage({ small: true });
   const runs = await page.evaluate(async ([chain, builderSrc, K]) => {
     const build = eval(`(${builderSrc})`);
     await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: chain.apothem });
@@ -207,7 +217,7 @@ test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi 
       await plate.loadState(build(chain));
       await plate.runSteps(1);
       const f = new Float32Array((await plate.readBuffers(['particles'])).particles);
-      const w = f.length / 25000;
+      const w = plate.layout.Particle.words;
       out[name] = Array.from({ length: chain.n }, (_, i) => Math.atan2(f[w * i], f[w * i + 2]));
     }
     return out;
@@ -231,7 +241,7 @@ test('a thickened block relaxes to its Airy height (free radius); its neighbours
   // still at the ocean's elevation. Each column's top relaxes toward its own
   // Airy height by implicit Euler with the Haskell rebound time. With no
   // flexural rigidity yet (phase 7), columns are independent.
-  const page = await openPage();
+  const page = await openPage({ small: true });
   const out = await page.evaluate(async () => {
     const a = 0.0175, n = 9, half = Math.asin(a); // chord between neighbours = 2a
     await plate.setParams({ mantle_drive: 0 });
@@ -264,7 +274,7 @@ test('a thickened block relaxes to its Airy height (free radius); its neighbours
     });
     const read = async () => {
       const f = new Float32Array((await plate.readBuffers(['particles'])).particles);
-      const w = f.length / 25000, off = plate.layout.Particle.offsets;
+      const w = plate.layout.Particle.words, off = plate.layout.Particle.offsets;
       return { e: Array.from({ length: n }, (_, i) => f[w * i + off.elevation]), x: Array.from({ length: n }, (_, i) => f[w * i]) };
     };
     const start = await read();
@@ -293,7 +303,7 @@ test('columns touch only if they overlap in map view and in depth', { timeout: 3
   // pair both columns are at the surface: a contact pushes them apart. In the
   // other, one column's top starts 400 km down, below the other's
   // lithosphere: no contact, so neither moves.
-  const page = await openPage();
+  const page = await openPage({ small: true });
   const out = await page.evaluate(async () => {
     const a = 0.0175, overlap = 0.005, half = Math.asin((2 * a - overlap) / 2);
     await plate.setParams({ mantle_drive: 0 });
@@ -312,7 +322,7 @@ test('columns touch only if they overlap in map view and in depth', { timeout: 3
     });
     await plate.runSteps(1);
     const f = new Float32Array((await plate.readBuffers(['particles'])).particles);
-    const w = f.length / 25000;
+    const w = plate.layout.Particle.words;
     const d = (i, j) => Math.hypot(f[w * i] - f[w * j], f[w * i + 1] - f[w * j + 1], f[w * i + 2] - f[w * j + 2]);
     return { before: 2 * a - overlap, surface: d(0, 1), deep: d(2, 3), overlap };
   });
@@ -343,17 +353,16 @@ const PATCH_HELPERS = `({
       yieldStressMPa: 1e9,
     };
   },
-  // Set positions (and predicted positions) of particles 0..n-1 to f(i, [x, y, z]), normalised.
-  async move(n, f) {
-    const buf = (await plate.readBuffers(['particles'])).particles;
-    const v = new Float32Array(buf), W = plate.layout.Particle.words, o = plate.layout.Particle.offsets;
-    for (let i = 0; i < n; i++) {
-      const p = f(i, [v[W * i + o.position], v[W * i + o.position + 1], v[W * i + o.position + 2]]);
-      const l = Math.hypot(...p);
-      v.set([p[0] / l, p[1] / l, p[2] / l, 1], W * i + o.position);
-      v.set([p[0] / l, p[1] / l, p[2] / l, 1], W * i + o.predicted_pos);
-    }
-    plate.sim.device.queue.writeBuffer(plate.sim.buffers.particles, 0, buf);
+  // Set the positions (and predicted positions, the two leading vec4 fields)
+  // of particles 0..n-1 to pts[i], normalised. Writes only those fields, so
+  // no readback is needed: the caller keeps the positions.
+  move(pts) {
+    const P = plate.layout.Particle;
+    if (P.offsets.position !== 0 || P.offsets.predicted_pos !== 4) throw new Error('Particle layout changed');
+    pts.forEach((p, i) => {
+      const l = Math.hypot(...p), q = [p[0] / l, p[1] / l, p[2] / l, 1];
+      plate.sim.device.queue.writeBuffer(plate.sim.buffers.particles, 4 * P.words * i, Float32Array.from([...q, ...q]));
+    });
   },
   // GPU edge set vs the CPU reference, skipping pairs within rounding of the range boundary.
   compare(r, n, previous) {
@@ -373,12 +382,12 @@ const PATCH_HELPERS = `({
 
 test('edge storage stays consistent and matches the reference under random motion', { timeout: 600_000 }, async () => {
   // Phase A (design 9): 127 columns on a triangular lattice, moved by a
-  // random walk with a pull back to their sites (stationary rms ~0.1 apothem),
-  // so pairs keep leaving and re-entering range. No solver iterations and no
+  // random walk with a pull back to their sites (stationary rms ~0.1 apothem,
+  // reached in ~10 steps), so pairs keep leaving and re-entering range. No solver iterations and no
   // mantle flow: only the edge kernels act. Every step: slot lists symmetric
   // and sorted, no duplicate pairs, free list exact, and the edge set equal to
   // the CPU reference's.
-  const page = await openPage();
+  const page = await openPage({ small: true });
   const out = await page.evaluate(async (helperSrc) => {
     const H = eval(helperSrc);
     const a = 0.0175, pts = H.patch(6, a), n = pts.length;
@@ -388,8 +397,12 @@ test('edge storage stays consistent and matches the reference under random motio
     const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
     let previous = new Set();
     const res = { steps: 0, problems: [], mismatches: [], created: 0, removed: 0, minEdges: Infinity, maxEdges: 0, slabs: 0 };
-    for (let s = 0; s < 100; s++) {
-      if (s > 0) await H.move(n, (i, p) => p.map((v, c) => v + 0.1 * (pts[i][c] - v) + 0.04 * a * 3.46 * rand()));
+    let cur = pts.map((p) => [...p]);
+    for (let s = 0; s < 30; s++) {
+      if (s > 0) {
+        cur = cur.map((p, i) => p.map((v, c) => v + 0.1 * (pts[i][c] - v) + 0.04 * a * 3.46 * rand()));
+        H.move(cur);
+      }
       await plate.runSteps(1);
       const r = await plate.debug.edges();
       res.problems.push(...r.problems.map((m) => `step ${s}: ${m}`));
@@ -412,7 +425,7 @@ test('edge storage stays consistent and matches the reference under random motio
   assert.deepEqual(out.mismatches.slice(0, 10), [], `${out.mismatches.length} mismatches with the reference`);
   assert.equal(out.slabs, 0, 'a column became a slab; the test assumes none');
   assert.deepEqual(out.overflow, [0, 0], 'edge pool or slot list overflowed');
-  assert.ok(out.created > 50 && out.removed > 50, 'too little turnover to test anything');
+  assert.ok(out.created > 20 && out.removed > 20, 'too little turnover to test anything');
 });
 
 test('an edge keeps its state while its pair stays in range and is dropped exactly when it leaves', { timeout: 600_000 }, async () => {
@@ -423,7 +436,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   // outward by 1.5% of the apothem sum per step: its edges must vanish at the
   // step the reference says they leave range, the others stay as they were.
   // Moved back, the pair gets a fresh edge: no cohesion and no history.
-  const page = await openPage();
+  const page = await openPage({ small: true });
   const out = await page.evaluate(async (helperSrc) => {
     const H = eval(helperSrc);
     const a = 0.0175, pts = H.patch(1, a), n = pts.length; // 7 columns; index 3 is the centre
@@ -455,22 +468,29 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
     };
     await step('start');
     const start = snapshotEdges(r);
+    // 100 steps of jitter, inspected only at the end (a readback costs ~0.5 s).
+    let cur = pts.map((p) => [...p]);
     for (let s = 0; s < 100; s++) {
-      await H.move(n, (i, p) => p.map((v, c) => v + 0.5 * (pts[i][c] - v) + 0.01 * a * 3.46 * rand()));
-      await step(`jitter ${s}`);
+      cur = cur.map((p, i) => p.map((v, c) => v + 0.5 * (pts[i][c] - v) + 0.01 * a * 3.46 * rand()));
+      H.move(cur);
+      await plate.runSteps(1);
     }
+    r = await plate.debug.edges();
+    problems.push(...r.problems.map((m) => `after jitter: ${m}`));
+    mismatches.push(...H.compare(r, n, previous).mismatches.map((m) => `after jitter: ${m}`));
     const afterJitter = snapshotEdges(r);
+    previous = new Set(r.pairs.keys());
 
     // Move column 0 (on the ring) radially away from the centre (3).
     const out = pts[0].map((v, c) => v - pts[3][c]), lo = Math.hypot(...out);
     const drops = [];
-    for (let s = 1; s <= 30; s++) {
-      await H.move(n, (i, p) => (i === 0 ? pts[0].map((v, c) => v + (s * 0.015 * 2 * a) * out[c] / lo) : pts[i]));
+    for (let s = 1; s <= 16; s++) {
+      H.move(pts.map((p, i) => (i === 0 ? p.map((v, c) => v + (s * 0.015 * 2 * a) * out[c] / lo) : p)));
       const expected = await step(`pull ${s}`);
       if (expected.removed.size) drops.push({ s, removed: [...expected.removed] });
     }
     const afterPull = snapshotEdges(r);
-    await H.move(n, (i) => pts[i]);
+    H.move(pts);
     await step('return');
     const returned = snapshotEdges(r);
     return { start, afterJitter, afterPull, returned, drops, problems, mismatches, time: plate.sim.timeMyr };
@@ -490,9 +510,10 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   const dropped = out.drops.flatMap((d) => d.removed);
   assert.deepEqual(dropped.sort(), touching0.map((e) => e.k).sort());
   console.log(`  ring column pulled out by 1.5% of the apothem sum per step; edges dropped at steps ${out.drops.map((d) => `${d.s} (${d.removed.join(' ')})`).join(', ')}`);
-  // The centre edge leaves first (gap 10.5% at step 7); the ring edges see
-  // half the motion along their length (gap 10.5% at step 14).
-  assert.deepEqual(out.drops.map((d) => [d.s, d.removed.length]), [[7, 1], [14, 2]]);
+  // The centre edge leaves first (gap 10.5% at step 7). The ring edges lie at
+  // 60 degrees to the motion: with displacement d = 0.03 s apothems their length
+  // is sqrt((2 + d/2)^2 + (d sqrt(3)/2)^2) apothems, a 10.1% gap at step 12.
+  assert.deepEqual(out.drops.map((d) => [d.s, d.removed.length]), [[7, 1], [12, 2]]);
   const kept = out.start.filter((e) => !e.k.split(',').includes('0'));
   assert.deepEqual(out.afterPull, kept, 'edges of the other columns changed');
 
@@ -505,7 +526,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   assert.equal(out.returned.length, 12);
 });
 
-test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 }, async () => {
+test('resuming from a record ZIP in a fresh page continues the run', { timeout: 600_000 , ...PLANET }, async () => {
   // Bit-identical GPU results are not a goal (README, "Reproducibility");
   // the continuation must match to well below a particle spacing.
   const N = 10;
@@ -545,7 +566,7 @@ test('resuming from a record ZIP in a fresh page continues the run', { timeout: 
   assert.ok(worst < 1e-4, `resumed run drifted by ${worst}`);
 });
 
-test('record ZIP is complete and self-consistent', { timeout: 300_000 }, async () => {
+test('record ZIP is complete and self-consistent', { timeout: 300_000 , ...PLANET }, async () => {
   const page = await openPage();
   await page.evaluate(() => { plate.recorder.options.fieldIntervalMyr = 0.16; }); // every 10 steps
   await page.evaluate(() => plate.runSteps(20));

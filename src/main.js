@@ -64,6 +64,12 @@ function download(bytes, filename) {
 }
 
 async function main() {
+  const query = new URLSearchParams(location.search);
+  // ?capacity=N: buffers for N particles (8 edge slots each) instead of the
+  // planet-sized default. Small synthetic tests use it: under a software GPU
+  // every dispatch and readback costs in proportion to capacity.
+  const capacity = Number.parseInt(query.get('capacity'), 10);
+  if (capacity > 0) Object.assign(CAPACITY, { maxParticles: capacity, maxEdges: 8 * capacity });
   const canvas = $('gpuCanvas');
   const { device, context, format } = await initDevice(canvas, reportError);
   const mantleMesh = new SphereMesh(MANTLE_DEFAULTS.subdivisions);
@@ -73,7 +79,6 @@ async function main() {
   const plates = new PlateTracker(sim);
   const recorder = new Recorder(sim, {}, plates);
 
-  const query = new URLSearchParams(location.search);
   const urlSeed = Number.parseInt(query.get('seed'), 10);
   if (Number.isFinite(urlSeed)) $('seed').value = urlSeed;
   if (query.has('paused')) $('pause').checked = true;
@@ -149,7 +154,7 @@ async function main() {
   /** Load a hand-built state (same shape as generateInitialState's result). */
   function loadState(state, run = { seed: null, init_options: 'custom' }) {
     return exclusive(async () => {
-      sim.load(state, sim.mantle);
+      sim.load(state, sim.mantle ?? new Mantle(1, {}, mantleMesh)); // (?empty: an unspun mantle; tests turn the flow off)
       initStats = { ...(state.stats ?? {}), seed: run.seed, ms: 0 };
       recorder.reset({ ...run, restarted_from: null });
       plates.reset();
@@ -212,7 +217,9 @@ async function main() {
     },
   };
 
-  await regenerate();
+  // ?empty: start with no world (synthetic tests load their own with loadState).
+  if (!query.has('empty')) await regenerate();
+  window.plate.ready = true;
 
   let lastStatsUpdate = 0;
   function frame(now) {
@@ -254,8 +261,8 @@ async function main() {
         ['Setup time', `${fmt(initStats.ms, 0)} ms`],
         ['Steps', sim.steps],
         ['Simulated time', `${sim.timeMyr.toFixed(2)} Myr`],
-        ['Mantle rms flow', `${sim.mantle.rmsSpeedCmYr().toFixed(1)} cm/yr`],
-        ['Mantle plumes / drips born', `${sim.mantle.births.hot} / ${sim.mantle.births.cold}`],
+        ['Mantle rms flow', sim.mantle ? `${sim.mantle.rmsSpeedCmYr().toFixed(1)} cm/yr` : '–'],
+        ['Mantle plumes / drips born', sim.mantle ? `${sim.mantle.births.hot} / ${sim.mantle.births.cold}` : '–'],
         ['Plates', `${plates.summary.length} (${plates.summary.filter((p) => p.size >= 100).length} with ≥100 particles)`],
         ['Plate speed (median rms)', Number.isFinite(plates.median('rms_speed_mm_per_yr')) ? `${plates.median('rms_speed_mm_per_yr').toFixed(2)} mm/yr` : '–'],
         ['Non-rigid part', Number.isFinite(plates.median('rms_nonrigid_speed_mm_per_yr')) ? `${plates.median('rms_nonrigid_speed_mm_per_yr').toFixed(2)} mm/yr` : '–'],

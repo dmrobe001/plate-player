@@ -230,8 +230,9 @@ to `entryPoints` and to the schedule in `step` (`simulation.js`).
 ### Tests
 
 ```bash
-npm run test:unit    # CPU code (zip, sampling, neighbour search, initial state); seconds
-npm run test:gpu     # acceptance tests against dist/plate-player.html; minutes
+npm run test:unit    # CPU code (zip, sampling, neighbour search, initial state, edge rules); seconds
+npm run test:gpu     # mechanism tests against dist/plate-player.html; ~2 minutes
+PLATE_PLANET=1 npm run test:gpu   # also the planet-scale tests; much longer
 npm test             # both, rebuilding first
 ```
 
@@ -241,11 +242,22 @@ object you can poke at in the browser console). They need Playwright with Chromi
 implementation of WebGPU, so results don't depend on your graphics card; set
 `PLATE_GPU=hardware` to use the real GPU. Headless Chromium can't present a WebGPU
 canvas, so the browser runs with a window; on a machine with no display (a server,
-CI), run `xvfb-run -a npm run test:gpu`. Under SwiftShader a step takes ~0.4 s, so
-the GPU suite takes several minutes.
+CI), run `xvfb-run -a npm run test:gpu`.
 
-Opening the page with `?paused` starts it paused, which scripts use to control
-stepping exactly.
+**Keep GPU tests small.** Under SwiftShader every dispatch costs in proportion to
+buffer *capacity*, not to how many particles are alive, and every readback takes
+~0.5 s. A planet page (25 000 particle slots) steps in ~0.4 s and takes a minute to
+open; an empty page with 1024 slots steps in ~0.2 s and opens in a few seconds. So
+mechanism tests load a hand-built state into a small empty page, write inputs
+straight into GPU buffers, and read back only when they must check something.
+Tests on a generated planet are skipped unless `PLATE_PLANET=1`.
+
+Page options (URL query): `?paused` starts paused, which scripts use to control
+stepping exactly; `?empty` skips generating a world (load one with
+`plate.loadState`); `?capacity=N` sizes the buffers for N particles (8 edge slots
+each) instead of the planet default. `plate.debug` holds the CPU reference functions
+and `plate.debug.edges()`, a readback of the edge storage checked against its
+invariants.
 
 **What belongs in the test suite.** Keep tests cheap and about *mechanisms*:
 invariants (every slot free or active exactly once), small analytic cases (two

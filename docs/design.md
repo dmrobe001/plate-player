@@ -744,7 +744,7 @@ written here.
 | 2 ✅ (partly) | **Overdamped XPBD core:** drag as mass, real compliance. *Changed:* λ-consistent Jacobi instead of graph-coloured Gauss–Seidel (see below) | Two-particle relaxation matches implicit Euler, (1 + dt/τ)⁻ⁿ with τ = γ/2k, to 0.1% at dt/τ = 0.1, 1, 10 (kept as a test). Whole-planet dt-independence **not met**: blocked on plate-scale convergence (findings below) |
 | 3 ✅ (partly) | **Unified edge array + column contacts + free radius & buoyancy.** Done: bonds and per-step one-sided contacts in one edge array solved by one XPBD kernel; contacts need overlap in map view *and* depth; fully damaged bonds retire; the radial coordinate is free and relaxes to Airy height (Haskell rebound time). *Superseded in part* by the pair law: edge kinds and per-step contacts give way to phase A | Thickened block relaxes to its Airy height as implicit Euler with the rebound time, neighbours unmoved (kept as a test); columns touch only when they overlap in depth (kept as a test) |
 | 5 (identification ✅; coarse solve shelved) | **Plate labelling** (diagnostic), Euler-pole fits, events | Labelling, persistent ids, split/merge events and Euler-pole fits are unit-tested on synthetic networks. The coarse *solve* does not fit the XPBD formulation (findings below) |
-| A | **Persistent pair-keyed edges**, one kind: per-particle angle-sorted slot lists; create on entering range (map view + depth), remove on leaving; φ, stored stresses, anchor, timers carried across steps | Slot lists stay symmetric (i lists j ⇔ j lists i) under random motion; an edge's state survives 100 steps of motion within range and is dropped exactly when the pair leaves; no duplicate pairs; free-list invariants hold |
+| A ✅ | **Persistent pair-keyed edges**, one kind: per-particle angle-sorted slot lists; create on entering range (map view + depth), remove on leaving; φ, stored stresses, anchor, timers carried across steps | Slot lists stay symmetric (i lists j ⇔ j lists i) under random motion; an edge's state survives 100 steps of motion within range and is dropped exactly when the pair leaves; no duplicate pairs; free-list invariants hold. **Met** (kept as tests; phase A findings) |
 | B | **Column profile** (4.0): T(z) from thermal age / continental geotherm, ρ(z), η(z), envelope; lithosphere thickness; GPE | Oceanic profile matches half-space cooling; Airy elevation from the profile reproduces depth ∝ √age on a synthetic age ramp; envelope peak at the brittle–ductile transition where the two curves cross (analytic) |
 | C | **Edge law** (4.5): effective stiffness integral, caps as λ clamps, Maxwell stored-stress decay | Single edge under constant separation rate: stress approaches η_eff·rate with the Maxwell time (implicit-Euler sequence, exact); cold pair behaves as a spring, hot pair as a dashpot; tension cap of a φ = 0 cold pair is ≈ 0; two-particle relaxation test from phase 2 still passes when k is set from a uniform profile |
 | D | **Irreversible step** (4.7): volumetric flow at fixed volume, slip, integrity (work-driven damage, thermal healing), neighbour exchange | Uniform compression of a patch thickens at the predicted rate with Σ volume constant; pure shear leaves every area_ref unchanged and produces slip; φ decays in proportion to work input and heals with τ_heal(T); a patch below yield accumulates no plastic strain over many steps with solver noise |
@@ -765,6 +765,51 @@ lava-lamp mantle with grounded basal drag, and bond rest length = apothem sum
 **Resolved:** how new crust is made. Not by inflation inside plates, and not by a
 separate gap-filling rule: by stretching (tessellated area grows at fixed volume) plus
 decompression melt where the lithosphere is thin (4.8).
+
+### Phase A findings: persistent edges of one kind
+
+**What was built.**
+- One `Edge` struct and one free-listed array (131 072 slots); bonds and contacts are
+  gone. Integrity in [0, 1] replaces both kinds and damage: an edge at integrity 0 pushes
+  only (λ ≥ 0), one above 0 is two-sided with tension softened by integrity. Initial
+  bonds load at 1 − damage; edges made later start at 0, except a split's parent–child
+  edge (1). The stored-stress, slip-anchor, timer and born fields are carried but not
+  yet used.
+- Per step, on predicted positions: prune pairs out of range (or with a dead particle)
+  and list the survivors in both ends' slot lists; each particle i creates edges to
+  in-range partners j > i that it does not already list; then each slot list is sorted
+  by angle. No pair is ever created twice: pair (i, j) is only created by thread i,
+  after checking i's survivors, and edges that other threads append to i's list
+  during creation have partners below i. New slots are popped with a compare-and-swap
+  loop; prune (pushes) and create (pops) are separate dispatches.
+- CPU reference (`src/edges/topology.js`): the range rule, the update
+  (kept/created/removed), the angle basis, and a checker for the storage invariants,
+  also exposed in the page as `plate.debug`.
+
+**Tests** (kept): unit tests of the reference (lattice degree 6 and 60° slot angles;
+range boundary at exactly the 10% margin; depth exclusion; keep/create/remove; deep
+overlap creates no edge but keeps an old one). GPU: 127 columns under a random walk for
+30 steps (181 created, 204 removed) match the reference every step with no storage
+problems; 7 columns with written-in edge state keep it bit for bit over 100 steps of
+jitter; pulling one column out drops its centre edge at step 7 and its ring edges at
+step 12, as the reference predicts; moved back, the pairs get fresh edges (integrity 0,
+no history, born now). One planet-scale run (5 steps, full capacity): invariants hold.
+
+**Behaviour changes, by design:**
+- A cohesive edge stretched beyond 10% is dropped (it was a bond before, kept at any
+  length). The two-particle relaxation test now stretches by 5%.
+- A new slab's edges leave range when its top drops below the lithosphere, so slabs
+  detach from their plates until phase F.
+- Rewiring at a split keeps the edge's integrity (it used to reset damage to 0,
+  welding the rewired bond).
+- Old record ZIPs (with `constraints` buffers) no longer restore; the record schema is
+  0.2.0.
+
+**Test cost.** Under the software GPU the cost of a dispatch or readback scales with
+buffer capacity, and a readback takes ~0.5 s, so a 100-step planet test took tens of
+minutes. Mechanism tests now run on an empty page with 1024 slots (`?empty&capacity=1024`)
+and write inputs without readbacks; the default GPU suite takes ~2 minutes. Planet
+tests run only with `PLATE_PLANET=1`.
 
 ### Phase 2 findings (measured once, 30 steps = 0.48 Myr, seed 1, SwiftShader)
 
