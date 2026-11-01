@@ -2,8 +2,18 @@
 
 Status: **phases 0–3 implemented** (2 and 3 partly, see the phase table), plate
 identification from phase 5, Chebyshev acceleration, and the lava-lamp mantle with
-grounded basal drag. The rest is a proposal. This document says where the model is
-going and why.
+grounded basal drag. **The physics is being redesigned around one pair-interaction
+law** (sections 3.2, 4.0, 4.5, 4.7, 6): no bond/contact distinction, graded and
+history-dependent integrity, area and volume as exact budgets. The rest is a proposal.
+This document says where the model is going and why.
+
+**Development strategy (current).** No more full-planet runs until all the physics
+in the phase table is assembled. The observable phenomena we could calibrate
+against (plate speeds, rigidity, ridge depth, orogen heights) are each produced by
+several mechanisms at once, so tuning one component against them in isolation has
+not converged. Until assembly, every component is developed and checked by **unit
+tests** only, and every component stays **inspectable on its own**: see section 9,
+"Development strategy".
 
 **How to use this document.** It is a working plan, not a specification. Don't
 pursue its goals too doggedly: when a phase runs into difficult problems (a method
@@ -74,14 +84,21 @@ Contents
    Irreversible changes (yield, damage, topology) are applied as corrections between
    solves. No explicit rate may have a stability limit on dt.
 
-3. **Boundaries live on edges.** Bonds and contacts are one structure, the *edge*.
-   Plate-boundary character (ridge, trench, transform, suture) is either stored edge
-   state or derived from edge kinematics.
+3. **One pair-interaction law, no identities.** Every interaction between two
+   columns is a function of the two columns' state and the state of the edge between
+   them, and nothing else. There are no bond/contact kinds, and no plate or continent
+   id enters any force. Bonds, contacts, faults, ridges and subduction interfaces are
+   regions of one continuum (section 4.5). Plate ids and boundary classes are
+   *diagnostics* derived from edge state and kinematics, for display, records and
+   events.
 
-4. **Two levels of resolution in the solver.** Plates are the coarse level: rigid
-   rotations about Euler poles, solved first. Particles are the fine level and carry
-   deformation within plates. This is aggregation multigrid with geologically
-   meaningful aggregates.
+4. **Exact budgets.** Surface area is exact by construction: each column's actual
+   area is its cell in the tessellation of the markers, so the cells tile the sphere.
+   Crust volume changes only at named, logged sources (melt at ridges, arcs, plumes)
+   and sinks (slabs). Deformation moves area and volume between columns; it never
+   creates or loses them. *(This replaces the earlier principle of a coarse
+   plate-level solve, which phase 5 found incompatible with the drag-as-mass
+   formulation; see "Phase 5 findings".)*
 
 5. **Material parameters are continuum quantities.** Young's modulus, Poisson's
    ratio, elastic thickness, viscosities and densities are given in physical units
@@ -113,14 +130,16 @@ crust and tilted for slabs.
 | `elevation` | f32 | km | **free radius** (done in phase 3, as a separate coordinate rather than \|x\|; see phase 3 findings) |
 | `director` | vec3 | unit vector | column axis; carries bending (new) |
 | `orientation` | f32 | rad | rotation about the director, from the polar decomposition (new) |
-| `area` | f32 | unit sphere² | hexagon area; apothem = √(area / 2√3) |
-| `crust_thickness` | f32 | km | |
+| `area_ref` | f32 | unit sphere² | stress-free (reference) area; apothem a = √(area_ref / 2√3) sets rest lengths and contact size. Changed only by plastic/viscous dilatation (4.7) and splits |
+| `area` (derived) | f32 | unit sphere² | actual area: the column's cell in the tessellation of the markers (4.8). Not state; recomputed each step. area/area_ref − 1 is the column's elastic dilatation |
+| `crust_volume` | f32 | km·unit sphere² | crust volume V; crust thickness h = V / area. Changes only at sources and sinks (4.8) |
+| `crust_thickness` (derived) | f32 | km | crust_volume / area |
 | `lith_mantle_thickness` | f32 | km | cold mantle layer that moves with the crust (new) |
 | `crust_density` | f32 | kg/m³ | at mantle temperature, as now |
 | `age` | f32 | Myr | time since formation; drives oceanic cooling |
 | `thermal_age` | f32 | Myr | reset by reheating (rifting, arcs); sets lith_mantle_thickness (new) |
-| `plastic_strain` | f32 | – | accumulated irreversible strain; weakens the column (new) |
-| `plate` | u32 | – | plate slot, from labelling (new) |
+| `plastic_strain` | f32 | – | accumulated irreversible strain (diagnostic; weakening lives in edge integrity, 3.2) |
+| `plate` | u32 | – | plate slot, from labelling; diagnostic only, never read by forces |
 | `kind` | u32 | – | surface / slab / ghost (boundary-driven) / inactive |
 | `level` | u32 | – | resolution level for adaptivity (new; 0 = base) |
 | `strain` | 3×f32 | – | symmetric 2×2 strain from the neighbour fit (diagnostic + yield) |
@@ -131,37 +150,51 @@ Temperature is no longer a per-particle prognostic scalar. The column's thermal
 structure follows from `thermal_age` (half-space cooling) plus a reheating rule for
 slabs and arcs. That removes an explicit ODE and gives the depth–age law directly.
 
-### 3.2 Edge = bond or contact
+### 3.2 Edge = the interface between two neighbouring columns
+
+There is one kind of edge. Whether a pair behaves like a weld, a fault, a gravel
+contact or a ridge is a matter of the edge's state and the two columns' profiles
+(section 4.5), not of a type field.
 
 | Field | Type | Notes |
 |---|---|---|
-| `a`, `b` | u32 | particle indices |
-| `type` | u32 | `BOND` (cohesive), `CONTACT` (touching, no cohesion), `SUBDUCTION` (contact with polarity) |
-| `rest_a`, `rest_b` | 2×vec2 | rest edge vector in each particle's own frame; used by the strain fit and for bending |
-| `damage` | f32 | 0..1, weakens cohesion; a BOND at damage 1 becomes a CONTACT |
-| `polarity` | u32 | SUBDUCTION only: which end goes down |
-| `lambda` | f32 | XPBD multiplier for this step |
-| `friction_state` | f32 | Coulomb friction scratch (stick/slip) |
+| `a`, `b` | u32 | particle indices; the pair is the edge's identity, and it persists across steps |
+| `integrity` φ | f32 | 0..1. Scales cohesion, friction and (optionally) ductile viscosity. Lowered by plastic work, raised by thermally activated healing (4.7) |
+| `stress_n`, `stress_t` | f32, vec2 | stored depth-integrated normal and tangential stress: the Maxwell memory that makes the edge history-dependent (4.5) |
+| `slip_anchor` | vec2 | tangential reference offset, moved by slip |
+| `lambda`, `lambda_prev` | f32 | XPBD multipliers for this step (Chebyshev needs the previous one) |
+| `timers` | f32 | sustained-compression accumulators for state transitions (subduction initiation, suturing) |
 | `born` | f32 | Myr; for events and history |
-| `stress_n`, `stress_t` | f32 | resolved normal and shear stress from the particle tensors (display) |
 
-Edges are created in two ways. **Bonds** come from initial conditions, from splits,
-and from welding (a contact held long enough under compression can become a bond:
-suturing). **Contacts** are created by the collision pass when two non-bonded
-columns overlap, and destroyed when they separate.
+**Existence is purely geometric.** An edge exists while the two columns are near in
+map view (gap below a margin m·(aᵢ + aⱼ), m ≈ 0.1) *and* their depth intervals
+overlap. It is created, with φ = 0 unless created by a split or by gap fill, when the
+pair comes into range, and removed when it leaves range. Neighbour exchange (a pair
+leaving range while another enters) is how the network flows in shear, as T1 events
+do in a foam.
+
+**Storage.** Edges are keyed by pair and persist across steps, unlike today's
+contacts, which are rebuilt every step. A per-particle slot list (≤12 partners,
+sorted by angle) is the natural layout: it serves the edge lookup, the tessellated
+area (4.8) and the strain fit (4.2).
 
 Boundary *classification* for display and export (divergent, convergent, transform)
-is derived from the relative velocity across the edge, not stored.
+is derived from the relative velocity across low-integrity edges, not stored.
+*Today's code still has two kinds (bonds in a free-listed range, contacts rebuilt per
+step); see phase 3 findings.*
 
-### 3.3 Plate (coarse level)
+### 3.3 Plate (diagnostic only)
 
-| Field | Type | Notes |
-|---|---|---|
-| `omega` | vec3 | angular velocity about the Euler pole, rad/Myr |
-| `torque` | 3×i32 atomic | fixed-point accumulation |
-| `drag_tensor` | 6×i32 atomic | I_γ = Σ γᵢ (\|rᵢ\|² 𝟙 − rᵢ rᵢᵀ), symmetric |
-| `area`, `centroid` | | for export |
-| `persistent_id` | u32 | stable across re-labelling (section 5.3) |
+Plates are connected components of high-integrity edges, labelled on the CPU every
+0.25 Myr (section 5.3). They feed records, events and display, never forces. The
+planned coarse rigid-body solve is shelved (phase 5 findings); its fields (`omega`,
+`torque`, `drag_tensor`) are fitted from motion for export, not solved for.
+
+| Field | Notes |
+|---|---|
+| `persistent_id` | stable across re-labelling (section 5.3) |
+| `omega` | Euler-pole rotation fitted to member displacements over the labelling interval |
+| `area`, `centroid` | for export |
 
 ### 3.4 Mantle
 
@@ -176,6 +209,27 @@ drag". It supplies v_mantle(x, t) and its divergence; crust → mantle feedback
 
 Notation: A = column area, hₑ = elastic thickness (from `thermal_age` and crust
 type), E = Young's modulus, ν = Poisson's ratio, g = gravity, ρ_m = mantle density.
+
+### 4.0 Column profile (what each column contributes to its edges)
+
+Each column carries a vertical profile, recomputed once per step from its own state
+(surface temperature, thermal age, composition, crust thickness, lithosphere
+thickness), on ~8 depth slices:
+
+- **Temperature T(z):** oceanic, half-space cooling from `thermal_age`; continental, a
+  steady geotherm with radiogenic heating in the crust. The lithosphere base Lᵢ is
+  where T reaches ~1300 °C.
+- **Density ρ(z)** from composition and T. Gives buoyancy (4.4), lithostatic pressure
+  P(z) = ∫ρg dz, and GPE (4.6).
+- **Ductile viscosity** η(z) = A exp(Q/RT(z)) (power-law creep linearised at the
+  current strain rate); falls steeply with depth.
+- **Brittle strength** τ_b(z) = μ(φ)·P(z) + φ·c (Byerlee friction plus cohesion);
+  rises with depth.
+
+The weaker of brittle and ductile at each depth is the **yield-strength envelope**
+(brittle on top, ductile below). Elastic modulus E is taken as uniform. Everything
+downstream reads these slices; nothing reads crust type directly, so a stretched
+continent that turns oceanic changes behaviour through its profile alone.
 
 ### 4.1 Dissipation (the "mass" of the solver)
 
@@ -201,6 +255,11 @@ thickness-integrated plane stress:
 This is a multi-particle XPBD constraint, involving i and its ≤6 neighbours. It
 frees Poisson's ratio from the 1/3 that central springs on a triangular lattice
 force, and gives a true stress tensor for yield, display and export.
+
+*Role under the pair law (section 4.5):* the edges carry the in-plane mechanics. The
+neighbour-fit tensor is kept as a measurement (display, export, and possibly a better
+split of edge stress into isotropic and deviatoric parts than the per-edge stand-in
+in 4.7), not as a separate energy, so elasticity is not counted twice.
 
 ### 4.3 Bending (new; needed at 50 km)
 
@@ -229,13 +288,52 @@ Slab particles are below the lithosphere base and have no restoring equilibrium.
 They feel a body force (ρ_col − ρ_m) g V along the local vertical, and sink until
 assimilated.
 
-### 4.5 Contact
+### 4.5 Pair interaction: the edge law
 
-Columns are prisms with radial extent [r_bottom, r_top]. Two columns are in contact
-only if they overlap in map view **and** in depth. This is what lets a slab pass
-beneath an overriding plate. Contacts are XPBD inequality constraints (non-penetration)
-with Coulomb friction μ_f on the tangential part. The subduction interface uses a
-low μ_f (it is weak on Earth).
+Given an edge (i, j) and the two column profiles (4.0), integrate over the depth
+interval the two columns share. Depth slices act **in parallel** (columns are
+vertically rigid: the thin-sheet assumption); each slice is a **Maxwell element**
+(spring E in series with dashpot η(z)), integrated by implicit Euler.
+
+**Geometry:** d = |xᵢ − xⱼ| on the unit sphere; rest length aᵢ + aⱼ (always: the
+apothem sum); normal gap C = d − (aᵢ + aⱼ); tangential offset relative to
+`slip_anchor`.
+
+**Effective stiffness for this step** (normal and tangential alike):
+
+> k = ∫_overlap dz / (1/E + dt/η(z)),  η from the pair (harmonic mean of the two profiles at each depth)
+
+Cold slices act as springs, hot ones as dashpots; the **elastic thickness emerges**
+rather than being a parameter. It is one number per edge per step, so the solve stays
+linear within a step (the Chebyshev requirement). The stored stresses decay between
+steps with each slice's Maxwell time η/E.
+
+**Strength caps**, each the depth integral of the envelope over the overlap, applied
+as clamps on the edge's multiplier λ (contacts already use exactly this, with a
+tensile cap of 0):
+
+| Direction | Brittle slices | Ductile slices |
+|---|---|---|
+| compression | μ(φ)·P(z) + φc (gravel resists compression) | flow stress |
+| tension | φc only | flow stress (sign-blind: the plastic lower plate resists separation) |
+| shear | μ(φ)·σ_n + φc | flow stress |
+
+**Where load above a cap goes** (between solves, 4.7):
+- the isotropic part (mean normal stress over a column's edges) changes the columns'
+  `area_ref` at fixed crust volume: compression thickens, extension thins;
+- the tangential part is slip: the anchor moves;
+- the anisotropic normal part lets the pair separate or approach at the capped
+  force, until it leaves range and another pair enters: neighbour exchange. The rule
+  rest length = aᵢ + aⱼ stays exact.
+
+**Limits of the continuum, by state, not by kind.** φ = 0 between cold, shallow
+columns: tensile cap ≈ 0, a contact. High φ: a weld. Low φ under shear: a fault or
+transform. Hot, thin, stretching columns: low caps everywhere, a ridge. A shrinking
+depth overlap: a subduction interface (section 6).
+
+*Prior art:* the bonded-particle model of rock mechanics in the discrete element
+method (Potyondy & Cundall 2004), where bonds break into frictional contacts; here the
+two are one edge with graded integrity.
 
 ### 4.6 Gravitational potential energy (ridge push, plateau collapse)
 
@@ -251,15 +349,73 @@ slowly; a test should confirm it has no stability limit in practice.
 
 ### 4.7 Irreversible processes (between solves)
 
-- **Yield:** pressure-dependent (Byerlee-type, i.e. frictional) yield stress at
-  shallow depth, Arrhenius-weakened ductile yield deeper. The depth-integrated yield
-  envelope is evaluated per column from its thermal structure. Excess stress
-  converts to `plastic_strain` (return mapping) and damages that particle's edges.
-- **Damage healing:** exponential relaxation, faster when hot.
-- **Volume conservation:** dilatation changes area; crust_thickness × area is
-  conserved. Compression thickens (mountains) and extension thins (rifts), except
-  where melt adds volume (section 6).
-- **Thermal:** `thermal_age` advances; reheating rules reset it at arcs and rifts.
+All are applied once per step, after the solve, from converged stresses. This keeps
+the solve linear within a step and means solver residuals below yield (~MPa) change
+nothing permanent.
+
+- **Edge stress:** σᵢⱼ from λ and the stored stress. Each column's mean pᵢ over its
+  edges is the isotropic part; sᵢⱼ = σᵢⱼ − ½(pᵢ + pⱼ) stands in for the deviatoric
+  part until the strain fit (4.2) gives a tensor.
+- **Volumetric flow (per column):** with p̃ᵢ = pᵢ + (excess GPE of i relative to its
+  neighbours)/Lᵢ, if |p̃ᵢ| exceeds the column's integrated yield,
+  d ln area_ref/dt = sign(p̃ᵢ)(|p̃ᵢ| − Yᵢ)/ηᵢ. Crust volume is unchanged, so
+  thickness changes and isostasy (4.4) moves the elevation. The GPE term is what
+  makes thick columns spread under their own weight (plateau collapse); without it
+  mountains have no ceiling. This is the thin viscous sheet of England & McKenzie
+  (1982), whose Argand number (buoyancy stress / viscous stress) decides between
+  thickening and collapse.
+- **Slip:** tangential load above the shear cap moves `slip_anchor`.
+- **Integrity:**
+
+  > dφ/dt = −Ẇ_p / W_D + (1 − φ)/τ_heal(T)
+
+  Ẇ_p is the plastic work rate on the edge (cap-limited force × plastic
+  displacement rate, all directions). It is positive for compression, extension and
+  shear alike, so any permanent deformation reduces integrity. τ_heal is thermally
+  activated: hot material heals fast. This mirrors grain-damage theory of plate
+  boundary formation (Bercovici & Ricard 2012). W_D and τ_heal are the two parameters
+  that decide whether damage localises into narrow boundaries; they are calibrated at
+  integration, not before.
+- **Thermal:** `thermal_age` advances; stretching and melt addition reheat
+  (reduce thermal age in proportion), as do arcs.
+- **State transitions on edges** (need persistent edges): subduction initiation and
+  suturing via the edge timers (section 6).
+
+### 4.8 Area, volume and melt
+
+**Area is geometric.** A column's actual area is its tessellation cell: the polygon
+bounded by perpendicular bisectors to its angle-sorted neighbours (≤12), computed per
+particle. The cells tile the sphere, so Σ area = 4π exactly and coverage cannot leak.
+What used to be a void is now a column whose cell is stretched: it thins
+(h = V/area), subsides, floods (water loading), and produces melt. Passive rifting
+needs no special rule. `area_ref` (the apothem) is the stress-free size; the gap
+between the two is elastic dilatation, which drives the volumetric flow of 4.7.
+
+**Volume sources.** Passive decompression melting (McKenzie & Bickle 1988), driven by
+the geometric dilatation rate (the local divergence of the marker motion) plus active
+upwelling from the mantle model:
+
+> V̇ᵢ = areaᵢ · w · F̄ · max(1 − Lᵢ/H_m, 0),  w = H_m · max(ȧreaᵢ/areaᵢ, 0) + w_mantle,ᵢ
+
+- H_m ≈ 70 km is the depth where rising mantle crosses its solidus; F̄ ≈ 0.1 the mean
+  melt fraction. H_m·F̄ = 7 km is why steady ridges make 7 km crust at any spreading
+  rate.
+- Under thick lithosphere (L ≥ H_m) stretching only thins; melt begins once the
+  lithosphere is thin enough. That is continental breakup, and the first column to
+  cross into oceanic composition is logged as the breakup event.
+- w_mantle (plumes, with a hotter, deeper H_m) adds volume at fixed area: hotspot
+  plateaus and seamounts. Volcanism is a volume source; a ridge is an area source.
+- Arcs: overriding columns near a subduction interface gain volume in proportion to
+  the subduction flux (section 6).
+
+**Volume sinks:** slab columns leaving the surface (their volume is logged when they
+become slabs and when they are removed).
+
+**Splits.** A column whose actual area exceeds twice the base area splits along its
+direction of greatest stretch; parent and child share volume and area_ref; the edge
+between them starts at full integrity, and edges to former neighbours are reassigned
+by side. This replaces the spreading proxy (inflation over diverging mantle), which
+is removed.
 
 ---
 
@@ -267,21 +423,24 @@ slowly; a test should confirm it has no stability limit in practice.
 
 ### 5.1 Schedule
 
+Target order once the pair law is assembled (today's code runs a subset; see phase 3
+findings for the current kernel list):
+
 ```
-1. thermal + irreversible     exponential updates; yield/damage return mapping
-2. topology events            contacts from hash grid; edge state transitions;
-                              subduction initiation; splits/merges; slab removal at depth
-3. plate labelling            incremental min-label propagation over intact bonds
-4. predict                    x̃ᵢ = xᵢ + v_mantle(xᵢ)·dt + F_ext,i·dt/γᵢ
-5. coarse solve               per plate: I_γ Ω = Σ rᵢ × (γᵢ v_mantle,i + Fᵢ) ; move x̃ by rotation Ω·dt
-6. fine solve                 k sweeps of XPBD over constraints (elastic, bending, buoyancy,
-                              contact), graph-coloured Gauss–Seidel
-7. finish                     v = (x − x_prev)/dt (diagnostic); orientation/director update;
-                              stresses for display; recording if due
+1. profiles                   per column: T(z), ρ(z), η(z), envelope (4.0); tessellated area (4.8)
+2. edges                      hash grid; create pairs coming into range, remove pairs leaving range;
+                              per edge: effective stiffness k and caps for this step (4.5)
+3. predict                    x̃ᵢ = xᵢ + v_mantle(xᵢ)·dt + F_ext,i·dt/γᵢ
+4. solve                      Chebyshev-accelerated Jacobi XPBD over all edges, λ clamped to caps
+5. irreversible               edge stress; volumetric flow; slip; integrity; melt; thermal;
+                              edge state transitions; splits; slab removal (4.7, 4.8)
+6. isostasy                   elevation relaxes toward Airy height (4.4)
+7. finish                     v = (x − x_prev)/dt (diagnostic); recording if due;
+                              plate labelling every 0.25 Myr (CPU, diagnostic only)
 ```
 
-Steps 5 and 6 can alternate twice if benchmarks show the fine solve fighting the
-coarse one.
+Each numbered stage reads and writes named buffers only, so any stage can be run
+alone on dumped or synthetic inputs (section 9, development strategy).
 
 ### 5.2 XPBD with drag in place of mass
 
@@ -294,68 +453,68 @@ Multiplying Φ by dt gives ½|x − x̃|²_Γ + dt·U. For a constraint Cₖ wit
 Velocity is no longer state; it is a diagnostic. Large dt is safe; it only makes
 each step more nearly quasi-static.
 
-### 5.3 Plate labelling
+### 5.3 Plate labelling (diagnostic)
 
-- Every frame, run a few sweeps where each particle takes the minimum plate label
-  over its intact BOND edges (damage < threshold). Labels persist between frames,
-  so a few sweeps per frame keep up.
-- Min-label propagation detects merges but **not splits**. Every K steps, re-seed
-  labels from particle indices and propagate to convergence. Then map the new
-  components to old `persistent_id`s by majority overlap: a small readback, done on
-  the CPU. Split and merge events go to the event log.
+Plates are connected components of edges with integrity above a threshold, found
+exactly by union-find on the CPU every 0.25 Myr; ids persist by majority inheritance,
+which yields split/merge/lost events (phase 5 findings). Under the pair law, two
+plates either side of a ridge stay joined by low-integrity, yielding edges, so the
+labelling cuts at low integrity (or high plastic work rate), not at missing edges.
+Labels never feed back into forces.
 
 ### 5.4 Parallelism and determinism
 
-- Graph-colour the edges (at most ~7 colours on a near-triangular lattice). Recolour
-  on topology change, locally and greedily.
-- Fixed-point integer atomics for accumulations (WGSL has no float atomics).
-- Thread-timing-dependent behaviour (free-list pops, contact creation order) is
-  listed in record manifests, not engineered away. Runs should agree statistically,
-  not bit for bit.
+- Jacobi sweeps with per-iteration fixed-point integer atomics (WGSL has no float
+  atomics); no graph colouring needed.
+- Thread-timing-dependent behaviour (free-list pops, edge creation order) is listed
+  in record manifests, not engineered away. Runs should agree statistically, not bit
+  for bit.
 
 ---
 
 ## 6. Boundaries, subduction and spreading
 
-**Spreading (kept, reinterpreted).** Where columns are pulled apart, area grows by
-dilatation, the crust thins, and the gap fills with new 7 km oceanic crust from melt.
-Concretely, the current grow-then-split rule stays, but:
-- the parent keeps its *volume*, so its thickness drops;
-- the child is new oceanic crust with `age` = `thermal_age` = 0.
+Under the pair law (4.5) boundaries are not built; they are where edge state and
+column profiles have become weak. This section says how each kind arises.
 
-Ridges stand high because young lithosphere is thin and hot (4.4), and ridge push
-follows (4.6).
+**Rifting and spreading.** Where columns are pulled apart, the tension is resisted by
+the ductile slices whatever the integrity, so separation is taken up by stretching:
+tessellated area grows, crust thins at fixed volume, the column subsides and, below
+sea level, floods. Stretching reheats, and hot is weak, so strain localises: the
+positive feedback by which real rifts narrow. Once the lithosphere is thinner than
+the melting depth, new area arrives with melt (4.8) and the column becomes oceanic:
+breakup. Steady ridges make ~7 km crust; split columns become the new sea floor. Ridges
+stand high because young lithosphere is thin and hot (4.4), and ridge push follows
+(4.6).
 
-**Continental rifting → breakup.** Stretching continental crust thins until a
-threshold, then behaves as above. The first oceanic child is logged as a breakup
-event.
+**Shear and transforms.** Pure shear does not change a column's area, so it cannot be
+taken up by volumetric flow; it loads edges tangentially until slip (anchors move)
+and integrity loss, then neighbour exchange. Low-integrity edges under sustained shear
+are transforms and strike-slip faults.
 
-**Subduction initiation.** A convergent CONTACT edge becomes SUBDUCTION when:
-1. one side's column is negatively buoyant relative to the mantle (old ocean,
-   ≳30–40 Myr); and
-2. normal stress across the contact exceeds a threshold, sustained over a time
-   window (a stored accumulator).
-
-Polarity: the denser column goes down. If both qualify, the older one goes down.
-Continent never goes down while it remains buoyant; continent–continent convergence
-produces collision (thickening) instead.
+**Subduction initiation.** An edge's timer accumulates while its normal stress is
+compressive beyond a threshold; it initiates when the timer passes a window *and* at
+least one column is negatively buoyant (old ocean, ≳30–40 Myr). Polarity: the denser
+column goes down; if both qualify, the older. Buoyant (continental) columns never go
+down; continent–continent convergence thickens instead.
 
 **Subduction (explicit slab).** The downgoing column's `kind` becomes slab. It
-keeps its bonds to the trailing plate, so slab pull is transmitted through real
+keeps its edges to the trailing plate, so slab pull is transmitted through real
 edges. It sinks under its own negative buoyancy, bends via the director energy, and
-its depth interval no longer overlaps the overriding plate's, so they slide past
-each other with interface friction. At a cutoff depth (e.g. 660 km), or once
-thermally assimilated, the particle is removed and its edges retired. The slab is
+its depth overlap with the overriding plate shrinks, so the edge law's caps on that
+interface fall and they slide past each other (a low-integrity, weak interface). At a cutoff depth (e.g. 660 km), or once
+thermally assimilated, the particle is removed, its volume is logged as a sink, and its edges are dropped. The slab is
 the memory: polarity persistence and the slab-pull–speed feedback come from the
 geometry, not from bookkeeping.
 
-**Arcs.** Overriding columns within a set distance of a SUBDUCTION edge gain crust
+**Arcs.** Overriding columns within a set distance of a subduction interface gain crust
 volume at a rate proportional to the subduction flux, and their `thermal_age` is
 reset (hot, weak arc lithosphere). This is how continents grow over time.
 
-**Collision and suturing.** Buoyant columns in sustained compressive contact thicken
-by volume conservation. A contact held long enough can weld into a BOND (suture),
-merging plates (a logged event).
+**Collision and suturing.** Buoyant columns in sustained compression thicken through
+volumetric flow (4.7), bounded by GPE spreading. Integrity across the collision zone
+heals while the zone is compressed and quiet, which welds the plates (suturing); the
+plate labelling records the merge.
 
 **Coarse-resolution fallback (~220 km).** Slabs are only 2–3 particles long, bending
 is aliased, and arcs are one particle wide. The same rules still run; slab pull is
@@ -542,37 +701,71 @@ records. Nothing game-specific lives in the simulation.
 
 ## 9. Implementation phases and acceptance tests
 
-Each phase ends with a check that could fail. Two kinds:
+### Development strategy: assemble, then run
 
-- **Mechanism tests** are cheap (seconds to a minute), small, and about one
-  mechanism with a known answer. They stay in `test/`.
-- **Benchmarks** of high-level behaviour (dt sensitivity of a whole planet, plate
-  speeds, flexure profiles at 50 km) are run once when the phase lands, and the
-  number is written in the table below. They are *not* kept as regression tests:
-  they are expensive and the behaviour they measure is meant to evolve.
+**Why.** The phenomena available for calibration are coupled: plate speed depends on
+basal drag, edge strength, slab pull and ridge push at once; rigidity on solver
+convergence and on yield; ridge depth on cooling, isostasy and melt. Tuning one
+component against such observables while the others are missing or stand-ins has
+repeatedly moved the problem rather than solved it (spreading proxy, overlap trigger,
+contact runaway). So:
+
+1. **No full-planet runs until assembly.** Planet benchmarks resume only when every
+   phase up to "Integration" in the table is in. Earlier findings below stay as
+   history; their numbers describe the old physics.
+2. **Unit tests only until then.** Each component is checked against an answer
+   known without the rest of the model: an analytic solution, a conservation
+   identity, a limit case, or a reference implementation. Tests stay cheap
+   (seconds), as in `test/`.
+3. **Every component inspectable on its own.**
+   - Each physics component has a **pure CPU reference** in JavaScript (a function
+     from plain arrays to plain arrays) next to its WGSL kernel. Unit tests check the
+     reference against the analytic answer and the kernel against the reference.
+   - Each pipeline stage (5.1) reads and writes named buffers, and can be **run alone**
+     from a state dump (snapshot or synthetic), so a suspected fault can be tested
+     on harvested data without warming up a planet (README, "Debugging").
+   - Intermediate per-column and per-edge quantities (profiles, k, caps, φ, plastic
+     work, melt rate, tessellated area) are exposed through a debug readback, not
+     only their effect on positions.
+4. **Calibrate at integration, all at once**, against the coupled targets listed in
+   the Integration row, and record the result once (no regression tests of
+   high-level behaviour).
+
+### Phase table
+
+Each phase ends with a check that could fail. Until integration these are
+mechanism tests (cheap, small, one mechanism with a known answer; kept in `test/`).
+Benchmarks of high-level behaviour are run once, at integration, and their numbers
+written here.
 
 | Phase | Work | Acceptance test |
 |---|---|---|
 | 0 ✅ | Housekeeping: exponential integrators for all rates; cache nearest mantle node; fix free-list and state-flip races; mantle substep from a stability bound, mantle time tied to Myr | Every slot free or active exactly once; cached node = nearest; no blow-up at 10× dt. dt sensitivity is *reported*, not asserted: PBD stiffness still depends on dt until phase 2, so that number is the baseline phase 2 must beat |
 | 1 ✅ | **Minimal recording:** manifest + field series + snapshots (tiers a–c), download as zip, resume from zip | Restart from a record ZIP in a fresh page continues the run (bitwise at the time; now checked to a tolerance, since bit-identity is not a goal) |
 | 2 ✅ (partly) | **Overdamped XPBD core:** drag as mass, real compliance. *Changed:* λ-consistent Jacobi instead of graph-coloured Gauss–Seidel (see below) | Two-particle relaxation matches implicit Euler, (1 + dt/τ)⁻ⁿ with τ = γ/2k, to 0.1% at dt/τ = 0.1, 1, 10 (kept as a test). Whole-planet dt-independence **not met**: blocked on plate-scale convergence (findings below) |
-| 3 ✅ (partly) | **Unified edges + column contacts + free radius & buoyancy.** Done: bonds and per-step one-sided contacts are one edge array solved by one XPBD kernel; contacts need overlap in map view *and* depth; fully damaged bonds retire; the radial coordinate is free and relaxes to Airy height (Haskell rebound time). *Changed:* the radius is a separate per-column coordinate, not \|x\| (findings below). Not done: persistent contacts (friction state, suture timers), the SUBDUCTION edge type, Coulomb friction | Thickened block relaxes to its Airy height as implicit Euler with the rebound time, neighbours unmoved (kept as a test); columns touch only when they overlap in depth (kept as a test) |
-| 4 | **Neighbour-fit strain + orientation**, stress-tensor glyphs | Rigid rotation → strain < 10⁻⁶; uniaxial stretch → set Poisson ratio ±5% |
-| 5 (identification ✅; coarse solve: redesign question) | **Plate coarse level** (labelling, Euler poles) | Labelling, persistent ids, split/merge events and Euler-pole fits are unit-tested on synthetic networks. The coarse *solve* does not fit the XPBD formulation (findings below) |
-| 6 | **Lithosphere column:** thermal age, depth–age, GPE force | Ridge Generator reproduces depth ∝ √age |
-| 7 | **Subduction:** initiation rule, slab particles, bending directors | Line-load flexure profile within 10% at 50 km; plate speed correlates positively with slab-attached perimeter in free runs |
-| 8 | **Volume conservation, collision, suturing, arcs** | Uniform-convergence Generator thickens at the predicted rate; continent never subducts |
-| 9 | **Adaptivity** (refine first, coarsen second) | Benchmarks 3–8 give the same continuum answer at 220/110/50 km within stated tolerances |
+| 3 ✅ (partly) | **Unified edge array + column contacts + free radius & buoyancy.** Done: bonds and per-step one-sided contacts in one edge array solved by one XPBD kernel; contacts need overlap in map view *and* depth; fully damaged bonds retire; the radial coordinate is free and relaxes to Airy height (Haskell rebound time). *Superseded in part* by the pair law: edge kinds and per-step contacts give way to phase A | Thickened block relaxes to its Airy height as implicit Euler with the rebound time, neighbours unmoved (kept as a test); columns touch only when they overlap in depth (kept as a test) |
+| 5 (identification ✅; coarse solve shelved) | **Plate labelling** (diagnostic), Euler-pole fits, events | Labelling, persistent ids, split/merge events and Euler-pole fits are unit-tested on synthetic networks. The coarse *solve* does not fit the XPBD formulation (findings below) |
+| A | **Persistent pair-keyed edges**, one kind: per-particle angle-sorted slot lists; create on entering range (map view + depth), remove on leaving; φ, stored stresses, anchor, timers carried across steps | Slot lists stay symmetric (i lists j ⇔ j lists i) under random motion; an edge's state survives 100 steps of motion within range and is dropped exactly when the pair leaves; no duplicate pairs; free-list invariants hold |
+| B | **Column profile** (4.0): T(z) from thermal age / continental geotherm, ρ(z), η(z), envelope; lithosphere thickness; GPE | Oceanic profile matches half-space cooling; Airy elevation from the profile reproduces depth ∝ √age on a synthetic age ramp; envelope peak at the brittle–ductile transition where the two curves cross (analytic) |
+| C | **Edge law** (4.5): effective stiffness integral, caps as λ clamps, Maxwell stored-stress decay | Single edge under constant separation rate: stress approaches η_eff·rate with the Maxwell time (implicit-Euler sequence, exact); cold pair behaves as a spring, hot pair as a dashpot; tension cap of a φ = 0 cold pair is ≈ 0; two-particle relaxation test from phase 2 still passes when k is set from a uniform profile |
+| D | **Irreversible step** (4.7): volumetric flow at fixed volume, slip, integrity (work-driven damage, thermal healing), neighbour exchange | Uniform compression of a patch thickens at the predicted rate with Σ volume constant; pure shear leaves every area_ref unchanged and produces slip; φ decays in proportion to work input and heals with τ_heal(T); a patch below yield accumulates no plastic strain over many steps with solver noise |
+| E | **Area, volume, melt, splits** (4.8); remove the spreading proxy | Tessellated areas sum to 4π to float precision on random and lattice configurations; a stretched strip produces 7 km crust per unit new area at L = 0 and none at L ≥ H_m; a split conserves volume and area_ref; budget identity: Δ(Σ V) = logged sources − sinks exactly |
+| F | **Subduction and suturing as edge-state transitions**; slab particles, bending directors (4.3); arcs | Timer-based initiation fires on a synthetic convergent pair with a dense side and never with two buoyant sides; line-load flexure profile within 10% (a mechanism test on a strip, not a planet) |
+| **Integration** | Assemble A–F; first planet runs since the redesign | Calibrate together, recorded once: plate speeds (rms ~4 cm/yr, slab-attached plates fastest), interior rigidity (non-rigid strain rate ≲ 10⁻⁹/yr), ridge depth ∝ √age, ~7 km oceanic crust, orogen heights bounded by collapse, coverage exact, volume budget closed, damage localised into narrow boundaries |
+| 9 | **Adaptivity** (refine first, coarsen second) | Benchmarks of Integration give the same continuum answer at 220/110/50 km within stated tolerances |
 | 10 | **Patch mode:** run L1 code on a projected patch driven by a Forcing; adapters from records; event log | Patch driven by a global record stays within tolerance of the global fields in its interior over [t₀, t₁] |
 
-The order is chosen so that phases 0–4 already improve the current game output at
-220 km, before 50 km is needed. Done outside the numbered phases: Chebyshev
-acceleration of the Jacobi sweeps, the lava-lamp mantle with grounded basal drag, and
-bond rest length = apothem sum (findings sections below).
+*Mapping from the earlier plan:* old phase 4 (neighbour-fit strain) is folded into D
+as a measurement (4.2); old 6 (lithosphere column) is B; old 7 (subduction) is F; old 8
+(volume conservation, collision, suturing, arcs) is split between D, E and F.
 
-**Next decision (open):** how new crust is made. In-plate inflation is now the main
-source of stress and damage (phase 3 findings); see "Mantle and basal drag" for the
-options.
+Done outside the numbered phases: Chebyshev acceleration of the Jacobi sweeps, the
+lava-lamp mantle with grounded basal drag, and bond rest length = apothem sum
+(findings sections below).
+
+**Resolved:** how new crust is made. Not by inflation inside plates, and not by a
+separate gap-filling rule: by stretching (tessellated area grows at fixed volume) plus
+decompression melt where the lithosphere is thin (4.8).
 
 ### Phase 2 findings (measured once, 30 steps = 0.48 Myr, seed 1, SwiftShader)
 
@@ -683,6 +876,9 @@ sweeps.
 ---
 
 ### Before changing the solver again: measure at higher resolution
+
+*Deferred to integration* (development strategy above): these are planet runs,
+and the solver's load changes once caps and the effective stiffness integral are in.
 
 Agreed: no further solver redesign (primal formulation, hierarchical constraints)
 until the work needed at higher resolution has been measured. Measure, at particle
@@ -883,6 +1079,20 @@ separate.
 
 ## 10. Open questions
 
+- **Localisation:** does work-driven damage with thermal healing concentrate into
+  narrow plate boundaries, or weaken plates diffusely? Bercovici's group finds
+  localisation only in a window of healing rates. Decide W_D and τ_heal at
+  integration.
+- **Neighbour exchange at 50 km:** do capped forces plus range-based edge turnover
+  give sensible ductile shear zones, or does the deviatoric part need a per-edge
+  outlet (a zero-mean rest offset, which would amend rest = aᵢ + aⱼ)?
+- **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity like the contact
+  clamp, which has been tolerated so far. Check at integration that dense yielding
+  zones do not slow or break convergence.
+- **Tessellated area on the sphere:** bisector polygons from ≤12 angle-sorted
+  neighbours are exact for a Delaunay neighbourhood; confirm the range-based neighbour
+  set is complete enough that the cells tile without gaps or double cover.
+
 - **Bending discretisation** (4.3): directors with a Kirchhoff penalty vs. dihedral
   constraints on edge pairs. Decide by the flexure benchmark.
 - **Coarse/fine coupling:** is one coarse solve per step enough, or do they need to
@@ -918,4 +1128,12 @@ separate.
 | polar decomposition | writing a deformation gradient as rotation × stretch |
 | CF conventions | Climate and Forecast metadata conventions for gridded scientific data |
 | HEALPix | Hierarchical Equal Area isoLatitude Pixelization of the sphere |
+| Maxwell element | spring and dashpot in series: elastic on short times, viscous on times longer than η/E |
+| yield-strength envelope | strength of the lithosphere versus depth: the weaker of brittle friction (rising with depth) and ductile creep (falling with depth as it gets hotter) |
+| Byerlee friction | the empirical rock friction law, shear strength ≈ 0.6 × normal stress |
+| tessellation cell (Voronoi cell) | the region of the sphere closer to a marker than to any other |
+| solidus | temperature (at a given pressure) at which rock begins to melt |
+| T1 event | neighbour exchange in a foam or cell network: one contact is lost and another forms |
+| integrity φ | an edge's undamaged fraction: scales cohesion, friction and optionally ductile viscosity |
+| thin viscous sheet | lithosphere modelled as a depth-averaged viscous layer (England & McKenzie 1982); Argand number = buoyancy stress / viscous stress |
 | downscaling, relaxation zone | regional climate modelling practice for driving a fine model with a coarse one at its boundaries |
