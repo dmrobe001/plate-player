@@ -413,3 +413,110 @@ test('profile: the yield-strength envelope peaks at the brittle-ductile transiti
   assert.ok(Math.abs(z - prof.columnKm) < 1e-9);
   assert.equal(ColumnProfile.fields.find(([f]) => f === 'depth_km')[1], `array<f32, ${profile.SLICES}>`);
 });
+
+// --- Edge law (design 4.5, phase C) ----------------------------------------
+import * as law from '../src/edges/law.js';
+
+// Parameters with the derived bond rate the GPU uses, and optional overrides.
+const lawParams = (over = {}) => {
+  const p = { ...PARAMS, ...over };
+  const k = (Math.sqrt(3) / 2) * p.crust_youngs_modulus_gpa * 1e9 * p.stiffness_reference_km * 1e3;
+  const gamma = (2 * Math.sqrt(3) * (p.base_apothem * 6.371e6) ** 2 * p.asthenosphere_viscosity_pa_s) / (p.drag_reference_channel_km * 1e3);
+  return { ...p, bond_rate_myr_inv: k / (gamma / profile.SECONDS_PER_MYR) };
+};
+// Creep with no temperature dependence: every slice has the same viscosity
+// eta (Pa s), crust and mantle alike; cohesion out of the way.
+const uniform = (eta) => {
+  const n = 3.5, edot = PARAMS.reference_strain_rate_s;
+  const sigmaMPa = 4 * eta * edot / 1e6; // differential stress = 2 x shear strength = 2 x 2 eta edot
+  const log10a = Math.log10(edot) - n * Math.log10(sigmaMPa);
+  const o = {};
+  for (const m of ['quartzite', 'diabase', 'olivine']) Object.assign(o, { [`${m}_log10_a`]: log10a, [`${m}_n`]: n, [`${m}_q_kj`]: 0 });
+  return lawParams({ ...o, cohesion_mpa: 1e5 });
+};
+const oldOcean = (e) => ({ crustKm: 7, compositionDensity: 3000, ageMyr: 100, elevationKm: e });
+
+test('edge law: under constant separation rate the stress follows the implicit-Euler Maxwell sequence to eta * rate', () => {
+  const E = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
+  const eta = 3 * E * dtS; // Maxwell time eta / E = 3 steps
+  const p = uniform(eta);
+  const col = oldOcean(-3);
+  const edge = law.edgeSlices(col, col, 1, p);
+  const r = 1 / (1 + E * dtS / eta);
+  for (const s of edge.slices) assert.ok(Math.abs(s.r / r - 1) < 1e-9, `slice r ${s.r} vs ${r}`);
+  const rate = 50e6 / eta; // 1/s: eta * rate = 50 MPa, well below the ductile cap (4 x that)
+  const dEps = rate * dtS;
+  let stress = new Array(law.EDGE_SLICES).fill(0), exact = 0;
+  for (let n = 1; n <= 30; n++) {
+    stress = law.maxwellUpdate(stress, edge, dEps, p).stored;
+    exact = (exact + E * dEps / 1e6) * r;
+    assert.ok(Math.abs(stress[0] / exact - 1) < 1e-12);
+  }
+  const target = (eta * rate) / 1e6;
+  assert.ok(Math.abs(stress[0] / target - 1) < 1e-3, `after 10 Maxwell times: ${stress[0]} vs eta rate ${target} MPa`);
+  // The fixed point is exact for any step: eta rate (implicit Euler has no steady-state error).
+  assert.ok(Math.abs((E * dEps / 1e6) * r / (1 - r) / target - 1) < 1e-12);
+});
+
+test('edge law: a cold pair is a spring, a hot pair a dashpot; real old ocean is both, by depth', () => {
+  const E = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
+  const col = oldOcean(-3);
+  // Cold: eta = 1e6 E dt. A strain held for 100 steps keeps its stress.
+  const pc = uniform(1e6 * E * dtS);
+  const cold = law.edgeSlices(col, col, 1, pc);
+  let s = law.maxwellUpdate(new Array(8).fill(0), cold, 1e-4, pc).stored;
+  for (let n = 0; n < 100; n++) s = law.maxwellUpdate(s, cold, 0, pc).stored;
+  assert.ok(Math.abs(s[0] / (E * 1e-4 / 1e6) - 1) < 2e-4, `spring lost stress: ${s[0]}`);
+  const lc = law.linearize(new Array(8).fill(0), cold, 0, pc);
+  assert.ok(Math.abs(lc.stiffness - cold.overlap / pc.stiffness_reference_km) < 1e-5, 'stiffness = overlap / reference');
+  // Hot: eta = 1e-3 E dt. Stress is eta x this step's rate and is gone a step later.
+  const ph = uniform(1e-3 * E * dtS);
+  const hot = law.edgeSlices(col, col, 1, ph);
+  const one = law.maxwellUpdate(new Array(8).fill(0), hot, 1e-4, ph);
+  const etaRate = (1e-3 * E * dtS) * (1e-4 / dtS) / 1e6;
+  assert.ok(Math.abs(one.actual[0] / etaRate - 1) < 2e-3, `dashpot ${one.actual[0]} vs ${etaRate}`);
+  assert.ok(Math.abs(law.maxwellUpdate(one.stored, hot, 0, ph).actual[0]) < 2e-3 * etaRate);
+  // Real old ocean: elastic on top, viscous below; the elastic thickness emerges.
+  const p = lawParams();
+  const real = law.edgeSlices(col, col, 1, p);
+  const elastic = real.slices.reduce((a, sl) => a + sl.r * sl.dz, 0);
+  assert.ok(real.slices[0].r > 0.999 && real.slices[7].r < 0.01, `top r ${real.slices[0].r}, bottom r ${real.slices[7].r}`);
+  console.log(`  old ocean pair: elastic thickness ${elastic.toFixed(1)} km of ${real.overlap.toFixed(1)} km`);
+});
+
+test('edge law: a cold pair without integrity carries no tension, closes exactly at touching, and yields in compression', () => {
+  const col = oldOcean(-3);
+  // Real old ocean: at integrity 0 only the ductile base resists tension
+  // (its flow stress), unless damage also weakens it.
+  {
+    const caps = (phi, w) => { const p = lawParams({ ductile_damage_weakening: w }); return law.linearize(new Array(8).fill(0), law.edgeSlices(col, col, phi, p), 0, p); };
+    const ci = caps(1, 0), cb = caps(0, 0), cw = caps(0, 1);
+    console.log(`  old ocean pair caps (MPa km): compression ${cb.Scomp.toFixed(0)}; tension ${ci.Stens.toFixed(0)} at integrity 1, `
+      + `${cb.Stens.toFixed(0)} at 0 (ductile base), ${cw.Stens.toFixed(0)} at 0 with full ductile weakening`);
+    assert.ok(ci.Stens > cb.Stens && cw.Stens === 0);
+  }
+  // A cold pair (no creep at all: every slice brittle) for the crack rules.
+  const E0 = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
+  const p = { ...uniform(1e6 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa };
+  const E = p.crust_youngs_modulus_gpa * 1000;
+  const intact = law.edgeSlices(col, col, 1, p), broken = law.edgeSlices(col, col, 0, p);
+  const ci = law.linearize(new Array(8).fill(0), intact, 0, p);
+  assert.ok(broken.slices.every((s) => s.cracks && s.tens === 0));
+  // Pull a broken cold pair apart, then push it back past touching.
+  let st = new Array(8).fill(0);
+  const pull = law.maxwellUpdate(st, broken, 1e-3, p);
+  assert.ok(Math.abs(pull.S) < 0.01 * E * 1e-3 * broken.overlap, `separated pair pulls with ${pull.S}`);
+  st = pull.stored;
+  // This step's law for the open pair: zero force exactly at touching, and no tension allowed.
+  const lin = law.linearize(st, broken, 1e-3, p);
+  assert.ok(Math.abs(lin.zeroStrain) < 1e-9 && lin.Stens === 0 && Math.abs(lin.K / ci.K - 1) < 1e-9);
+  const back = law.maxwellUpdate(st, broken, -1e-3, p);
+  assert.ok(Math.abs(back.S) < 0.01 * E * 1e-3 * broken.overlap, `at touching: ${back.S}`);
+  const past = law.maxwellUpdate(back.stored, broken, -1e-4, p);
+  assert.ok(past.actual[0] < -0.9 * E * 1e-4, `compression past touching: ${past.actual[0]}`);
+  // Compressed far beyond the cap: the top slice sits at its cap, and unloads elastically from there.
+  const crush = law.maxwellUpdate(new Array(8).fill(0), intact, -0.05, p);
+  assert.ok(Math.abs(crush.actual[0] + intact.slices[0].comp) < 1e-9);
+  const unload = law.maxwellUpdate(crush.stored, intact, 1e-5, p);
+  assert.ok(Math.abs(unload.actual[0] - (-intact.slices[0].comp + E * 1e-5) * intact.slices[0].r) < 1e-6);
+});

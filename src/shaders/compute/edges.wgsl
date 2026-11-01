@@ -20,9 +20,9 @@
 // and creates nothing until it is back under capacity.
 
 // Radial extent of a column, km in the elevation datum: from its top down
-// through the lithosphere that moves with it.
+// through its crust and the lithosphere that moves with it (column_depth_km, law.wgsl).
 fn column_top(i: u32) -> f32 { return particles[i].elevation; }
-fn column_bottom(i: u32) -> f32 { return particles[i].elevation - lithosphere_thickness_km(i); }
+fn column_bottom(i: u32) -> f32 { return particles[i].elevation - column_depth_km(i); }
 
 // Map-view overlap on predicted positions (negative = gap).
 fn pair_overlap(i: u32, j: u32) -> f32 {
@@ -56,7 +56,9 @@ fn pop_edge() -> u32 {
     }
 }
 
-// A fresh edge with no history.
+// A fresh edge with no history: every slice loaded elastically from the rest
+// length by the pair's current strain (so a gap is an open crack, and an
+// overlap pushes at once).
 fn new_edge(a: u32, b: u32, integrity: f32) -> Edge {
     var c: Edge;
     c.particle_a = a;
@@ -68,7 +70,14 @@ fn new_edge(a: u32, b: u32, integrity: f32) -> Edge {
     c.yield_stress_mpa = sim.yield_stress_mpa;
     c.stress_normal_mpa = 0.0;
     c.stress_shear_mpa = 0.0;
-    c.stored_stress_n = 0.0;
+    let rest = particles[a].apothem + particles[b].apothem;
+    c.strain = (distance(particles[a].position.xyz, particles[b].position.xyz) - rest) / rest;
+    for (var k = 0u; k < 8u; k++) { c.slice_stress_mpa[k] = sim.crust_youngs_modulus_gpa * 1000.0 * c.strain; }
+    c.stiffness = 0.0;
+    c.reference_gap = 0.0;
+    c.lambda_min = 0.0;
+    c.lambda_max = 0.0;
+    c.overlap_km = 0.0;
     c.stored_stress_t0 = 0.0;
     c.stored_stress_t1 = 0.0;
     c.slip_anchor0 = 0.0;

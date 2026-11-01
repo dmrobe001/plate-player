@@ -39,7 +39,8 @@ export function columnsFrom(P, params, { stride = 4, positionField = 'predicted_
   for (let i = 0; i < count; i++) {
     for (let c = 0; c < 3; c++) position[3 * i + c] = pos[stride * i + c];
     top[i] = P.elevation[i];
-    bottom[i] = P.elevation[i] - lithosphereThicknessKm(P.composition_density[i], P.age[i], params);
+    // The column spans its crust and its lithosphere, whichever reaches deeper (column_bottom in edges.wgsl).
+    bottom[i] = P.elevation[i] - Math.max(lithosphereThicknessKm(P.composition_density[i], P.age[i], params), P.thickness_km?.[i] ?? 0);
   }
   return {
     count, position, top, bottom,

@@ -11,6 +11,7 @@ import growthWGSL from '../shaders/compute/growth.wgsl';
 import solverWGSL from '../shaders/compute/solver.wgsl';
 import edgesWGSL from '../shaders/compute/edges.wgsl';
 import profileWGSL from '../shaders/compute/profile.wgsl';
+import lawWGSL from '../shaders/compute/law.wgsl';
 
 export const CAPACITY = {
   maxParticles: 25000,
@@ -103,7 +104,7 @@ export class Simulation {
 
   #createPipelines(onError) {
     const { device, buffers } = this;
-    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL, edgesWGSL, profileWGSL].join('\n');
+    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, growthWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
     const order = ['grid', 'adjacency', 'particles', 'edges', 'particlePool', 'edgePool', 'hashGrid', 'deltas', 'solver', 'profiles'];
@@ -134,8 +135,8 @@ export class Simulation {
       'crust_thermo_isostasy', 'crust_refresh_derived', 'crust_edge_healing',
       'crust_accumulation', 'crust_commit_splits', 'crust_rewire_edges', 'crust_clean_split',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
-      'edges_begin', 'edges_prune', 'edges_note_listed', 'edges_create', 'edges_finish',
-      'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine', 'crust_edge_stress',
+      'edges_begin', 'edges_prune', 'edges_note_listed', 'edges_create', 'edges_finish', 'edges_law', 'edges_maxwell',
+      'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine',
       'crust_clear_deltas', 'crust_solve_edges', 'crust_apply_deltas',
       'crust_integrate',
     ];
@@ -199,6 +200,12 @@ export class Simulation {
       eu[base + eo.is_active] = 1;
       ef[base + eo.integrity] = 1 - B.damage[k];
       ef[base + eo.yield_stress_mpa] = state.yieldStressMPa;
+      // Elastic loading from the rest length (apothem sum), in every slice.
+      const i = B.a[k], j = B.b[k];
+      const d = Math.hypot(...[0, 1, 2].map((c) => P.position[3 * i + c] - P.position[3 * j + c]));
+      const rest = P.apothem[i] + P.apothem[j];
+      ef[base + eo.strain] = (d - rest) / rest;
+      ef.fill(this.params.crust_youngs_modulus_gpa * 1000 * ((d - rest) / rest), base + eo.slice_stress_mpa, base + eo.slice_stress_mpa + 8);
     }
     device.queue.writeBuffer(buffers.edges, 0, ebuf);
 
@@ -292,6 +299,7 @@ export class Simulation {
     run('edges_note_listed', crust);
     run('edges_create', crust);      // new pairs in range
     run('edges_finish', crust);      // edge counts, angle-sorted slots, solver iterates
+    run('edges_law', edges);         // this step's linear force law and caps (design 4.5)
     for (let i = 0; i < this.params.solver_iterations; i++) {
       if (i > 0 && i % ITERATIONS_PER_SUBMIT === 0) {
         submit();
@@ -304,7 +312,7 @@ export class Simulation {
       run('crust_chebyshev_combine', crust);
       run('solver_next_iteration', 1);
     }
-    run('crust_edge_stress', edges);
+    run('edges_maxwell', edges);     // slice stresses advance, capped; stand-in damage
     run('crust_integrate', crust);
     submit();
     this.steps++;
@@ -411,7 +419,7 @@ export function chebyshevWeights(rho, delay, n) {
  * both the drag term and the elastic energy scale with R^2.
  */
 export function bondRate(p) {
-  const k = (Math.sqrt(3) / 2) * p.crust_youngs_modulus_gpa * 1e9 * p.elastic_thickness_km * 1e3; // N/m
+  const k = (Math.sqrt(3) / 2) * p.crust_youngs_modulus_gpa * 1e9 * p.stiffness_reference_km * 1e3; // N/m
   const area = 2 * Math.sqrt(3) * (p.base_apothem * EARTH_RADIUS_M) ** 2;                          // m^2
   const gamma = (area * p.asthenosphere_viscosity_pa_s) / (p.drag_reference_channel_km * 1e3);     // N s/m
   return k / (gamma / SECONDS_PER_MYR);

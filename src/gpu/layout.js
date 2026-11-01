@@ -126,11 +126,19 @@ export const Edge = defineStruct('Edge', [
   ['integrity', 'f32'],         // 0..1: 0 = no cohesion (pushes only), 1 = intact
   ['lambda', 'f32'],            // XPBD multiplier accumulated over this step's iterations
   ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
-  ['yield_stress_mpa', 'f32'],
-  ['stress_normal_mpa', 'f32'], // diagnostic: + tension, - compression
-  ['stress_shear_mpa', 'f32'],  // diagnostic: magnitude
-  // Carried across steps, not yet used (design 4.5, 4.7; phases C-F):
-  ['stored_stress_n', 'f32'],   // Maxwell memory, normal
+  ['yield_stress_mpa', 'f32'],   // stand-in damage rule, until phase D
+  ['stress_normal_mpa', 'f32'], // diagnostic: depth-averaged normal stress, + tension, - compression
+  ['stress_shear_mpa', 'f32'],  // diagnostic: magnitude (0 until shear exists)
+  // Edge law (design 4.5, phase C; src/edges/law.js). State:
+  ['strain', 'f32'],            // normal strain (|x_b - x_a| - rest) / rest at the last update
+  ['slice_stress_mpa', 'array<f32, 8>'], // Maxwell stress per depth slice of the shared interval, top down
+  // Derived each step by edges_law, for the solve:
+  ['stiffness', 'f32'],         // effective stiffness / (E * stiffness_reference_km), in [0, 1]
+  ['reference_gap', 'f32'],     // gap C (unit sphere) at which the linearised force is zero
+  ['lambda_min', 'f32'],        // multiplier bounds: depth-integrated tension and compression caps
+  ['lambda_max', 'f32'],
+  ['overlap_km', 'f32'],        // thickness of the depth interval the two columns share
+  // Carried across steps, not yet used (phases D-F):
   ['stored_stress_t0', 'f32'],  // Maxwell memory, tangential (2 components)
   ['stored_stress_t1', 'f32'],
   ['slip_anchor0', 'f32'],      // tangential reference offset (2 components)

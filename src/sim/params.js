@@ -42,7 +42,10 @@ export const SIM_PARAMS = [
   // solve converges well enough that residual stresses stay at a few MPa
   // (design.md, Chebyshev findings); plain Jacobi needed a 2 GPa stop-gap.
   ['crust_youngs_modulus_gpa', 'f32', 70.0],
-  ['elastic_thickness_km', 'f32', 30.0],     // thickness that carries in-plane stress
+  // Edge stiffness is E times the elastic part of the shared depth interval
+  // (design 4.5); this thickness normalises it so the per-edge factor is
+  // <= 1 (the thickest column), which keeps the Chebyshev bound valid.
+  ['stiffness_reference_km', 'f32', 150.0],
   ['bond_rate_myr_inv', 'f32', null],   // derived: bond stiffness / reference drag of a base-size particle, 1/Myr
   ['yield_stress_mpa', 'f32', 150.0],
   ['base_apothem', 'f32', 0.0175],      // reference particle apothem
@@ -81,6 +84,11 @@ export const SIM_PARAMS = [
   ['pore_fluid_factor', 'f32', 0.4],         // pore pressure / lithostatic (hydrostatic ~0.4)
   ['cohesion_mpa', 'f32', 20.0],             // of intact rock (integrity 1)
   ['reference_strain_rate_s', 'f32', 1e-15],
+  // Edge law (design 4.5): how much lost integrity weakens a ductile slice in
+  // tension, cap x (1 - w (1 - phi)). 0 = the design table (ductile rock
+  // resists separation whatever phi); 1 = a broken edge's ductile part is as
+  // weak in tension as its brittle part (shear-zone damage, as in grain-damage theory).
+  ['ductile_damage_weakening', 'f32', 0.0],
   ['quartzite_log10_a', 'f32', -3.959],      // log10(1.1e-4)
   ['quartzite_n', 'f32', 4.0],
   ['quartzite_q_kj', 'f32', 223.0],

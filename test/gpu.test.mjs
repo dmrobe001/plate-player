@@ -157,11 +157,12 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
   // One stretched bond, no mantle flow. Drag-as-mass XPBD should reproduce
   // implicit Euler for  dC/dt = -C / tau  exactly: C_n = C_0 (1 + dt/tau)^-n,
   // for time steps far below, at, and far above tau.
+  // The edge law uses a uniform, purely elastic profile (ELASTIC).
   const page = await openPage({ small: true });
-  const results = await page.evaluate(async () => {
+  const results = await page.evaluate(async (elastic) => {
     const a = 0.0175, L = 3 * a, eps = 0.05; // stretch well inside edge range (10%)
     // base_apothem = L/2: these particles have the reference drag (w = 1).
-    await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: L / 2 });
+    await plate.setParams({ ...elastic, mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: L / 2 });
     const kappa70 = plate.sim.params.bond_rate_myr_inv;
     await plate.setParams({ crust_youngs_modulus_gpa: 70 * 0.5 / kappa70 }); // kappa = 0.5/Myr, tau = 1/(2 kappa) = 1 Myr
     const tau = 1 / (2 * plate.sim.params.bond_rate_myr_inv);
@@ -192,7 +193,7 @@ test('two bonded particles relax as implicit Euler with tau = gamma / 2k', { tim
       out.push({ dt, steps, tau, ratio: (await stretch()) / c0, expected: (1 + dt / tau) ** -steps });
     }
     return out;
-  });
+  }, ELASTIC);
   for (const r of results) {
     console.log(`  dt/tau = ${(r.dt / r.tau).toFixed(1)}, ${r.steps} steps: C/C0 = ${r.ratio.toFixed(5)}, implicit Euler ${r.expected.toFixed(5)}`);
     assert.ok(Math.abs(r.ratio - r.expected) < 0.01 * r.expected + 2e-3, `dt ${r.dt}: ${r.ratio} vs ${r.expected}`);
@@ -207,9 +208,9 @@ test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi 
   // propagates the end displacement about one bond per sweep.
   const K = 200;
   const page = await openPage({ small: true });
-  const runs = await page.evaluate(async ([chain, builderSrc, K]) => {
+  const runs = await page.evaluate(async ([chain, builderSrc, K, elastic]) => {
     const build = eval(`(${builderSrc})`);
-    await plate.setParams({ mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: chain.apothem });
+    await plate.setParams({ ...elastic, mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: chain.apothem });
     await plate.setParams({ dt_crust_myr: K / plate.sim.params.bond_rate_myr_inv, solver_iterations: 128 });
     const out = {};
     for (const [name, rho] of [['plain', 0], ['chebyshev', 0.999]]) {
@@ -221,7 +222,7 @@ test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi 
       out[name] = Array.from({ length: chain.n }, (_, i) => Math.atan2(f[w * i], f[w * i + 2]));
     }
     return out;
-  }, [CHAIN, chainState.toString(), K]);
+  }, [CHAIN, chainState.toString(), K, ELASTIC]);
   assert.deepEqual(page.errors, []);
   await page.close();
 
@@ -333,6 +334,114 @@ test('column profiles on the GPU match the CPU reference', { timeout: 300_000 },
   out.elevation.forEach((e, k) => assert.ok(Math.abs(e - out.airy[k]) < 1e-6));
 });
 
+test('edge law on the GPU matches the CPU reference: linearised law, caps and slice stresses', { timeout: 300_000 }, async () => {
+  // Phase C (design 9). Isolated pairs with real profiles (old ocean,
+  // continents, continent against ocean, thick against thin), loaded
+  // compressed or stretched, at integrity 1, 0.3 and 0; one step with the
+  // solver. The kernels (law.wgsl) must give the reference's (src/edges/law.js)
+  // stiffness, zero-force gap, multiplier bounds and overlap at the start of the
+  // step, and its slice stresses for the strain the solve produced.
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async () => {
+    const pairs = [ // [crust km, density, age] x 2, strain, integrity
+      [[7, 3000, 100], [7, 3000, 100], -1e-3, 1], [[7, 3000, 100], [7, 3000, 100], 2e-3, 0],
+      [[35, 2700, 1000], [35, 2700, 1000], -2e-3, 1], [[35, 2700, 1000], [7, 3000, 100], -1e-3, 0.3],
+      [[70, 2700, 1000], [30, 2700, 1000], 1e-3, 1], [[7, 3000, 80], [7, 3000, 100], 3e-3, 0.3],
+    ];
+    const a = 0.0175, n = 2 * pairs.length, position = new Float32Array(3 * n);
+    const cols = pairs.flatMap((q) => [q[0], q[1]]);
+    pairs.forEach((q, k) => {
+      const c = 6 * a * k, half = Math.asin(a * (1 + q[2])); // chord 2a (1 + strain)
+      position.set([Math.sin(c - half), 0, Math.cos(c - half), Math.sin(c + half), 0, Math.cos(c + half)], 6 * k);
+    });
+    const f = (m) => Float32Array.from(cols, (c) => c[m]);
+    await plate.setParams({ mantle_drive: 0 });
+    await plate.loadState({
+      particles: { count: n, position, thickness: f(0), compositionDensity: f(1), age: f(2), temperature: new Float32Array(n).fill(278), apothem: new Float32Array(n).fill(a) },
+      bonds: { count: pairs.length, a: Uint32Array.from(pairs, (_, k) => 2 * k), b: Uint32Array.from(pairs, (_, k) => 2 * k + 1), damage: Float32Array.from(pairs, (q) => 1 - q[3]) },
+      yieldStressMPa: 1e9,
+    });
+    const L = plate.debug.law, Pr = plate.debug.profile, p = plate.sim.params;
+    const before = await plate.debug.edges();
+    await plate.runSteps(1);
+    const after = await plate.debug.edges();
+    const worst = {};
+    const note = (field, gpu, ref, scale) => { const e = Math.abs(gpu - ref) / scale; if (!(e <= (worst[field]?.e ?? -1))) worst[field] = { e, gpu, ref }; };
+    const summary = [];
+    pairs.forEach((q, k) => {
+      const e = [...after.pairs.entries()].find(([key]) => key === `${2 * k},${2 * k + 1}`)?.[1];
+      if (e === undefined) { worst.missing = { e: 1 }; return; }
+      const colA = Pr.columnOfParticle(after.P, 2 * k), colB = Pr.columnOfParticle(after.P, 2 * k + 1);
+      const edge = L.edgeSlices(colA, colB, after.E.integrity[e], p);
+      const stress0 = Array.from(before.E.slice_stress_mpa.subarray(8 * e, 8 * e + 8));
+      const lin = L.linearize(stress0, edge, before.E.strain[e], p);
+      const rest = after.P.apothem[2 * k] + after.P.apothem[2 * k + 1];
+      const bounds = L.lambdaBounds(lin, rest, p);
+      note('stiffness', after.E.stiffness[e], lin.stiffness, 1);
+      note('reference_gap', after.E.reference_gap[e], lin.zeroStrain * rest, Math.max(Math.abs(lin.zeroStrain * rest), 1e-3 * rest));
+      note('lambda_min', after.E.lambda_min[e], bounds.lambdaMin, Math.max(bounds.lambdaMax, 1e-12));
+      note('lambda_max', after.E.lambda_max[e], bounds.lambdaMax, Math.max(bounds.lambdaMax, 1e-12));
+      note('overlap_km', after.E.overlap_km[e], edge.overlap, 100);
+      const upd = L.maxwellUpdate(stress0, edge, after.E.strain[e] - before.E.strain[e], p);
+      for (let s = 0; s < 8; s++) note('slice_stress_mpa', after.E.slice_stress_mpa[8 * e + s], upd.stored[s], 70);
+      note('stress_normal_mpa', after.E.stress_normal_mpa[e], upd.meanStress, 70);
+      summary.push(`${q[0][0]}/${q[1][0]} km, strain ${q[2]}, integrity ${q[3]}: stiffness ${lin.stiffness.toFixed(3)}, stress ${upd.meanStress.toFixed(1)} MPa`);
+    });
+    return { worst, summary };
+  });
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  for (const line of out.summary) console.log(`  ${line}`);
+  console.log(`  worst scaled differences: ${Object.entries(out.worst).map(([k, w]) => `${k} ${w.e.toExponential(1)}`).join(', ')}`);
+  for (const [field, w] of Object.entries(out.worst)) assert.ok(w.e < 1e-3, `${field}: GPU ${w.gpu} vs reference ${w.ref}`);
+});
+
+test('one edge under constant separation rate follows the Maxwell sequence on the GPU', { timeout: 300_000 }, async () => {
+  // Phase C (design 9). Creep without temperature dependence gives every
+  // slice the same viscosity, eta = 3 E dt (a Maxwell time of 3 steps). The
+  // pair is pulled apart by the same strain every step (positions written,
+  // no solve): the mean stress must follow sigma_n = (sigma_n-1 + E de) r,
+  // r = 1 / (1 + E dt / eta), toward eta x rate.
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async (helperSrc) => {
+    const p0 = plate.sim.params;
+    const E = p0.crust_youngs_modulus_gpa * 1e9, dtS = p0.dt_crust_myr * 3.15576e13, eta = 3 * E * dtS;
+    const n = 3.5, edot = p0.reference_strain_rate_s, log10a = Math.log10(edot) - n * Math.log10(4 * eta * edot / 1e6);
+    const over = { mantle_drive: 0, solver_iterations: 0, cohesion_mpa: 1e5 };
+    for (const m of ['quartzite', 'diabase', 'olivine']) Object.assign(over, { [`${m}_log10_a`]: log10a, [`${m}_n`]: n, [`${m}_q_kj`]: 0 });
+    await plate.setParams(over);
+    const a = 0.0175, rate = 50e6 / eta, de = rate * dtS; // eta rate = 50 MPa
+    const place = (strain) => { const h = Math.asin(a * (1 + strain)); return [[-Math.sin(h), 0, Math.cos(h)], [Math.sin(h), 0, Math.cos(h)]]; };
+    const pos = place(0);
+    await plate.loadState({
+      particles: { count: 2, position: Float32Array.from(pos.flat()), thickness: Float32Array.of(7, 7), compositionDensity: Float32Array.of(3000, 3000), age: Float32Array.of(100, 100), temperature: Float32Array.of(278, 278), apothem: Float32Array.of(a, a) },
+      bonds: { count: 1, a: Uint32Array.of(0), b: Uint32Array.of(1), damage: Float32Array.of(0) },
+      yieldStressMPa: 1e9,
+    });
+    const H = eval(helperSrc);
+    const stresses = [];
+    for (let s = 1; s <= 12; s++) {
+      H.move(place(s * de));
+      await plate.runSteps(1);
+      if (s % 4 === 0) {
+        const r = await plate.debug.edges();
+        const e = r.pairs.get('0,1');
+        stresses.push({ s, mean: r.E.stress_normal_mpa[e], strain: r.E.strain[e] });
+      }
+    }
+    return { stresses, E, de, r: 1 / (1 + E * dtS / eta), target: eta * rate / 1e6 };
+  }, PATCH_HELPERS);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  let sigma = 0;
+  const expected = [];
+  for (let s = 1; s <= 12; s++) { sigma = (sigma + out.E * out.de / 1e6) * out.r; if (s % 4 === 0) expected.push(sigma); }
+  out.stresses.forEach((x, k) => {
+    console.log(`  step ${x.s}: mean stress ${x.mean.toFixed(2)} MPa, implicit-Euler Maxwell ${expected[k].toFixed(2)} MPa (eta x rate = ${out.target.toFixed(1)})`);
+    assert.ok(Math.abs(x.mean / expected[k] - 1) < 0.02, `step ${x.s}: ${x.mean} vs ${expected[k]}`);
+  });
+});
+
 test('columns touch only if they overlap in map view and in depth', { timeout: 300_000 }, async () => {
   // Two unbonded pairs overlapping by the same amount in map view. In one
   // pair both columns are at the surface: a contact pushes them apart. In the
@@ -370,6 +479,11 @@ test('columns touch only if they overlap in map view and in depth', { timeout: 3
 
 // Page-side helpers for synthetic edge tests: a triangular lattice patch of
 // spacing 2a around the north pole, and a writer for particle positions.
+// Edge-law parameters that make every slice a pure spring (no creep, no
+// strength limit) over exactly the reference thickness, for an age-100 ocean
+// column (100 km deep): edge stiffness is then the old bond stiffness (design 9, phase C).
+const ELASTIC = { olivine_log10_a: -60, diabase_log10_a: -60, quartzite_log10_a: -60, cohesion_mpa: 1e5, stiffness_reference_km: 100 };
+
 const PATCH_HELPERS = `({
   patch(rings, a) {
     const pts = [];
@@ -482,7 +596,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
     await plate.loadState(H.state(pts, a, bonds));
 
     // Distinct values in every carried field.
-    const E = plate.layout.Edge, fields = ['stored_stress_n', 'stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1', 'timer'];
+    const E = plate.layout.Edge, fields = ['stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1', 'timer'];
     const buf = (await plate.readBuffers(['edges'])).edges, v = new Float32Array(buf);
     bonds.forEach((_, k) => fields.forEach((f, m) => { v[E.words * k + E.offsets[f]] = 10 * (m + 1) + k; }));
     plate.sim.device.queue.writeBuffer(plate.sim.buffers.edges, 0, buf);
@@ -536,7 +650,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   assert.deepEqual(out.problems.slice(0, 10), []);
   assert.deepEqual(out.mismatches.slice(0, 10), []);
   assert.equal(out.start.length, 12);
-  assert.ok(out.start.every((e) => Math.abs(e.integrity - 0.7) < 1e-6 && e.timer >= 60), 'carried state not as written');
+  assert.ok(out.start.every((e) => Math.abs(e.integrity - 0.7) < 1e-6 && e.timer >= 50), 'carried state not as written');
   assert.deepEqual(out.afterJitter, out.start, 'edge state changed while every pair stayed in range');
 
   // The ring column has 3 edges (centre and two ring neighbours); all leave range.
@@ -555,7 +669,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   // Back in range: fresh edges with no cohesion and no history, born now.
   for (const e of out.returned.filter((x) => x.k.split(',').includes('0'))) {
     assert.equal(e.integrity, 0);
-    for (const f of ['stored_stress_n', 'stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1', 'timer']) assert.equal(e[f], 0);
+    for (const f of ['stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1', 'timer']) assert.equal(e[f], 0);
     assert.ok(e.born > 0, `born_myr ${e.born}`);
   }
   assert.equal(out.returned.length, 12);

@@ -95,28 +95,37 @@ from its state on 8 depth slices (3 in the crust, 5 in the lithospheric mantle):
   (where Byerlee friction and creep cross).
 
 So sea floor deepens with √age (ridge 2.9 km deep, old basins 5.6 km), and GPE
-differences give the ridge push of half-space cooling. For now only isostasy reads
-the profile; the edge law (stiffness and strength from the slices, phase C) and GPE
-forces (phase D) come next.
+differences give the ridge push of half-space cooling. Isostasy and the edge law read
+the profile; GPE forces come with design phase D.
 
 **Edges** (`Edge`, `shaders/compute/edges.wgsl`). There is one kind of edge: the
 interface between two neighbouring columns. An edge exists exactly while its pair is
 in range: a map-view gap below 10% of the apothem sum *and* overlapping depth
 intervals. It is created when the pair comes into range and dropped when it leaves,
-and in between it keeps its state across steps (integrity, plus stress memory,
-slip anchor and timer fields reserved for the coming edge law). **Integrity** in
-[0, 1] replaces the old bond/contact split: an edge with integrity 0 has no cohesion
-and only pushes (a contact); one with integrity > 0 is a central spring whose tension
-is softened by lost integrity (a bond). The initial bonds start at integrity
-1 − damage; edges made later start at 0, except the parent–child edge of a split,
-which starts at 1. Each particle also has a slot list of its edges, sorted by angle,
-rebuilt every step. Rest length is always the sum of the two particles' apothems
-(computed, not stored), so it follows any change in particle size. Stiffness comes
-from the lithosphere's Young's modulus and elastic thickness, k = (√3/2)·E·hₑ (the
-2D modulus of a triangular spring network), with the physical E ≈ 70 GPa. Stress
-beyond an Arrhenius-weakened yield stress lowers integrity, and heat slowly restores
-it, except at 0, which is final until suturing exists. These two rules are stand-ins
-until the edge law of design phases C–D.
+and in between it keeps its state across steps. **Integrity** in [0, 1] replaces the
+old bond/contact split. Initial bonds start at integrity 1 − damage; edges made later
+start at 0, except the parent–child edge of a split, which starts at 1. Each particle
+also has a slot list of its edges, sorted by angle, rebuilt every step.
+
+**Edge law** (`shaders/compute/law.wgsl`; CPU reference `src/edges/law.js`). An edge
+couples its two columns over the depth range they share, in 8 slices. Each slice uses
+the two columns' temperature and creep strength at that depth (from the column
+profiles). Each slice is a spring (Young's modulus 70 GPa) in series with a dashpot
+(the pair's creep viscosity), and keeps its own stress from step to step. Cold slices
+act as springs and hot ones as dashpots, so the elastic thickness emerges: 47 km for a
+pair of 100 Myr old ocean. Each slice's stress is capped by the yield-strength
+envelope:
+- compression: the weaker of Byerlee friction (plus cohesion × integrity) and creep;
+- tension: cohesion × integrity where the slice is brittle, or the creep flow stress
+  where it is ductile.
+
+So an edge at integrity 0 between cold columns only pushes (a contact), and its
+brittle slices crack in tension and close exactly at touching. Rest length is always
+the sum of the two apothems. Within a step the law is linear, with the total force
+clamped to the depth-integrated caps. Only the normal (push–pull) part exists:
+tangential friction needs a per-particle orientation first. Damage and healing are
+still stand-ins until design phase D: mean stress beyond an Arrhenius-weakened yield
+lowers integrity, and heat slowly restores it, except at 0.
 
 **Motion** (`shaders/compute/solver.wgsl`). Overdamped extended position-based
 dynamics (XPBD), with basal drag in the role of mass: each step minimises
@@ -194,7 +203,8 @@ plate-player/
 │   │   ├── cell-list.js       CPU neighbour search
 │   │   └── random.js          seeded RNG, uniform points on the sphere
 │   ├── edges/
-│   │   └── topology.js        CPU reference for edge existence, slot order, storage checks
+│   │   ├── topology.js        CPU reference for edge existence, slot order, storage checks
+│   │   └── law.js             CPU reference for the edge law: depth slices, Maxwell stresses, caps
 │   ├── columns/
 │   │   └── profile.js         CPU reference for column profiles: geotherm, Airy, GPE, strength
 │   ├── sim/
@@ -214,7 +224,7 @@ plate-player/
 │   │   ├── renderer.js        render pipelines and draw calls
 │   │   └── camera.js          orbit camera
 │   └── shaders/
-│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver, edges, profile
+│       ├── compute/           bindings.wgsl, locate, thermal, growth, solver, edges, profile, law
 │       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
 ├── test/
 │   ├── unit.test.mjs          CPU tests (Node only)
@@ -428,8 +438,9 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [ ] **Subduction rarely starts.** The trigger is a deep overlap (34% of an apothem
       sum), which stiff contacts now prevent; converging plates lock instead. Design §6
       replaces it with a stress-based rule on the (now persistent) edges (phase F).
-- [ ] **No friction.** Edges are frictionless; Coulomb friction comes with the
-      strength caps of the edge law (phase C).
+- [ ] **No friction.** Edges have strength caps in compression and tension
+      (phase C) but no tangential part, so sliding columns feel no friction. A
+      tangential channel needs a per-particle orientation (design §10).
 - [ ] **Slabs detach from their plate.** A new slab's edges leave range when its top
       drops below the lithosphere, so slab pull no longer reaches the plate through
       edges (phase F replaces the drop with bending).
