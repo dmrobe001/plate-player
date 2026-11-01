@@ -5,9 +5,10 @@ identification from phase 5, Chebyshev acceleration, and the lava-lamp mantle wi
 grounded basal drag. **The physics is being redesigned around one pair-interaction
 law** (sections 3.2, 4.0, 4.5, 4.7, 6): no bond/contact distinction, graded and
 history-dependent integrity, area and volume as exact budgets. Of the redesign, phases
-A (persistent edges), B (column profiles), C (the edge law, normal part), D (the
-irreversible step, without slip), E (area, volume, melt, splits) and F (subduction,
-suturing, slabs, arcs, bending) are done. Integration is next.
+A (persistent edges), B (column profiles), C (the edge law), D (the irreversible
+step), E (area, volume, melt, splits), F (subduction, suturing, slabs, arcs,
+bending) and G (column rotation, the tangential channel with friction, face
+rolling, reference shapes) are done. Integration is next.
 This document says where the model is going and why.
 
 **Development strategy (current).** No more full-planet runs until all the physics
@@ -131,9 +132,11 @@ crust and tilted for slabs.
 |---|---|---|---|
 | `position` | vec3 | unit sphere | direction of the column |
 | `elevation` | f32 | km | **free radius** (done in phase 3, as a separate coordinate rather than \|x\|; see phase 3 findings) |
-| `director` | vec3 | unit vector | column axis; carries bending (new) |
-| `orientation` | f32 | rad | rotation about the director, from the polar decomposition (new) |
-| `area_ref` | f32 | unit sphere² | stress-free (reference) area; apothem a = √(area_ref / 2√3) sets rest lengths and contact size. Changed only by plastic/viscous dilatation (4.7) and splits |
+| `director` | vec3 | unit vector | column axis; carries bending. *Not built:* bending acts on the elevation field instead (phase F) |
+| `body_axis` | vec3 | unit tangent | the column's body x-axis: carried with it and turned by its spin (done in phase G; 4.2) |
+| `spin`, `rotation_total` | f32 | rad | rotation about the vertical this step (a solved unknown, phase G), and since the run started (diagnostic: paleomagnetic declination) |
+| `shape_p`, `shape_q` | f32 | – | reference shape: traceless log-stretch L = [[p, q], [q, −p]] in the body frame; aspect ratio e^(2\|(p,q)\|) (done in phase G; 4.2, 4.8) |
+| `area_ref` | f32 | unit sphere² | stress-free (reference) area; apothem a = √(area_ref / 2√3) is the mean radius, and with the shape sets rest lengths and contact size. Changed only by plastic/viscous dilatation (4.7) and splits |
 | `cell_area` (derived) | f32 | unit sphere² | actual area: the column's cell in the tessellation of the markers (4.8; done in phase E). Recomputed each step, with `cell_area_prev`, `cell_shape` (centroid, major axis) and `cell_clipped` |
 | `crust_volume` | f32 | km·unit sphere² | crust volume V; crust thickness h = V / area. Changes only at sources and sinks (4.8; done in phase E) |
 | `thickness_km` (derived) | f32 | km | crust_volume / cell_area |
@@ -145,7 +148,7 @@ crust and tilted for slabs.
 | `plate` | u32 | – | plate slot, from labelling; diagnostic only, never read by forces |
 | `kind` | u32 | – | surface / slab / ghost (boundary-driven) / inactive |
 | `level` | u32 | – | resolution level for adaptivity (new; 0 = base) |
-| `strain` | 3×f32 | – | symmetric 2×2 strain from the neighbour fit (diagnostic + yield) |
+| `strain` | 3×f32 | – | symmetric 2×2 strain from the neighbour fit (diagnostic + yield). *As built (phase G):* the step's inelastic strain tensor is fitted from the edges and used at once (area, shape), not stored |
 | `stress` | 3×f32 | MPa·km | thickness-integrated stress tensor (diagnostic + export) |
 | `x_prev`, `x_pred` | vec3 | | solver scratch |
 
@@ -165,8 +168,8 @@ contact or a ridge is a matter of the edge's state and the two columns' profiles
 | `integrity` φ | f32 | 0..1. Scales cohesion, friction and (optionally) ductile viscosity. Lowered by plastic work, raised by thermally activated healing (4.7) |
 | `length`, `slice_stress` | f32, 8×f32 | the pair's distance at the last update (strain increments are measured from it, so a change of rest length adds no stress), and the Maxwell stress of each of 8 depth slices of the shared interval: the memory that makes the edge history-dependent (4.5; phases C, D) |
 | `strain`, `inelastic_strain`, `work` | f32 | diagnostics of the last update: strain vs rest length, inelastic strain (feeds area_ref), plastic work (feeds damage) |
-| `stress_t` | vec2 | tangential stored stress (reserved; needs particle orientation, section 10) |
-| `slip_anchor` | vec2 | tangential reference offset, moved by slip |
+| `slice_shear_mpa`, `direction` | 8×f32, 3×f32 | the tangential Maxwell stress of each slice, and the pair's separation vector at the last update, from which sliding is measured (done in phase G; replaces the planned `stress_t` and `slip_anchor`: like `length`, the memory is the last update's geometry) |
+| `moment` | f32 | the face moment against relative rotation of the two columns (phase G) |
 | `lambda`, `lambda_prev` | f32 | XPBD multipliers for this step (Chebyshev needs the previous one) |
 | `timers` | f32 | sustained-compression accumulators for state transitions (subduction initiation, suturing) |
 | `born` | f32 | Myr; for events and history |
@@ -276,6 +279,36 @@ neighbour-fit tensor is kept as a measurement (display, export, and possibly a b
 split of edge stress into isotropic and deviatoric parts than the per-edge stand-in
 in 4.7), not as a separate energy, so elasticity is not counted twice.
 
+*As built (phase G; `src/columns/shape.js`, `flow.wgsl`, `solver.wgsl`, `law.wgsl`).*
+The orientation is not taken from a polar decomposition but **solved for**: each
+column has a spin (a rotation about the vertical per step), an unknown of the XPBD
+solve next to its position, resisted by the same basal drag through its squared
+radius of gyration (area/2π for the equal-area ellipse). The edges' tangential
+channel (4.5) couples spins and positions; rigid rotation of a patch turns every
+column with it and stores no shear.
+- **Elasticity stays on the edges.** On a triangular lattice with free rotations,
+  normal and tangential edge stiffnesses k_n and k_t give plane elasticity with
+  K = √3 k_n/2, μ = √3 (k_n + k_t)/4, so ν = (k_n − k_t)/(3k_n + k_t) and the shear
+  modulus is E/2(1+ν). `shear_stiffness_ratio` k_t/k_n = 0.2 gives ν = 0.25. The
+  normal stiffness is set so the lattice's Young's modulus stays E·h for any ratio
+  (`bondRate`). One energy: the column's deformation energy is half of each face's.
+- **The neighbour fit is a measurement of inelastic strain.** Each step, the
+  column's distributed inelastic strain increment is fitted by least squares from its
+  edges: the normal inelastic strain of each (n·ε·n) and its ductile tangential
+  strain (t·ε·n + w). The fourth unknown w is the neighbourhood's rotation relative
+  to the column's spin (the micro- and macro-rotations of a Cosserat medium may
+  differ). Its trace changes area_ref (4.7); its deviatoric part changes the shape.
+- **Reference shape.** The hexagon of area area_ref stretched by U = exp(L), L
+  traceless in the body frame: radius along n = apothem/√(nᵀU⁻²n). An affinely
+  stretched lattice keeps every rest length exact (rest = the two radii along the
+  pair). The shape is a finite-strain ellipse: it turns with the material (spin, plus
+  w) and accumulates the deviatoric strain, up to `shape_aspect_cap` 3. Beyond the
+  cap, deviatoric flow is taken up by neighbour exchange. Faults (brittle slip on an
+  edge) do not change shapes: they are jumps between columns.
+- **The tessellation keeps scalar weights** (the apothem): anisotropic weights would
+  curve cell boundaries and break the exact tiling. The cell's measured shape against
+  the reference shape is a diagnostic.
+
 ### 4.3 Bending (new; needed at 50 km)
 
 Directors nᵢ, with flexural rigidity D = E hₑ³ / 12(1−ν²):
@@ -326,7 +359,9 @@ vertically rigid: the thin-sheet assumption); each slice is a **Maxwell element*
 
 **Geometry:** d = |xᵢ − xⱼ| on the unit sphere; rest length aᵢ + aⱼ (always: the
 apothem sum); normal gap C = d − (aᵢ + aⱼ); tangential offset relative to
-`slip_anchor`.
+`slip_anchor`. *Since phase G:* rest length = the two columns' radii along the pair
+(their reference shapes, 4.2), which is the apothem sum for round columns; the
+tangential offset is the faces' sliding since the last update (below).
 
 **Effective stiffness for this step** (normal and tangential alike):
 
@@ -389,10 +424,33 @@ two are one edge with graded integrity.
   pulled together at most at its tension cap until it reaches touching, where the law
   is stiff again. An earlier draft treated open cracks as constant forces for the
   whole step, and pairs overshot into compression.
-- **Not built: the tangential (shear) part.** A tangential spring between column
-  centres resists rigid rotation of the pair (the bug removed in phase 2). It needs a
-  per-particle orientation (4.2) first (section 10). Until then shear is resisted only
-  through the network's geometry, as before.
+- **The tangential part (phase G).** Each slice also carries a tangential Maxwell
+  stress, stiffness G_t = `shear_stiffness_ratio`·E, the same Maxwell factor. Its
+  strain is the faces' sliding over the step per rest length:
+  δ_t = L₀ψ − l_a θ_a − l_b θ_b, ψ the rotation of the pair line since the last
+  update, θ the spins, l the levers to the contact point (l_a + l_b = L₀, split at
+  the two radii). Rigid rotation (ψ = θ_a = θ_b) slides nothing, so the phase-2 bug
+  (a centre-to-centre tangential spring resisting rigid rotation) does not return.
+  - **Caps per slice, symmetric:** friction φc + μ·max((1 − λ_pore)P − σ_n, 0), with
+    σ_n the slice's stored normal stress (+ tension): compression across the face
+    strengthens it, tension weakens it, an open crack is frictionless. Or the ductile
+    flow stress, whichever is weaker.
+  - **Above the cap:** a brittle slice slips (a fault: `slip`, a jump between the
+    columns); a ductile slice flows (`inelastic_shear`, distributed: it changes the
+    shapes, 4.2). The stiffest slice decides which, as for the normal part. Plastic
+    work of both feeds damage.
+  - **Only between surface columns;** slab interfaces stay normal-only (the
+    megathrust's own friction is for later).
+- **Face rolling (phase G).** Flat faces resist relative rotation: a relative spin
+  opens one end of the shared face and closes the other, moment K·face²/(12·rest)·Δθ
+  (K the normal stiffness, face the shared tessellation boundary). It decays with
+  the mean Maxwell factor and is capped by the kern rule of masonry: the face opens
+  at one end once |M| > (compression + tension cap)·face/6. Without it a column in a
+  slipping zone could spin like a ball bearing and erase friction. The length scale
+  is the spacing, so it vanishes in the continuum limit.
+- **In the solve** each edge does its normal row, then its tangential row, then its
+  rolling row, in one thread (Jacobi across edges). The tangential and rolling rows
+  are plain Jacobi, not extrapolated by Chebyshev (phase G findings).
 
 ### 4.6 Gravitational potential energy (ridge push, plateau collapse)
 
@@ -431,7 +489,10 @@ nothing permanent.
   mountains have no ceiling. This is the thin viscous sheet of England & McKenzie
   (1982), whose Argand number (buoyancy stress / viscous stress) decides between
   thickening and collapse.
-- **Slip:** tangential load above the shear cap moves `slip_anchor`.
+- **Slip:** tangential load above the shear cap moves `slip_anchor`. *As built
+  (phase G):* there is no anchor: the tangential memory is incremental (the pair's
+  separation vector at the last update), and slip is the tangential strain a
+  brittle slice could not store (`slip`).
 - **Integrity:**
 
   > dφ/dt = −Ẇ_p / W_D + (1 − φ)/τ_heal(T)
@@ -464,7 +525,11 @@ nothing permanent.
     still drifted in area as its mid slices relaxed.
 - **Volumetric flow** replaces the p̃ > Y rule above:
   d ln area_ref = 2 × mean of the column's edges' inelastic strain, at fixed crust
-  volume (thickness ∝ 1/area_ref until phase E's V/area). The GPE term reaches it
+  volume (thickness ∝ 1/area_ref until phase E's V/area). *Since phase G* it is the
+  trace of the fitted inelastic strain tensor (4.2); the mean is the trace only for
+  edges spread evenly in angle, and in a lattice already stretched one way it
+  over-counts. Without a fit (edges in fewer than two directions) 2 × the mean is
+  used with at least three edges, else nothing. The GPE term reaches it
   through the GPE force (4.6) loading the edges, not as a separate pressure.
   - Uniform shortening at the caps gives d ln A = 2 dε.
   - In pure shear the per-edge parts cancel: tension cracks and compression stays
@@ -552,7 +617,15 @@ is removed.
   counted and its formation age reset.
 - **Plumes (w_mantle) and arcs are not built.** The mantle model has no plume source
   yet; arcs are phase F.
-- **Splits** use the actual cell area (> `split_area_factor` 2 × the base hexagon).
+- **Splits by shape (phase G)** come first: a column whose reference shape is
+  elongated past `split_aspect_ratio` 2, with its reference area at least
+  `split_area_guard` 1.3 × the base hexagon, splits across its long axis. Each half
+  has half the area and half the aspect ratio (round at 2), and sits at its own
+  radius along the axis from the parent's position, so the halves touch at their
+  rest length. A ridge stretches columns along the pull, so they split into rows
+  parallel to the ridge; elongation at constant area (shear) never splits.
+- **Splits by area** (the backstop, for stretching without a preferred direction)
+  use the actual cell area (> `split_area_factor` 2 × the base hexagon).
   The halves go to the cell centroid ∓ 0.87 × the cell's major-axis spread
   (√ of its largest second moment). That puts them on the two half-cells' centroids
   for a domino of hexagons (0.885), a rectangle (0.866) or an ellipse (0.849).
@@ -940,11 +1013,12 @@ written here.
 | 5 (identification ✅; coarse solve shelved) | **Plate labelling** (diagnostic), Euler-pole fits, events | Labelling, persistent ids, split/merge events and Euler-pole fits are unit-tested on synthetic networks. The coarse *solve* does not fit the XPBD formulation (findings below) |
 | A ✅ | **Persistent pair-keyed edges**, one kind: per-particle angle-sorted slot lists; create on entering range (map view + depth), remove on leaving; φ, stored stresses, anchor, timers carried across steps | Slot lists stay symmetric (i lists j ⇔ j lists i) under random motion; an edge's state survives 100 steps of motion within range and is dropped exactly when the pair leaves; no duplicate pairs; free-list invariants hold. **Met** (kept as tests; phase A findings) |
 | B ✅ | **Column profile** (4.0): T(z) from thermal age / continental geotherm, ρ(z), η(z), envelope; lithosphere thickness; GPE | Oceanic profile matches half-space cooling; Airy elevation from the profile reproduces depth ∝ √age on a synthetic age ramp; envelope peak at the brittle–ductile transition where the two curves cross (analytic). **Met**, plus GPE differences = half-space ridge push, and the kernel matches the reference (kept as tests; phase B findings) |
-| C ✅ (normal part) | **Edge law** (4.5): effective stiffness integral, caps as λ clamps, Maxwell stored-stress decay | Single edge under constant separation rate: stress approaches η_eff·rate with the Maxwell time (implicit-Euler sequence, exact); cold pair behaves as a spring, hot pair as a dashpot; tension cap of a φ = 0 cold pair is ≈ 0; two-particle relaxation test from phase 2 still passes when k is set from a uniform profile. **Met** for the normal part (kept as tests; phase C findings). Tangential part deferred: needs particle orientation |
+| C ✅ | **Edge law** (4.5): effective stiffness integral, caps as λ clamps, Maxwell stored-stress decay | Single edge under constant separation rate: stress approaches η_eff·rate with the Maxwell time (implicit-Euler sequence, exact); cold pair behaves as a spring, hot pair as a dashpot; tension cap of a φ = 0 cold pair is ≈ 0; two-particle relaxation test from phase 2 still passes when k is set from a uniform profile. **Met** for the normal part (kept as tests; phase C findings). Tangential part: phase G |
 | D ✅ (without slip) | **Irreversible step** (4.7): volumetric flow at fixed volume, slip, integrity (work-driven damage, thermal healing), neighbour exchange; plus the GPE force (4.6) | Uniform compression of a patch thickens at the predicted rate with Σ volume constant; pure shear leaves every area_ref unchanged and produces slip; φ decays in proportion to work input and heals with τ_heal(T); a patch below yield accumulates no plastic strain over many steps with solver noise. **Met**, with "slip" read as crack opening and plastic work, since edges have no tangential channel; neighbour exchange is the range rule of phase A (kept as tests; phase D findings) |
 | E ✅ | **Area, volume, melt, splits** (4.8); remove the spreading proxy | Tessellated areas sum to 4π to float precision on random and lattice configurations; a stretched strip produces 7 km crust per unit new area at L = 0 and none at L ≥ H_m; a split conserves volume and area_ref; budget identity: Δ(Σ V) = logged sources − sinks exactly. **Met** ("exactly" = to the float32 rounding of each column's V; kept as tests; phase E findings) |
 | F ✅ | **Subduction and suturing as edge-state transitions**; slab particles, bending (4.3; elevation on the tessellation, not directors); arcs | Timer-based initiation fires on a synthetic convergent pair with a dense side and never with two buoyant sides; line-load flexure profile within 10% (a mechanism test on a strip, not a planet). **Met** (kept as tests; phase F findings) |
-| **Integration** | Assemble A–F; first planet runs since the redesign | Calibrate together, recorded once: plate speeds (rms ~4 cm/yr, slab-attached plates fastest), interior rigidity (non-rigid strain rate ≲ 10⁻⁹/yr), ridge depth ∝ √age, ~7 km oceanic crust, orogen heights bounded by collapse, coverage exact, volume budget closed, damage localised into narrow boundaries |
+| G ✅ | **Rotation, friction, shape** (4.2, 4.5, 4.8): spins as unknowns; the tangential channel with friction caps; face rolling; reference shapes elongated by distributed flow; splits by aspect ratio with an area guard | Lattice moduli ν = (k_n − k_t)/(3k_n + k_t), μ = E/2(1+ν), isotropic (CPU); rigid rotation turns the columns and stores no shear; friction plateau = the reference's, raised by μ·σ_n when the faces are pressed; spreading elongates columns along the pull, area and aspect both tracking the stretch, splits them into touching round halves in rows across the pull, and closes the volume budget; simple shear follows the finite-strain ellipse to the aspect cap at constant area and never splits. **Met** (kept as tests; phase G findings) |
+| **Integration** | Assemble A–G; first planet runs since the redesign | Calibrate together, recorded once: plate speeds (rms ~4 cm/yr, slab-attached plates fastest), interior rigidity (non-rigid strain rate ≲ 10⁻⁹/yr), ridge depth ∝ √age, ~7 km oceanic crust, orogen heights bounded by collapse, coverage exact, volume budget closed, damage localised into narrow boundaries |
 | 9 | **Adaptivity** (refine first, coarsen second) | Benchmarks of Integration give the same continuum answer at 220/110/50 km within stated tolerances |
 | 10 | **Patch mode:** run L1 code on a projected patch driven by a Forcing; adapters from records; event log | Patch driven by a global record stays within tolerance of the global fields in its interior over [t₀, t₁] |
 
@@ -959,6 +1033,110 @@ lava-lamp mantle with grounded basal drag, and bond rest length = apothem sum
 **Resolved:** how new crust is made. Not by inflation inside plates, and not by a
 separate gap-filling rule: by stretching (tessellated area grows at fixed volume) plus
 decompression melt where the lithosphere is thin (4.8).
+
+### Phase G findings: rotation, friction, rolling and reference shapes
+
+**What was built** (rules: 4.2, 4.5, 4.7 and 4.8, "As built").
+- **Spins** (`spin`, `body_axis`, `rotation_total`): a rotation per step about the
+  vertical, solved with the positions. `crust_predict` starts it at 0 (the mantle
+  flow is a potential flow, so basal drag alone never turns a column);
+  `crust_integrate` carries the body axis to the new tangent plane and turns it.
+- **Tangential channel and face rolling** in `edges_law`, `crust_solve_edges` and
+  `edges_maxwell`; CPU reference in `src/edges/law.js` (`tangentialDisplacement`,
+  `linearizeShear`, `maxwellShear`, `linearizeRolling`, `rollingUpdate`).
+- **Reference shapes** (`shape_p`, `shape_q`): rest lengths, range and contact use
+  the two radii along the pair (`column_radius`, bindings.wgsl; `radiusToward` in
+  `src/edges/topology.js`); `columns_flow` fits the inelastic strain tensor, takes
+  the area change from its trace and the shape change from its deviatoric part,
+  turning the shape with the material. CPU reference `src/columns/shape.js`.
+- **Splits by aspect ratio with an area guard**; ellipses are drawn.
+- **New parameters:** `shear_stiffness_ratio` 0.2, `rolling_stiffness_factor` 1,
+  `shape_flow_factor` 1, `shape_aspect_cap` 3, `split_aspect_ratio` 2,
+  `split_area_guard` 1.3. Edge state: `slice_shear_mpa`, `direction`, `moment`
+  (the reserved `stored_stress_t*` and `slip_anchor*` are gone). The per-particle
+  slot record grew to 48 words (tangential position corrections). Record schema
+  0.7.0 adds `shape_aspect` and `vertical_axis_rotation`.
+
+**Tests** (kept). Unit tests of the references:
+- **Lattice elasticity:** for k_t/k_n = 0, 0.2 and 1 and three lattice orientations,
+  the energy of a homogeneously strained lattice (spins at their optimum, the mean
+  sliding) equals (K/2)tr² + μ ε_dev:ε_dev with K = √3k_n/2, μ = √3(k_n + k_t)/4 to
+  10⁻⁹: isotropic, ν = (k_n − k_t)/(3k_n + k_t), μ = E/2(1 + ν). Rigid rotation costs
+  nothing with free spins and 3(k_t/2)L²ω² per cell with spins held.
+- **Shapes:** radii exact (10⁻¹²) for an affinely stretched hexagon; the fit recovers
+  a uniform strain and a relative rotation from six, three or two edge directions;
+  the aspect cap; split halves round and touching at aspect 2, swapped axes below.
+- **Tangential channel:** rigid rotations of the sphere about any axis slide nothing
+  (to the curvature over one spacing); friction per slice rises by μ|σ_n| with
+  compression across the face and vanishes for an open crack; a cold pair loads at
+  G_t and plateaus at the depth-integrated cap with slip (a fault), a hot pair flows
+  as distributed shear.
+- **Rolling:** stiffness K·face²/12·rest; kern cap; none without a face or with
+  tension and no tension cap.
+
+GPU tests:
+- **Friction** (two broken pairs of cold old ocean, the second column turned around
+  the first by 5×10⁻³ rad per step for 60 steps, no solve; one pair at touching, one
+  pressed by 10⁻³): every slice follows the CPU reference to 2.4×10⁻⁶ of its cap
+  through the elastic rise to the friction plateau (mean shear 608 MPa; slices
+  89 MPa at the top to 1123 MPa at the bottom); the pressed pair's caps are higher by
+  μ × its normal stress (70 MPa → 42 MPa), mean 650 MPa.
+- **Rigid rotation** (a bonded 19-column patch turned by 0.02 rad in one step, then
+  solved, 32 iterations): the patch keeps 0.01892 rad of the turn, against the
+  parallel-axis prediction 0.01897 (orbital drag Σr² against spin drag Σ area/2π);
+  every column spins with it within 0.35%; the edges gain at most 3.5 MPa of shear,
+  1.2% of G_t × turn (the solve's residual for a turn ~10³ times a fast plate's per
+  step).
+- **Spreading** (61 hot, weak, young columns stretched by hand along x by 7% per
+  step, no solve): at stretch 1.838 the interior columns' aspect ratio is 1.866 and
+  their reference area 1.848× the base, long axis along the pull (|u·x| ≥ 0.992), and
+  no lattice pair has left range. At stretch 2.10 the 20 unclipped columns split:
+  halves along the pull (≥ 0.975), touching (gap/rest 1.8×10⁻⁴), round (aspect ≤
+  1.015). Crust volume 0.613 → 1.066 = initial + melt (0.453) to the budget's rounding.
+- **Simple shear** (the same patch, 0.05 per step to 1.8, no solve, so the columns
+  do not spin and the shapes turn by the fitted relative rotation): at shear 1 the
+  interior aspect is 2.626–2.636 against the finite-strain ellipse's 2.618; at 1.8 all
+  sit at the cap (3.000), areas 0.979–0.990, 52 lattice pairs have left range, and no
+  column split.
+
+**Found on the way.**
+- **Chebyshev slows the tangential rows.** With the derived ρ = 0.99993, the
+  Chebyshev weights converge every mode at the slowest mode's rate; spins and
+  tangential multipliers, which plain Jacobi converges in a few sweeps, were left at
+  ~4% of the naive shear after 32 iterations. They are now plain Jacobi: their
+  position corrections go to a separate accumulator and are added after the
+  extrapolation, and the previous iterate is shifted by the same amount. Without that
+  shift the extrapolation gives them momentum: the patch un-turned to 81% of the turn
+  instead of 95%.
+- **The pair's direction is edge memory**, like its length. Measuring sliding from
+  the step's start positions failed when positions were moved between steps (tests
+  move columns by hand; splits move them too); now a split or subduction resets
+  both together.
+- **2 × mean normal strain over-counts dilatation** once a neighbourhood is
+  anisotropic: 60° edges of a lattice stretched 1.8× along x lie at 44°, so the mean
+  picks up 0.68 of the stretch instead of 0.5, and areas grew 13% too fast. The fit's
+  trace is exact for a uniform strain.
+- **A new edge's first step is not flow.** A pair entering range is loaded from its
+  rest length (so a gap is an open crack and an overlap pushes at once); in hot rock
+  that load relaxes within the step, and was counted as inelastic dilatation. In
+  shear past the aspect cap, new neighbours' gaps inflated areas past the guard and
+  started a split cascade. An edge's birth step now contributes no inelastic strain;
+  the load itself is unchanged, so contacts still engage exactly at touching.
+- **Inelastic strain per length, not per rest length.** They differ where a shape
+  has met its cap; per rest length, stretched pairs over-count.
+- **The shape must turn with the material, not with the column.** Without a solve
+  (or where weak rock lets spins lag), a shape accumulated in the body frame does
+  not rotate with the flow; in simple shear the ellipse then pointed the wrong way,
+  lattice pairs left range early, and columns ended with two collinear neighbours.
+  Turning the shape by the fitted relative rotation w gives the finite-strain
+  ellipse.
+- **Where the strain cannot be fitted** (edges in one direction), the mean of a
+  one-sided neighbourhood is not its dilatation: no area change unless the column
+  has at least three edges.
+- **SwiftShader's atan2(−0, x > 0) is π, not 0.** A pair that did not move at all
+  read as half a turn of sliding, and every new edge on a static sphere slipped at
+  its friction cap and lost its integrity. The pair's rotation now uses atan(y/x)
+  for x > 0 (turns below a right angle), atan2 only beyond.
 
 ### Phase F findings: subduction, suturing, slabs, arcs and bending
 
@@ -1640,14 +1818,27 @@ separate.
   integration.
 - **Neighbour exchange at 50 km:** do capped forces plus range-based edge turnover
   give sensible ductile shear zones, or does the deviatoric part need a per-edge
-  outlet (a zero-mean rest offset, which would amend rest = aᵢ + aⱼ)?
+  outlet (a zero-mean rest offset, which would amend rest = aᵢ + aⱼ)? *Phase G:* the
+  outlet is the reference shape (rest = the two radii along the pair), up to the
+  aspect cap; beyond it, neighbour exchange. Whether cap 3 is right is for integration.
 - **Ductile tension at zero integrity** (phase C): tuned at integration with the
   other interaction parameters (`ductile_damage_weakening`). New hot edges are held
   by their surroundings and heal fast; columns made in a highly dynamic setting
   should not cohere (transform faults cut ridges).
-- **Shear on edges** (phase C): a tangential channel with slip anchors needs a
-  per-particle orientation (the polar decomposition of the neighbour fit, 4.2) so
-  rigid rotation stays free. Not scheduled; revisit if integration shows it matters.
+- **Shear on edges** (phase C): resolved in phase G, with spins as solved unknowns
+  rather than an orientation from the polar decomposition.
+- **Fault-zone width** (phase G): friction plus face rolling should localise slip
+  onto lines of edges; whether that happens at 220 km spacing, and how wide the
+  zones are, is for integration.
+- **Spin drag and mantle vorticity** (phase G): the mantle flow is a potential
+  flow, so basal drag never turns a column, only resists its spin. A mantle with
+  a toroidal (vertical-vorticity) part would drive spins too.
+- **Tangential rows outside Chebyshev** (phase G): plain Jacobi converges them in a
+  few sweeps on a patch; whether that holds at plate scale, where spins couple
+  through the positions over many columns, is to be measured at integration.
+- **Large strain per step** (phase G): the shape and area updates are first order
+  in the step's strain. Hand-driven tests at 5–7% per step are within a few percent;
+  real steps are ~10⁻⁴.
 - **GPE force vs basal drag** (phase D): the force is physical but, against today's
   drag, metres per year at margins. Calibrate drag, edge tension and this force
   together at integration.
@@ -1704,6 +1895,11 @@ separate.
 | Winkler foundation | restoring force proportional to vertical displacement, i.e. buoyancy |
 | Cosserat medium | a continuum whose points carry orientation as well as position |
 | polar decomposition | writing a deformation gradient as rotation × stretch |
+| spin (of a column) | its rotation about the vertical, solved for with its position; the micro-rotation of the Cosserat medium |
+| finite-strain ellipse | the shape a small circle of material takes after deformation; its aspect ratio measures accumulated strain |
+| logarithmic strain | ln(stretch); increments add for deformation along fixed axes |
+| kern rule | masonry: a joint stays closed while the resultant force passes through its middle third, i.e. moment < force × length / 6 |
+| parallel-axis theorem | moment of inertia (here, of drag) about an axis = about the centre + area × distance² |
 | CF conventions | Climate and Forecast metadata conventions for gridded scientific data |
 | HEALPix | Hierarchical Equal Area isoLatitude Pixelization of the sphere |
 | Maxwell element | spring and dashpot in series: elastic on short times, viscous on times longer than η/E |

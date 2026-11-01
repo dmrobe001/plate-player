@@ -42,6 +42,15 @@ fn inverse_drag(i: u32) -> f32 {
     return (base_area() / particles[i].area_ref) * (channel / sim.drag_reference_channel_km);
 }
 
+// The same basal shear resists the column's spin: drag x squared radius of
+// gyration, area_ref cosh(2 s) / 2 pi (equal-area ellipse; gyrationSquared in
+// src/columns/shape.js). Summed over a plate, spin and orbital drag are the
+// two terms of the parallel-axis theorem: a plate rotating rigidly feels both.
+fn inverse_spin_drag(i: u32) -> f32 {
+    let s = length(vec2f(particles[i].shape_p, particles[i].shape_q));
+    return inverse_drag(i) * 6.2831853 / (particles[i].area_ref * cosh(2.0 * s));
+}
+
 @compute @workgroup_size(64)
 fn crust_predict(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
@@ -53,6 +62,9 @@ fn crust_predict(@builtin(global_invocation_id) id: vec3<u32>) {
     // edges, which are measured in 3D; bindings.wgsl, edge_offset.)
     let grid_vel = grid[node].velocity.xyz * sim.mantle_drive;
     particles[idx].predicted_pos = vec4f(normalize(pos + grid_vel * sim.dt_crust_myr), 1.0);
+    // The mantle flow is a potential flow (no vertical vorticity, src/mantle/),
+    // so basal drag alone does not spin a column: spin starts at 0.
+    particles[idx].spin = 0.0;
 }
 
 @compute @workgroup_size(64)
@@ -78,6 +90,10 @@ fn crust_clear_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
         atomicStore(&particle_deltas[idx].dy, 0i);
         atomicStore(&particle_deltas[idx].dz, 0i);
         atomicStore(&particle_deltas[idx].count, 0i);
+        atomicStore(&particle_deltas[idx].dspin, 0i);
+        atomicStore(&particle_deltas[idx].tdx, 0i);
+        atomicStore(&particle_deltas[idx].tdy, 0i);
+        atomicStore(&particle_deltas[idx].tdz, 0i);
     }
 }
 
@@ -106,7 +122,22 @@ fn crust_chebyshev_combine(@builtin(global_invocation_id) id: vec3<u32>) {
         x = vec4f(normalize(omega * (x.xyz - prev) + prev), 1.0);
         particles[idx].predicted_pos = x;
     }
-    particles[idx].iter_prev = particles[idx].iter_start;
+    // Tangential rows (phase G) are plain Jacobi: their position corrections
+    // are added after the extrapolation, and spins and their multipliers are
+    // not extrapolated, so each subsystem stays consistent with its
+    // multipliers. (Extrapolating them with the normal rows' weights slows
+    // them: for rho near 1, Chebyshev converges every mode at the slow rate.)
+    // The previous iterate is shifted by the same correction, so the next
+    // extrapolation sees only the normal rows' progress (no momentum is given
+    // to the tangential corrections).
+    let td = vec3f(f32(atomicLoad(&particle_deltas[idx].tdx)), f32(atomicLoad(&particle_deltas[idx].tdy)), f32(atomicLoad(&particle_deltas[idx].tdz))) / FIXED_POINT;
+    var prev = particles[idx].iter_start;
+    if (any(td != vec3f(0.0))) {
+        x = vec4f(normalize(x.xyz + td), 1.0);
+        particles[idx].predicted_pos = x;
+        prev = vec4f(normalize(prev.xyz + td), 1.0);
+    }
+    particles[idx].iter_prev = prev;
     particles[idx].iter_start = x;
 }
 
@@ -120,6 +151,13 @@ fn crust_chebyshev_combine(@builtin(global_invocation_id) id: vec3<u32>) {
 // scaled by 1 / max(edges at either end). Scaling dlambda, not the applied
 // dx, keeps lambda consistent with the displacement it caused, so a
 // converged solve is the true minimum of drag + edge energy.
+//
+// Then, in the same thread, the tangential row (phase G): C_t = delta_t -
+// reference_t, delta_t = L0 psi - l_a spin_a - l_b spin_b (bindings.wgsl),
+// gradients -t, +t on the positions and -l_a, -l_b on the spins, spins
+// weighted by the inverse spin drag; clamped to the shear caps. Then the face
+// moment: C_r = spin_b - spin_a - reference_r, clamped by the kern rule.
+// Both are plain Jacobi (not extrapolated; crust_chebyshev_combine).
 @compute @workgroup_size(64)
 fn crust_solve_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
@@ -146,6 +184,36 @@ fn crust_solve_edges(@builtin(global_invocation_id) id: vec3<u32>) {
 
     add_delta(pA, -wA * dlambda * n, 0i);
     add_delta(pB, wB * dlambda * n, 0i);
+
+    if (c.stiffness_t <= 0.0 && c.stiffness_r <= 0.0) { return; }
+    let sA = inverse_spin_drag(pA);
+    let sB = inverse_spin_drag(pB);
+    if (c.stiffness_t > 0.0) {
+        let up = normalize(particles[pA].predicted_pos.xyz + particles[pB].predicted_pos.xyz);
+        let t = normalize(cross(up, n));
+        let la = c.lever_a * c.length;
+        let lb = c.length - la;
+        let Ct = tangential_displacement(c) - c.reference_t;
+        let at = 1.0 / (sim.bond_rate_myr_inv * c.stiffness_t * sim.dt_crust_myr);
+        var dl = (-Ct - at * c.lambda_t) / (wA + wB + sA * la * la + sB * lb * lb + at) / degree;
+        let lt = clamp(c.lambda_t + dl, -c.lambda_t_max, c.lambda_t_max);
+        dl = clamp(c.lambda_t + dl, -c.lambda_t_max, c.lambda_t_max) - c.lambda_t;
+        edges[c_idx].lambda_t = lt;
+        add_tangential_delta(pA, -wA * dl * t);
+        add_tangential_delta(pB, wB * dl * t);
+        add_spin(pA, -sA * la * dl);
+        add_spin(pB, -sB * lb * dl);
+    }
+    if (c.stiffness_r > 0.0) {
+        let Cr = particles[pB].spin - particles[pA].spin - c.reference_r;
+        let ar = 1.0 / (sim.bond_rate_myr_inv * c.stiffness_r * sim.dt_crust_myr);
+        var dl = (-Cr - ar * c.lambda_r) / (sA + sB + ar) / degree;
+        let lr = clamp(c.lambda_r + dl, -c.lambda_r_max, c.lambda_r_max);
+        dl = clamp(c.lambda_r + dl, -c.lambda_r_max, c.lambda_r_max) - c.lambda_r;
+        edges[c_idx].lambda_r = lr;
+        add_spin(pA, -sA * dl);
+        add_spin(pB, sB * dl);
+    }
 }
 
 @compute @workgroup_size(64)
@@ -157,6 +225,7 @@ fn crust_apply_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
     if (any(sum != vec3f(0.0))) {
         particles[idx].predicted_pos = vec4f(normalize(particles[idx].predicted_pos.xyz + sum / FIXED_POINT), 1.0);
     }
+    particles[idx].spin += f32(atomicLoad(&particle_deltas[idx].dspin)) / FIXED_POINT;
 }
 
 @compute @workgroup_size(64)
@@ -165,7 +234,16 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     // Overdamped: velocity is not state, only a record of this step's motion.
     particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, 0.0);
-    particles[idx].position = vec4f(particles[idx].predicted_pos.xyz, 1.0);
+    let x = particles[idx].predicted_pos.xyz;
+    particles[idx].position = vec4f(x, 1.0);
+    // Body axis: carried to the new tangent plane and turned by the spin
+    // (carryBodyAxis in src/columns/shape.js).
+    let b0 = particles[idx].body_axis.xyz;
+    var b = b0 - dot(b0, x) * x;
+    b = select(tangent_e1(x), normalize(b), dot(b, b) > 1e-12);
+    let spin = particles[idx].spin;
+    particles[idx].body_axis = vec4f(cos(spin) * b + sin(spin) * cross(x, b), 0.0);
+    particles[idx].rotation_total += spin;
     // Subduction initiated by an edge (edges_maxwell): the column becomes a
     // slab where it is; it then sinks under its own weight (thermal.wgsl), and
     // its edges are measured in 3D from the next step (length reset, split.wgsl).

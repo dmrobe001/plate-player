@@ -414,11 +414,12 @@ test('profile: the yield-strength envelope peaks at the brittle-ductile transiti
 
 // --- Edge law (design 4.5, phase C) ----------------------------------------
 import * as law from '../src/edges/law.js';
+import * as shape from '../src/columns/shape.js';
 
 // Parameters with the derived bond rate the GPU uses, and optional overrides.
 const lawParams = (over = {}) => {
   const p = { ...PARAMS, ...over };
-  const k = (Math.sqrt(3) / 2) * p.crust_youngs_modulus_gpa * 1e9 * p.stiffness_reference_km * 1e3;
+  const k = shape.normalStiffnessPerModulus(p.shear_stiffness_ratio) * p.crust_youngs_modulus_gpa * 1e9 * p.stiffness_reference_km * 1e3;
   const gamma = (2 * Math.sqrt(3) * (p.base_apothem * 6.371e6) ** 2 * p.asthenosphere_viscosity_pa_s) / (p.drag_reference_channel_km * 1e3);
   return { ...p, bond_rate_myr_inv: k / (gamma / profile.SECONDS_PER_MYR) };
 };
@@ -782,4 +783,173 @@ test('bending: a line load on a strip of columns gives the thin-plate flexure pr
   // D = 0: one sweep is exactly the old per-column relaxation (w0 + k weq) / (1 + k), k = 1 / r.
   const one = flexure.jacobi(cols.map((c) => ({ ...c, D: 0, r: 2, w0: 0.5 })), 1, 2);
   assert.ok(Math.abs(one[half] - (0.5 + 0.5 * 1) / 1.5) < 1e-12 && Math.abs(one[0] - 0.5 / 1.5) < 1e-12);
+});
+
+// --- Orientation, shape, tangential channel, rolling (design 4.2, 4.5; phase G) ---
+
+test('lattice elasticity: normal and tangential edges with free column rotations give nu = (kn - kt) / (3 kn + kt), isotropically; rigid rotation is free', () => {
+  // A triangular lattice (spacing L, one column per cell), homogeneous
+  // displacement gradient grad u = e + w (rotation w), every column spinning
+  // by theta. Per edge: normal stretch n.e.n L; sliding (t.grad u.n - theta) L.
+  // Energy per cell over cell area sqrt(3)/2 L^2, minimised over theta.
+  const L = 1, kn = 1;
+  const energy = (kt, e, w, phase, theta = null) => {
+    const dirs = [0, 1, 2].map((k) => phase + (k * Math.PI) / 3);
+    const sliding = (a) => { const n = [Math.cos(a), Math.sin(a)], t = [-n[1], n[0]]; return t[0] * (e[0][0] * n[0] + e[0][1] * n[1]) + t[1] * (e[1][0] * n[0] + e[1][1] * n[1]) + w; };
+    // Optimal spin: the mean sliding (each column has the same spin).
+    const th = theta ?? dirs.reduce((s, a) => s + sliding(a), 0) / 3;
+    let W = 0;
+    for (const a of dirs) {
+      const n = [Math.cos(a), Math.sin(a)];
+      const en = n[0] * (e[0][0] * n[0] + e[0][1] * n[1]) + n[1] * (e[1][0] * n[0] + e[1][1] * n[1]);
+      W += 0.5 * L * L * (kn * en * en + kt * (sliding(a) - th) ** 2);
+    }
+    return { W: W / ((Math.sqrt(3) / 2) * L * L), theta: th };
+  };
+  for (const kt of [0, 0.2, 1]) {
+    const m = shape.latticeModuli(kn, kt);
+    for (const phase of [0, 0.3, 1.1]) {
+      for (const e of [[[1e-3, 0], [0, 0]], [[2e-3, -1e-3], [-1e-3, 5e-4]], [[0, 1e-3], [1e-3, 0]]]) {
+        const tr = e[0][0] + e[1][1], dxx = e[0][0] - tr / 2, dxy = e[0][1];
+        const want = 0.5 * m.bulk * tr * tr + m.shear * 2 * (dxx * dxx + dxy * dxy);
+        const got = energy(kt, e, 0.003, phase).W;
+        assert.ok(Math.abs(got / want - 1) < 1e-9, `kt ${kt} phase ${phase}: ${got} vs ${want}`);
+      }
+    }
+    assert.ok(Math.abs(m.poisson - (kn - kt) / (3 * kn + kt)) < 1e-12);
+    assert.ok(Math.abs(m.shear - m.youngs / (2 * (1 + m.poisson))) < 1e-12, 'shear modulus = E / 2(1 + nu)');
+  }
+  assert.ok(Math.abs(shape.latticeModuli(1, 0.2).poisson - 0.25) < 1e-12);
+  // Rigid rotation: free when the columns turn (optimal spin = w); with spins
+  // held at 0 it would cost 3 (kt / 2) L^2 w^2 per cell (the phase-2 bug).
+  const free = energy(0.2, [[0, 0], [0, 0]], 0.01, 0.2);
+  const held = energy(0.2, [[0, 0], [0, 0]], 0.01, 0.2, 0);
+  assert.ok(free.W < 1e-20 && Math.abs(free.theta - 0.01) < 1e-15 && held.W > 1e-6);
+  // The normal stiffness that keeps E h for any ratio.
+  for (const r of [0, 0.2, 1]) assert.ok(Math.abs(shape.latticeModuli(shape.normalStiffnessPerModulus(r), r * shape.normalStiffnessPerModulus(r)).youngs - 1) < 1e-12);
+});
+
+test('reference shape: radii are exact for an affinely stretched lattice; elongation is fitted, capped and split into touching halves', () => {
+  const a = 0.0175;
+  // A hexagon's six neighbours stretched by U = exp(L), long axis at 0.4 rad from b.
+  const x = [0, 0, 1], b = [1, 0, 0];
+  const s = 0.3, ang = 0.4, p = s * Math.cos(2 * ang), q = s * Math.sin(2 * ang);
+  assert.ok(Math.abs(shape.shapeAxes(p, q).aspect - Math.exp(0.6)) < 1e-12 && Math.abs(shape.shapeAxes(p, q).axis - ang) < 1e-12);
+  const U = (v) => { const c = Math.cosh(s), f = Math.sinh(s) / s; return [c * v[0] + f * (p * v[0] + q * v[1]), c * v[1] + f * (q * v[0] - p * v[1])]; };
+  for (let k = 0; k < 6; k++) {
+    const d = U([2 * a * Math.cos((k * Math.PI) / 3), 2 * a * Math.sin((k * Math.PI) / 3)]);
+    const r = shape.radiusAlong(a, p, q, x, b, [d[0], d[1], 0]);
+    assert.ok(Math.abs((2 * r) / Math.hypot(...d) - 1) < 1e-12, `rest ${2 * r} vs distance ${Math.hypot(...d)}`);
+  }
+  assert.equal(shape.radiusAlong(a, 0, 0, x, b, [0.3, 0.1, 0]), a);
+  // Fit: a uniform strain tensor from hexagon edges (normal and tangential), and from three irregular ones.
+  const e = { exx: 2e-3, eyy: -1e-3, exy: 7e-4 };
+  // The neighbourhood also turns by w relative to the column (its spin lags): fitted, not read as shear.
+  const w = 3e-3;
+  const row = (phi) => { const nx = Math.cos(phi), ny = Math.sin(phi); return { nx, ny, en: e.exx * nx * nx + e.eyy * ny * ny + 2 * e.exy * nx * ny, g: -ny * (e.exx * nx + e.exy * ny) + nx * (e.exy * nx + e.eyy * ny) + w }; };
+  for (const dirs of [[0, 1, 2, 3, 4, 5].map((k) => (k * Math.PI) / 3), [0.1, 1.9, 4.0], [0.2, 0.5, 0.9]]) {
+    const f = shape.fitStrain(dirs.map(row));
+    for (const k of ['exx', 'eyy', 'exy', 'w']) assert.ok(Math.abs(f[k] - { ...e, w }[k]) < 1e-12, `${dirs.length} edges: ${k} ${f[k]}`);
+  }
+  assert.equal(shape.fitStrain([row(0.3)]), null);
+  // Deviatoric part only, capped at the aspect ratio limit.
+  const u = shape.updateShape(0, 0, e, 1, 3);
+  assert.ok(Math.abs(u.p - 1.5e-3) < 1e-15 && Math.abs(u.q - 7e-4) < 1e-15);
+  // The shape turns with the material: by w relative to the body frame (2w in (p, q)).
+  const turned = shape.updateShape(0.2, 0, { exx: 0, eyy: 0, exy: 0, w: Math.PI / 4 }, 1, 3);
+  assert.ok(Math.abs(turned.p) < 1e-12 && Math.abs(turned.q - 0.2) < 1e-12 && Math.abs(shape.shapeAxes(turned.p, turned.q).axis - Math.PI / 4) < 1e-12);
+  // Volumetric flow takes the fitted trace; without a fit, 2 x mean only with >= 3 edges.
+  const col = { area: 1 };
+  assert.ok(Math.abs(flow.columnFlow(col, [0.1, 0.1], 1, { exx: 0.01, eyy: 0.02, exy: 0 }).area - Math.exp(0.03)) < 1e-15);
+  assert.equal(flow.columnFlow(col, [0.1, 0.1], 1, null).area, 1);
+  assert.ok(Math.abs(flow.columnFlow(col, [0.1, 0.1, 0.1], 1, null).area - Math.exp(0.2)) < 1e-15);
+  const big = shape.updateShape(0, 0, { exx: 2, eyy: 0, exy: 0 }, 1, 3);
+  assert.ok(Math.abs(shape.shapeAxes(big.p, big.q).aspect - 3) < 1e-12);
+  // Split at aspect 2: round halves, at their contact distance.
+  const s2 = 0.5 * Math.log(2);
+  const h = shape.splitShape(a, s2, 0);
+  assert.ok(Math.abs(h.p) < 1e-15 && Math.abs(h.q) < 1e-15 && Math.abs(2 * h.offset - 2 * a / Math.SQRT2) < 1e-15);
+  // At aspect 3 the halves keep 3/2 along the same axis; below 2 the axes swap.
+  const h3 = shape.splitShape(a, 0.5 * Math.log(3), 0);
+  assert.ok(Math.abs(shape.shapeAxes(h3.p, h3.q).aspect - 1.5) < 1e-12 && h3.p > 0);
+  const h15 = shape.splitShape(a, 0.5 * Math.log(1.5), 0);
+  assert.ok(Math.abs(shape.shapeAxes(h15.p, h15.q).aspect - 4 / 3) < 1e-12 && h15.p < 0);
+  // Body axis: carried along a meridian it stays the meridian's tangent; spin turns it.
+  const bb = shape.carryBodyAxis([1, 0, 0], [Math.sin(0.1), 0, Math.cos(0.1)], Math.PI / 2);
+  assert.ok(Math.abs(bb[1] - 1) < 1e-12, `${bb}`);
+});
+
+test('tangential channel: rigid motions slide nothing; friction rises with compression across the face; brittle slip is a fault, ductile shear changes shape', () => {
+  // Sliding of a pair: a rigid rotation of the sphere (about z, by w) with
+  // each column spinning by its share of it (w z.x), and a translation, give
+  // none (to the sphere's curvature over one spacing, (L/2)^2 / 2); holding
+  // the spins at 0 under a rotation gives L0 psi.
+  const a = [0, 0, 1], bx = 0.035, b = [Math.sin(bx), 0, Math.cos(bx)];
+  const rot = (v, w) => [Math.cos(w) * v[0] - Math.sin(w) * v[1], Math.sin(w) * v[0] + Math.cos(w) * v[1], v[2]];
+  const L0 = Math.hypot(b[0] - a[0], b[2] - a[2]);
+  const w = 0.01;
+  assert.ok(Math.abs(law.tangentialDisplacement(a, b, rot(a, w), rot(b, w), L0, 0.5, w * a[2], w * b[2])) < (bx / 2) ** 2 * L0 * w);
+  assert.ok(Math.abs(law.tangentialDisplacement(a, b, rot(a, w), rot(b, w), L0, 0.3, 0, 0) / (L0 * w) - 1) < 1e-3);
+  // Any rigid rotation of the sphere (axis k): spins w k.x, again none.
+  for (const k of [[1, 0, 0], [0, 1, 0], [0.6, 0, 0.8]]) {
+    const R = (v) => { // Rodrigues
+      const c = Math.cos(w), s = Math.sin(w), kv = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+      const kx = [k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0]];
+      return v.map((x, i) => x * c + kx[i] * s + k[i] * kv * (1 - c));
+    };
+    const spin = (v) => w * (k[0] * v[0] + k[1] * v[1] + k[2] * v[2]);
+    assert.ok(Math.abs(law.tangentialDisplacement(a, b, R(a), R(b), L0, 0.5, spin(a), spin(b))) < (bx / 2) ** 2 * L0 * w, `axis ${k}`);
+  }
+
+  // Friction of a cold, broken (phi = 0) pair of old ocean: mu (1 - lambda) P per
+  // slice; compression across the face (sigma_n < 0) raises it by mu |sigma_n|,
+  // tension lowers it; an open crack is frictionless.
+  const E0 = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
+  const p = { ...uniform(1e6 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa };
+  const col = oldOcean(-3);
+  const zero = new Array(8).fill(0);
+  const free = law.edgeSlices(col, col, 0, p, zero);
+  const pressed = law.edgeSlices(col, col, 0, p, zero.map(() => -50));
+  const open = law.edgeSlices(col, col, 0, p, zero.map(() => 1e4));
+  free.slices.forEach((s, k) => {
+    assert.ok(s.slips, 'cold slices slip by friction');
+    assert.ok(Math.abs(pressed.slices[k].shear - s.shear - p.friction_coefficient * 50) < 1e-9);
+    assert.equal(open.slices[k].shear, 0);
+  });
+  // Shear loading: elastic (G_t = ratio x E) up to the depth-integrated cap, then slip.
+  const G = p.shear_stiffness_ratio * p.crust_youngs_modulus_gpa * 1000;
+  let tau = zero, slip = 0, ductile = 0, Sprev = 0, work = 0;
+  const dg = 5e-3; // 70 MPa per step; 60 steps load the deepest (strongest) slice past its cap
+  for (let n = 0; n < 60; n++) {
+    const u = law.maxwellShear(tau, free, dg, p);
+    tau = u.stored; slip += u.slip; ductile += u.ductile; work += u.work;
+    if (n === 0) assert.ok(Math.abs(u.S - G * dg * free.overlap) < 1e-5 * u.S, 'elastic slope (r = 1 - 1e-6)');
+    Sprev = u.S;
+  }
+  const cap = free.slices.reduce((s, sl) => s + sl.shear * sl.dz, 0);
+  assert.ok(Math.abs(Sprev - cap) < 1e-9 * cap, `plateau ${Sprev} vs cap ${cap}`);
+  assert.ok(slip > 0.5 * 60 * dg && ductile < 1e-6 * slip && work > 0, `slip ${slip}, ductile ${ductile}`); // (below the cap a cold slice creeps by (1 - r) ~ 1e-6)
+  // A hot (uniformly viscous) pair: the same loading is distributed shear, not slip.
+  const ph = uniform(1e-2 * E0 * dtS);
+  const hot = law.edgeSlices(col, col, 1, ph, zero);
+  const uh = law.maxwellShear(zero, hot, dg, ph);
+  assert.ok(uh.slip === 0 && uh.ductile > 0.9 * dg, `hot: slip ${uh.slip}, ductile ${uh.ductile}`);
+  // No channel at ratio 0.
+  assert.equal(law.linearizeShear(zero, free, 0.035, lawParams({ shear_stiffness_ratio: 0 })).stiffness, 0);
+});
+
+test('rolling: flat faces resist relative rotation (K face^2 / 12 rest) up to the kern rule', () => {
+  const p = lawParams();
+  const col = oldOcean(-3);
+  const edge = law.edgeSlices(col, col, 1, p, new Array(8).fill(0));
+  const face = 0.0175 * 2 / Math.sqrt(3), rest = 0.035;
+  const K = edge.slices.reduce((s, sl) => s + p.crust_youngs_modulus_gpa * 1000 * sl.r * sl.dz, 0);
+  const lin = law.linearizeRolling(0, edge, face, rest, -100, 50, p);
+  assert.ok(Math.abs(lin.K - K * face * face / (12 * rest)) < 1e-9 * lin.K);
+  assert.ok(Math.abs(lin.cap - (100 + 50) * face / 6) < 1e-12);
+  assert.ok(Math.abs(law.rollingUpdate(lin, 1e-6) - lin.K * 1e-6) < 1e-12 * lin.K);
+  assert.equal(law.rollingUpdate(lin, 1), lin.cap); // rocks open beyond the kern
+  // No moment without a shared face, or with tension and no tension cap.
+  assert.equal(law.linearizeRolling(0, edge, 0, rest, -100, 50, p).stiffness, 0);
+  assert.equal(law.linearizeRolling(0, edge, face, rest, 100, 0, p).cap, 0);
 });

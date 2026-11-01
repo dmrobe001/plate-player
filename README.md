@@ -36,10 +36,10 @@ the seed in the URL: `plate-player.html?seed=42`.
 
 | Glyph | Meaning |
 |---|---|
-| Disc | One crust particle. Radius = the particle's apothem; colour = elevation relative to sea level (blues below, greens/browns/white above). Darkened discs are subducting slabs. |
+| Disc / ellipse | One crust particle (column), drawn as its reference shape: mean radius = the apothem, elongated by distributed flow (its finite strain, up to aspect 3). Colour = elevation relative to sea level (blues below, greens/browns/white above). Darkened discs are subducting slabs. |
 | Black line between centres | Edge in **compression**. Width ∝ \|normal stress\| |
 | White line between centres | Edge in **tension** (only edges with integrity > 0 carry tension). Width ∝ normal stress |
-| Black tick across an edge's midpoint | **Shear** stress on the edge. Width ∝ shear stress; length = one hexagon edge (the "face" between the two particles) |
+| Black tick across an edge's midpoint | **Shear** stress on the edge (its tangential channel, either sense). Width ∝ \|shear stress\|; length = one hexagon edge (the "face" between the two particles) |
 | Background sphere | Mantle grid, coloured by flow divergence: orange = upwelling, blue = downwelling |
 | **Colour by plate** | Each plate in its own colour; grey particles belong to no plate (fragments under 20 particles, or slabs) |
 
@@ -126,17 +126,28 @@ envelope:
 
 So an edge at integrity 0 between cold columns only pushes (a contact), and its
 brittle slices crack in tension and close exactly at touching. Within a step the law is
-linear, with the total force clamped to the depth-integrated caps. Only the normal
-(push–pull) part exists: tangential friction needs a per-particle orientation first.
+linear, with the total force clamped to the depth-integrated caps.
+
+Each slice also has a **tangential** (sliding) stress, with a shear stiffness of 0.2×
+the normal one (which makes Poisson's ratio 0.25 for the lattice). Sliding is measured
+against the columns' own rotations, which the solver finds along with their positions,
+so a plate turning rigidly stores no shear. The tangential cap is **friction**,
+μ × (pressure − tension across the face) plus cohesion × integrity, or the creep flow
+stress. Above it a brittle slice slips (a fault) and a ductile one flows. Neighbouring
+columns' flat faces also resist **rolling** against each other, up to the point where
+the face starts to open at one end.
 
 **Irreversible step** (`law.wgsl`, `shaders/compute/flow.wgsl`; references
 `src/edges/law.js`, `src/columns/flow.js`). After each solve:
 - **Inelastic strain.** Each edge records the strain its stiffest slice could not
   store elastically.
-- **Volumetric flow.** Each column changes its reference area by twice the mean of
-  its edges' inelastic strain; pure shear leaves areas alone. The rest length (sum of
-  apothems) follows the area. Edges remember the pair's distance, not its strain, so
-  that change adds no stress.
+- **Strain of each column.** The column's inelastic strain tensor is fitted from its
+  edges (normal and ductile tangential parts). Its trace changes the column's
+  reference area (volumetric flow; pure shear leaves areas alone); its deviatoric part
+  elongates the column's reference **shape** (an ellipse, up to aspect 3), which turns
+  with the material. The rest length of a pair is the two shapes' radii along it.
+  Edges remember the pair's distance and direction, not its strain, so these changes
+  add no stress.
 - **Integrity.** Edges lose integrity in proportion to the plastic work done on them,
   and heal toward 1 with a thermally activated time: 0.1 Myr at mantle temperature,
   ~50 Myr at 1200 K, never in cold lithosphere.
@@ -176,9 +187,11 @@ Stretching also thins the lithosphere (its thermal age scales by (A₀/A)²), an
 the lithosphere is thinner than 70 km, new area brings decompression melt: 7 km of
 crust per unit new area at a ridge, none under thick lithosphere. Melt is mixed into
 the column's composition, so a stretched continent eventually becomes oceanic
-(breakup). A column whose cell exceeds twice the base hexagon **splits** along the
-cell's long axis into two halves that share its volume and reference area, joined by
-an intact, stress-free edge. Sources (melt) and sinks (slabs) are logged, so the crust
+(breakup). A column stretched along the pull to twice its length (reference aspect
+ratio 2, and at least 1.3× the base area) **splits** across its long axis into two
+round halves that share its volume and reference area, joined by an intact,
+stress-free edge, so a ridge lays down rows of columns parallel to itself. A column
+whose cell exceeds twice the base hexagon without a preferred direction also splits. Sources (melt) and sinks (slabs) are logged, so the crust
 volume budget closes. This replaced the old spreading stand-in (area growth over
 diverging mantle).
 
@@ -250,6 +263,7 @@ plate-player/
 │   │   ├── flow.js            CPU reference for volumetric flow and the GPE push
 │   │   ├── area.js            CPU reference for the tessellated area (weighted Voronoi cells)
 │   │   ├── volume.js          CPU reference for crust volume, thinning, melt, breakup and splits
+│   │   ├── shape.js           CPU reference for column rotation and reference shapes (strain fit, split by aspect, lattice moduli)
 │   │   └── flexure.js         CPU reference for bending of the free radius (thin plate on a Winkler foundation)
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
@@ -446,9 +460,9 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       Sea level moved from 3.5 to 2.6 km in the elevation datum to keep
       35 km continents ~0.8 km above it.
 - [x] ~~Bond "shear" resisted rigid rotation~~ (it was a velocity difference, not a
-      strain). Removed in phase 2: bonds are central springs. A rotation-free shear
-      measure comes with the per-particle strain fit (design phase 4); until then the
-      shear ticks are blank.
+      strain). Removed in phase 2: bonds are central springs. Phase G: shear is a
+      tangential channel on each edge, measured against the columns' own (solved)
+      rotations, so rigid rotation stores none; the shear ticks show it.
 - [x] ~~Young's modulus had no dynamical effect.~~ Phase 2: bond stiffness and drag
       are physical, and the two-particle relaxation matches τ = γ/2k (tested).
 - [x] ~~Plate-scale stress didn't converge with plain Jacobi~~ (median 56 MPa of
@@ -480,9 +494,13 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       edges with a dense side, not an overlap.
 - [ ] **No trench or outer rise:** the slab pulls the plate in-plane only; its
       vertical load on the plate behind it is not coupled to the bending.
-- [ ] **No friction.** Edges have strength caps in compression and tension
-      (phase C) but no tangential part, so sliding columns feel no friction. A
-      tangential channel needs a per-particle orientation (design §10).
+- [x] ~~**No friction.**~~ Phase G: edges have a tangential channel capped by
+      friction (rising with compression across the face) or the flow stress, columns
+      have solved rotations, and flat faces resist rolling. Shear modulus and
+      Poisson's ratio (0.25) follow from the normal and tangential stiffnesses.
+- [x] ~~**Columns are round.**~~ Phase G: distributed flow elongates a column's
+      reference shape (up to aspect 3); spreading columns split across their long
+      axis into rows parallel to the ridge; shear never splits them.
 - [x] ~~**Slabs detach from their plate.**~~ Phase F: a slab subducts where it is
       and keeps its edges until it has sunk below the plate behind it.
 - [x] ~~Water loading factor~~ was d·(1 + ρ_w/ρ_m); now ρ_w/(ρ_m − ρ_w) (phase 3).

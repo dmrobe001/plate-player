@@ -123,6 +123,12 @@ export const Particle = defineStruct('Particle', [
   ['flexural_rigidity', 'f32'], // D, N m (derived each step)
   ['bending_moment', 'f32'],    // D x laplacian of elevation (solver scratch)
   ['elevation_start', 'f32'],   // elevation at the start of the vertical solve
+  // Orientation and shape (design 4.2, phase G; src/columns/shape.js):
+  ['body_axis', 'vec4f'],       // unit tangent: the column's body x-axis (xyz; w unused), carried and spun with it
+  ['shape_p', 'f32'],           // reference shape: traceless log-stretch L = [[p, q], [q, -p]] in the body
+  ['shape_q', 'f32'],           //   frame (body_axis, position x body_axis); aspect ratio exp(2 |(p, q)|)
+  ['spin', 'f32'],              // rotation this step about the outward radial, rad, CCW (solver iterate; plain Jacobi)
+  ['rotation_total', 'f32'],    // vertical-axis rotation since load, rad (diagnostic: paleomagnetic declination)
 ]);
 
 /**
@@ -134,8 +140,8 @@ export const Particle = defineStruct('Particle', [
  * gap below edge_range_margin of the apothem sum, and overlapping depth
  * intervals). Edges are keyed by pair and persist across steps in a
  * free-listed array; per-particle slot lists (SLOTS) are an index rebuilt
- * every step. Rest length is not stored: it is always the sum of the two
- * apothems (rest_length() in bindings.wgsl).
+ * every step. Rest length is the sum of the two columns' radii along the
+ * pair (their reference shapes, src/columns/shape.js), set each step by edges_law.
  */
 export const Edge = defineStruct('Edge', [
   ['particle_a', 'u32'],
@@ -145,7 +151,7 @@ export const Edge = defineStruct('Edge', [
   ['lambda', 'f32'],            // XPBD multiplier accumulated over this step's iterations
   ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
   ['stress_normal_mpa', 'f32'], // diagnostic: depth-averaged normal stress, + tension, - compression
-  ['stress_shear_mpa', 'f32'],  // diagnostic: magnitude (0 until shear exists)
+  ['stress_shear_mpa', 'f32'],  // diagnostic: depth-averaged tangential stress, signed (b moving +t relative to a is +)
   // Edge law (design 4.5, phase C; src/edges/law.js). State:
   ['length', 'f32'],            // |x_b - x_a| (unit sphere) at the last update: strain increments are
                                 //   measured from it, so a change of rest length (area_ref) adds no stress
@@ -160,13 +166,29 @@ export const Edge = defineStruct('Edge', [
   ['lambda_min', 'f32'],        // multiplier bounds: depth-integrated tension and compression caps
   ['lambda_max', 'f32'],
   ['overlap_km', 'f32'],        // thickness of the depth interval the two columns share
-  // Carried across steps, not yet used (phases D-F):
-  ['stored_stress_t0', 'f32'],  // Maxwell memory, tangential (2 components)
-  ['stored_stress_t1', 'f32'],
-  ['slip_anchor0', 'f32'],      // tangential reference offset (2 components)
-  ['slip_anchor1', 'f32'],
   ['timer', 'f32'],             // sustained-compression accumulator (subduction, suturing)
   ['born_myr', 'f32'],          // creation time
+  // Tangential channel and face rolling (design 4.5, phase G; src/edges/law.js). State:
+  ['slice_shear_mpa', 'array<f32, 8>'], // tangential Maxwell stress per depth slice (+: b displaced along +t, t = up x n)
+  ['direction_x', 'f32'],       // x_b - x_a at the last update (with `length`): sliding is measured from it
+  ['direction_y', 'f32'],
+  ['direction_z', 'f32'],
+  ['moment', 'f32'],            // face moment against relative rotation, MPa km x unit-sphere length
+  // Derived each step by edges_law, for the solve (t = tangential, r = rolling):
+  ['rest', 'f32'],              // rest length: the two columns' radii along the pair (shape-dependent)
+  ['lever_a', 'f32'],           // contact point: fraction r_a / (r_a + r_b) of the pair distance from a
+  ['face_length', 'f32'],       // shared tessellation boundary (unit sphere; 0 = not cell neighbours)
+  ['stiffness_t', 'f32'],
+  ['reference_t', 'f32'],       // tangential offset (unit sphere) at zero force
+  ['lambda_t', 'f32'],           // (tangential and rolling rows are plain Jacobi: no previous multipliers)
+  ['lambda_t_max', 'f32'],      // symmetric bound: depth-integrated shear cap (friction / flow stress)
+  ['stiffness_r', 'f32'],
+  ['reference_r', 'f32'],       // relative rotation (rad) at zero moment
+  ['lambda_r', 'f32'],
+  ['lambda_r_max', 'f32'],      // symmetric bound: the kern rule, (compression + tension cap) x face / 6
+  // Diagnostics of the last update:
+  ['inelastic_shear', 'f32'],   // tangential strain not stored, where distributed (ductile): feeds the shape
+  ['slip', 'f32'],              // tangential strain slipped at the friction cap (brittle): a fault, not the shape
 ]);
 
 /**
@@ -200,7 +222,7 @@ export const ColumnProfile = defineStruct('ColumnProfile', [
   ['ductile_mpa', 'array<f32, 8>'], // ductile shear strength (capped at 1e6)
 ]);
 
-export const SLOTS = { wordsPerParticle: 44, countWord: 4, firstSlotWord: 8, capacity: 12 };
+export const SLOTS = { wordsPerParticle: 48, countWord: 4, firstSlotWord: 8, capacity: 12 };
 
 /** One node of the mantle grid; written from the CPU mantle model (src/mantle/). */
 export const GridNode = defineStruct('GridNode', [

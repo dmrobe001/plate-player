@@ -2,6 +2,8 @@
 
 import { ColumnProfile, Edge, GridNode, NONE, Particle, SLOTS } from '../gpu/layout.js';
 import { createShaderModule } from '../gpu/device.js';
+import { normalStiffnessPerModulus } from '../columns/shape.js';
+import { tangentBasis } from '../columns/flow.js';
 import { packSimParams, SIM_PARAMS, SIM_PARAMS_BYTES, simParamsWGSL } from './params.js';
 
 import bindingsWGSL from '../shaders/compute/bindings.wgsl';
@@ -199,6 +201,11 @@ export class Simulation {
       pf[base + po.elevation] = P.elevation ? P.elevation[i] : NaN; // NaN: start at the Airy height
       pu[base + po.split_child] = NONE;
       pu[base + po.mantle_node] = nearestVertex(this.icosphere.vertices, x, y, z);
+      // Body axis (phase G): the tangent basis e1 (tangent_e1 in area.wgsl) unless given; round shape unless given.
+      const b = P.bodyAxis ? [P.bodyAxis[3 * i], P.bodyAxis[3 * i + 1], P.bodyAxis[3 * i + 2]] : tangentBasis([x, y, z])[0];
+      pf.set([...b, 0], base + po.body_axis);
+      pf[base + po.shape_p] = P.shapeP ? P.shapeP[i] : 0;
+      pf[base + po.shape_q] = P.shapeQ ? P.shapeQ[i] : 0;
     }
     device.queue.writeBuffer(buffers.particles, 0, pbuf);
 
@@ -217,8 +224,11 @@ export class Simulation {
       // Elastic loading from the rest length (apothem sum), in every slice.
       const i = B.a[k], j = B.b[k];
       const d = Math.hypot(...[0, 1, 2].map((c) => P.position[3 * i + c] - P.position[3 * j + c]));
-      const rest = P.apothem[i] + P.apothem[j];
+      const rest = P.apothem[i] + P.apothem[j]; // (loaded columns start round unless shapes are given; edges_law sets the shaped rest)
       ef[base + eo.length] = d;
+      [eo.direction_x, eo.direction_y, eo.direction_z].forEach((o, c) => { ef[base + o] = P.position[3 * j + c] - P.position[3 * i + c]; });
+      ef[base + eo.rest] = rest;
+      ef[base + eo.lever_a] = 0.5;
       ef[base + eo.strain] = (d - rest) / rest;
       ef.fill(this.params.crust_youngs_modulus_gpa * 1000 * ((d - rest) / rest), base + eo.slice_stress_mpa, base + eo.slice_stress_mpa + 8);
     }
@@ -472,14 +482,16 @@ export function chebyshevWeights(rho, delay, n) {
 
 /**
  * Bond stiffness over basal drag for a base-size particle, in 1/Myr.
- * For a triangular network of central springs, the 2D (thickness-integrated)
- * Young's modulus is E_2D = (2/sqrt 3) k, so k = (sqrt 3 / 2) E h_e,
+ * For a triangular network of normal springs k and tangential springs r k
+ * (shear_stiffness_ratio), the 2D (thickness-integrated) Young's modulus is
+ * E_2D = 2 sqrt(3) k (1 + r) / (3 + r) (latticeModuli in src/columns/shape.js;
+ * (2/sqrt 3) k for central springs alone), so k = E h_e (3 + r) / (2 sqrt(3) (1 + r)),
  * independent of spacing. Basal drag of a column is gamma = A eta / h_a.
  * Positions are on the unit sphere, but the radius cancels in the ratio:
  * both the drag term and the elastic energy scale with R^2.
  */
 export function bondRate(p) {
-  const k = (Math.sqrt(3) / 2) * p.crust_youngs_modulus_gpa * 1e9 * p.stiffness_reference_km * 1e3; // N/m
+  const k = normalStiffnessPerModulus(p.shear_stiffness_ratio) * p.crust_youngs_modulus_gpa * 1e9 * p.stiffness_reference_km * 1e3; // N/m
   const area = 2 * Math.sqrt(3) * (p.base_apothem * EARTH_RADIUS_M) ** 2;                          // m^2
   const gamma = (area * p.asthenosphere_viscosity_pa_s) / (p.drag_reference_channel_km * 1e3);     // N s/m
   return k / (gamma / SECONDS_PER_MYR);

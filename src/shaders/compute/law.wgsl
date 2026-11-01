@@ -4,7 +4,8 @@
 //   edges_law      before the solve: the edge's slices over the depth interval
 //                  both columns share; from the stored slice stresses, this
 //                  step's linear force law (stiffness, zero-force gap) and the
-//                  multiplier bounds (depth-integrated caps)
+//                  multiplier bounds (depth-integrated caps); the same for the
+//                  tangential channel and the face moment (phase G)
 //   edges_maxwell  after the solve: advance each slice's Maxwell stress by the
 //                  step's strain, cap it, store it; mean stress; then the
 //                  irreversible part (phase D): inelastic strain (accumulated
@@ -38,9 +39,12 @@ struct EdgeSlices {
     tens: array<f32, 8>,
     cracks: array<u32, 8>,  // 1 = brittle (cracks in tension), 0 = ductile (flows)
     temp: array<f32, 8>,    // K, mean of the two columns at this depth
+    shear: array<f32, 8>,   // tangential cap, MPa (phase G)
+    slips: array<u32, 8>,   // 1 = the tangential cap is friction (slip is a fault)
 }
 
-fn edge_slices(a: u32, b: u32, phi: f32) -> EdgeSlices {
+// sn: the slices' stored normal stresses (+ tension), which load the faces in friction.
+fn edge_slices(a: u32, b: u32, phi: f32, sn: array<f32, 8>) -> EdgeSlices {
     var s: EdgeSlices;
     let ea = particles[a].elevation;
     let eb = particles[b].elevation;
@@ -71,6 +75,9 @@ fn edge_slices(a: u32, b: u32, phi: f32) -> EdgeSlices {
         s.tens[k] = select(ductile_cap * (1.0 - sim.ductile_damage_weakening * (1.0 - phi)), phi * sim.cohesion_mpa, brittle);
         s.cracks[k] = select(0u, 1u, brittle);
         s.temp[k] = 0.5 * (temp_at(ca, da) + temp_at(cb, db));
+        let brittle_shear = phi * sim.cohesion_mpa + sim.friction_coefficient * max((1.0 - sim.pore_fluid_factor) * pressure - sn[k], 0.0);
+        s.shear[k] = min(brittle_shear, ductile_cap);
+        s.slips[k] = select(0u, 1u, brittle_shear < ductile_cap);
     }
     return s;
 }
@@ -80,20 +87,32 @@ fn edges_law(@builtin(global_invocation_id) id: vec3<u32>) {
     let e = id.x;
     if (e >= sim.max_edges || edges[e].is_active == 0u) { return; }
     let c = edges[e];
-    let s = edge_slices(c.particle_a, c.particle_b, c.integrity);
+    let a = c.particle_a;
+    let b = c.particle_b;
+    let s = edge_slices(a, b, c.integrity, c.slice_stress_mpa);
     let E = sim.crust_youngs_modulus_gpa * 1000.0;
     var S0 = 0.0;
     var K = 0.0;
     var scomp = 0.0;
     var stens = 0.0;
+    var S0t = 0.0;
+    var scap_t = 0.0;
     for (var k = 0u; k < EDGE_SLICES; k++) {
         S0 += c.slice_stress_mpa[k] * s.r[k] * s.dz;
         K += E * s.r[k] * s.dz;
         scomp += s.comp[k] * s.dz;
         stens += s.tens[k] * s.dz;
+        S0t += c.slice_shear_mpa[k] * s.r[k] * s.dz;
+        scap_t += s.shear[k] * s.dz;
     }
+    // Rest length from the two reference shapes along the pair (phase G);
+    // contact point at the lever fraction r_a / rest from a.
+    let xa = particles[a].predicted_pos.xyz;
+    let xb = particles[b].predicted_pos.xyz;
+    let rest = contact_length(a, b, xa, xb);
+    edges[e].rest = rest;
+    edges[e].lever_a = column_radius(a, xa, xb - xa) / rest;
     let keff = max(K, 1e-6 * E * sim.stiffness_reference_km);
-    let rest = rest_length(c);
     let scale = sim.bond_rate_myr_inv * sim.dt_crust_myr * rest / (E * sim.stiffness_reference_km);
     edges[e].stiffness = keff / (E * sim.stiffness_reference_km);
     // Zero-force length: the law is S = S0 + K (d - length) / rest.
@@ -101,6 +120,36 @@ fn edges_law(@builtin(global_invocation_id) id: vec3<u32>) {
     edges[e].lambda_min = -scale * stens;
     edges[e].lambda_max = scale * scomp;
     edges[e].overlap_km = s.overlap;
+
+    // Tangential channel and face moment (linearizeShear, linearizeRolling in
+    // law.js): surface pairs only (slab interfaces are normal-only).
+    let surface_pair = particles[a].state == 1u && particles[b].state == 1u;
+    var face = 0.0;
+    for (var k = 0u; k < particle_deltas[a].cell_count; k++) {
+        if (particle_deltas[a].cell_nbr[k] == b) { face = particle_deltas[a].cell_coef[k] * distance(particles[a].position.xyz, particles[b].position.xyz); }
+    }
+    edges[e].face_length = face;
+    let ratio = sim.shear_stiffness_ratio;
+    edges[e].stiffness_t = 0.0;
+    edges[e].reference_t = 0.0;
+    edges[e].lambda_t_max = 0.0;
+    if (surface_pair && ratio > 0.0 && s.overlap > 0.0) {
+        let kt = max(ratio * K, 1e-6 * ratio * E * sim.stiffness_reference_km);
+        edges[e].stiffness_t = kt / (E * sim.stiffness_reference_km);
+        edges[e].reference_t = -S0t / kt * rest;
+        edges[e].lambda_t_max = scale * scap_t;
+    }
+    edges[e].stiffness_r = 0.0;
+    edges[e].reference_r = 0.0;
+    edges[e].lambda_r_max = 0.0;
+    if (surface_pair && sim.rolling_stiffness_factor > 0.0 && face > 0.0 && s.overlap > 0.0) {
+        let geom = sim.rolling_stiffness_factor * face * face / 12.0;
+        let kr = keff * geom / rest;
+        let m0 = c.moment * K / (E * s.overlap);
+        edges[e].stiffness_r = edges[e].stiffness * geom;
+        edges[e].reference_r = -m0 / kr;
+        edges[e].lambda_r_max = scale * (max(-S0, 0.0) + stens) * face / 6.0;
+    }
 }
 
 // After the solve (CPU reference: law.js, maxwellUpdate and integrityStep).
@@ -112,9 +161,10 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
     if (e >= sim.max_edges || edges[e].is_active == 0u) { return; }
     let c = edges[e];
     let rest = rest_length(c);
-    let len = length(edge_offset(c.particle_a, c.particle_b, particles[c.particle_a].predicted_pos.xyz, particles[c.particle_b].predicted_pos.xyz));
+    let offset = edge_offset(c.particle_a, c.particle_b, particles[c.particle_a].predicted_pos.xyz, particles[c.particle_b].predicted_pos.xyz);
+    let len = length(offset);
     let d_strain = (len - c.length) / rest;
-    let s = edge_slices(c.particle_a, c.particle_b, c.integrity);
+    let s = edge_slices(c.particle_a, c.particle_b, c.integrity, c.slice_stress_mpa);
     let E = sim.crust_youngs_modulus_gpa * 1000.0;
     var S = 0.0;
     var work = 0.0;
@@ -143,16 +193,67 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
         wt_sum += w * s.temp[k];
     }
     edges[e].length = len;
+    edges[e].direction_x = offset.x;
+    edges[e].direction_y = offset.y;
+    edges[e].direction_z = offset.z;
     edges[e].strain = (len - rest) / rest;
     edges[e].stress_normal_mpa = select(0.0, S / s.overlap, s.overlap > 0.0);
-    edges[e].stress_shear_mpa = 0.0;
-    if (!(s.overlap > 0.0)) { inelastic = 0.0; }
-    edges[e].inelastic_strain = inelastic;
+    // An edge in its first step has deformed nothing: what its slices relax
+    // is the load it was born with (from the rest length), not flow, so it is
+    // not inelastic strain of the columns (phase G: in hot rock, gaps of new
+    // neighbours read as dilatation, e.g. after neighbour exchange in shear).
+    let newborn = c.born_myr == sim.time_myr;
+    if (!(s.overlap > 0.0) || newborn) { inelastic = 0.0; }
+    // As a strain of the columns, per length, not per rest length (they differ
+    // where a shape has met its cap): the fitted tensor is then the true
+    // (logarithmic) strain increment, and area-preserving flow keeps the area.
+    let per_length = rest / max(c.length, 1e-9);
+    edges[e].inelastic_strain = inelastic * per_length;
+
+    // Tangential channel (maxwellShear in law.js): the faces' sliding this
+    // step; inelastic shear of the stiffest slice is fault slip if that slice
+    // is brittle and at its cap, else distributed (it changes the shapes).
+    let surface_pair = particles[c.particle_a].state == 1u && particles[c.particle_b].state == 1u;
+    var St = 0.0;
+    var shear_inelastic = 0.0;
+    var fault = false;
+    let G = sim.shear_stiffness_ratio * E;
+    if (c.stiffness_t > 0.0 && G > 0.0) {
+        let dg = tangential_displacement(c) / rest;
+        var rt = -1.0;
+        for (var k = 0u; k < EDGE_SLICES; k++) {
+            let relaxed = (c.slice_shear_mpa[k] + G * dg) * s.r[k];
+            let capped = clamp(relaxed, -s.shear[k], s.shear[k]);
+            edges[e].slice_shear_mpa[k] = capped;
+            St += capped * s.dz;
+            if (relaxed != capped) { work += abs(capped * (relaxed - capped) / (G * max(s.r[k], 1e-30))) * s.dz; }
+            if (s.r[k] > rt) { rt = s.r[k]; shear_inelastic = dg - (capped - c.slice_shear_mpa[k]) / G; fault = s.slips[k] == 1u && relaxed != capped; }
+        }
+    } else {
+        for (var k = 0u; k < EDGE_SLICES; k++) { edges[e].slice_shear_mpa[k] = 0.0; }
+    }
+    if (!(s.overlap > 0.0) || newborn) { shear_inelastic = 0.0; }
+    edges[e].stress_shear_mpa = select(0.0, St / s.overlap, s.overlap > 0.0);
+    edges[e].slip = select(0.0, shear_inelastic, fault) * per_length;
+    edges[e].inelastic_shear = select(shear_inelastic, 0.0, fault) * per_length;
+    // Face moment (rollingUpdate in law.js): the kern-rule bound in lambda
+    // units over the scale gives the cap.
+    if (c.stiffness_r > 0.0) {
+        var K = 0.0;
+        for (var k = 0u; k < EDGE_SLICES; k++) { K += E * s.r[k] * s.dz; }
+        let keff = max(K, 1e-6 * E * sim.stiffness_reference_km);
+        let kr = keff * sim.rolling_stiffness_factor * c.face_length * c.face_length / 12.0 / rest;
+        let scale = sim.bond_rate_myr_inv * sim.dt_crust_myr * rest / (E * sim.stiffness_reference_km);
+        let cap = c.lambda_r_max / scale;
+        let dtheta = particles[c.particle_b].spin - particles[c.particle_a].spin;
+        edges[e].moment = clamp(c.moment * K / (E * s.overlap) + kr * dtheta, -cap, cap);
+    } else {
+        edges[e].moment = 0.0;
+    }
     edges[e].work_mpa_km = work;
 
     // Volumetric flow: both columns collect this edge's inelastic strain
     // (surface pairs only: slabs are not part of the area budget).
-    let surface_pair = particles[c.particle_a].state == 1u && particles[c.particle_b].state == 1u;
     if (surface_pair) {
         let fixed = i32(round(inelastic * FIXED_POINT));
         atomicAdd(&particle_deltas[c.particle_a].dx, fixed);

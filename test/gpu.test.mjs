@@ -552,7 +552,7 @@ test('edge storage stays consistent and matches the reference under random motio
   const out = await page.evaluate(async ([helperSrc, elastic]) => {
     const H = eval(helperSrc);
     const a = 0.0175, pts = H.patch(6, a), n = pts.length;
-    await plate.setParams({ ...elastic, damage_work_mpa_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing or area change
+    await plate.setParams({ ...elastic, damage_work_mpa_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, shape_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing, area or shape change
     await plate.loadState(H.state(pts, a));
     let seed = 12345;
     const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
@@ -604,11 +604,11 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
     const d = (i, j) => Math.hypot(...pts[i].map((v, c) => v - pts[j][c]));
     const bonds = [];
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (d(i, j) < 2.1 * a) bonds.push([i, j, 0.3]);
-    await plate.setParams({ ...elastic, damage_work_mpa_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing or area change
+    await plate.setParams({ ...elastic, damage_work_mpa_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, shape_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing, area or shape change
     await plate.loadState(H.state(pts, a, bonds));
 
     // Distinct values in every carried field.
-    const E = plate.layout.Edge, fields = ['stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1']; // (the timer is live state since phase F)
+    const E = plate.layout.Edge, fields = ['born_myr']; // (the timer is live since phase F, tangential stress and moment since phase G)
     const buf = (await plate.readBuffers(['edges'])).edges, v = new Float32Array(buf);
     bonds.forEach((_, k) => fields.forEach((f, m) => { v[E.words * k + E.offsets[f]] = 10 * (m + 1) + k; }));
     plate.sim.device.queue.writeBuffer(plate.sim.buffers.edges, 0, buf);
@@ -662,7 +662,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   assert.deepEqual(out.problems.slice(0, 10), []);
   assert.deepEqual(out.mismatches.slice(0, 10), []);
   assert.equal(out.start.length, 12);
-  assert.ok(out.start.every((e) => Math.abs(e.integrity - 0.7) < 1e-6 && e.slip_anchor1 >= 40), 'carried state not as written');
+  assert.ok(out.start.every((e) => Math.abs(e.integrity - 0.7) < 1e-6 && e.born_myr >= 10), 'carried state not as written');
   assert.deepEqual(out.afterJitter, out.start, 'edge state changed while every pair stayed in range');
 
   // The ring column has 3 edges (centre and two ring neighbours); all leave range.
@@ -678,11 +678,10 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
   const kept = out.start.filter((e) => !e.k.split(',').includes('0'));
   assert.deepEqual(out.afterPull, kept, 'edges of the other columns changed');
 
-  // Back in range: fresh edges with no cohesion and no history, born now.
+  // Back in range: fresh edges with no cohesion, born now.
   for (const e of out.returned.filter((x) => x.k.split(',').includes('0'))) {
     assert.equal(e.integrity, 0);
-    for (const f of ['stored_stress_t0', 'stored_stress_t1', 'slip_anchor0', 'slip_anchor1']) assert.equal(e[f], 0);
-    assert.ok(e.born > 0, `born_myr ${e.born}`);
+    assert.ok(e.born > 0 && e.born < 10, `born_myr ${e.born}`);
   }
   assert.equal(out.returned.length, 12);
 });
@@ -1311,4 +1310,286 @@ test('record ZIP is complete and self-consistent', { timeout: 300_000 , ...PLANE
   for (const snap of manifest.snapshots) {
     for (const { file, bytes } of Object.values(snap.buffers)) assert.equal(files.get(file)?.length, bytes, file);
   }
+});
+
+// --- Phase G: tangential channel, spins, reference shapes ------------------
+
+// In-page helpers for hand-driven motion: move particles first..first+n-1
+// (position and predicted position; the edges remember the geometry of their
+// last update, so the step sees the motion), and read the particle buffer's
+// few fields of interest.
+const MOTION_HELPERS = `({
+  movePredicted(pts, first = 0) {
+    const P = plate.layout.Particle;
+    pts.forEach((p, k) => {
+      const l = Math.hypot(...p), q = [p[0] / l, p[1] / l, p[2] / l, 1];
+      plate.sim.device.queue.writeBuffer(plate.sim.buffers.particles, 4 * P.words * (first + k), Float32Array.from([...q, ...q]));
+    });
+  },
+  async particles(n) {
+    const P = plate.layout.Particle, f = new Float32Array((await plate.readBuffers(['particles'])).particles), u = new Uint32Array(f.buffer);
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const b = P.words * i, o = P.offsets;
+      out.push({ active: u[b + o.is_active], x: [f[b + o.position], f[b + o.position + 1], f[b + o.position + 2]],
+        axis: [f[b + o.body_axis], f[b + o.body_axis + 1], f[b + o.body_axis + 2]], p: f[b + o.shape_p], q: f[b + o.shape_q],
+        areaRef: f[b + o.area_ref], volume: f[b + o.crust_volume], rotation: f[b + o.rotation_total] });
+    }
+    return out;
+  },
+  // Rodrigues rotation of v about unit axis k by w.
+  rotate(v, k, w) {
+    const c = Math.cos(w), s = Math.sin(w), kv = k[0] * v[0] + k[1] * v[1] + k[2] * v[2];
+    const kx = [k[1] * v[2] - k[2] * v[1], k[2] * v[0] - k[0] * v[2], k[0] * v[1] - k[1] * v[0]];
+    return v.map((x, i) => x * c + kx[i] * s + k[i] * kv * (1 - c));
+  },
+})`;
+
+test('tangential channel on the GPU: friction rises with compression across the face and matches the reference; rigid rotation turns the columns and stores no shear', { timeout: 300_000 }, async () => {
+  // Phase G (design 4.5). (1) Two broken (integrity 0) pairs of cold old
+  // ocean, no creep, one at touching and one pressed by 1e-3: the second
+  // column is turned around the first by 5e-3 rad per step (constant
+  // distance; spins stay 0 with no solve), so the faces slide by 5e-3 rest
+  // lengths per step. The slice shear stresses must follow the CPU
+  // reference (src/edges/law.js: edgeSlices with the stored normal stresses,
+  // maxwellShear) through the elastic rise to the friction plateau, and the
+  // pressed pair's plateau is higher by mu x its normal stress, slice by slice.
+  // (2) A bonded 19-column patch is turned rigidly by 0.02 rad in one step
+  // (predicted positions) and solved: every column must spin with the
+  // patch, and the edges store almost no shear (vs G_t x 0.02 if the
+  // columns could not turn).
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async ([helperSrc, motionSrc, brittle, elastic]) => {
+    const H = eval(helperSrc), M = eval(motionSrc);
+    const a = 0.0175, L = plate.debug.law, Pr = plate.debug.profile;
+    await plate.setParams({ ...brittle, mantle_drive: 0, solver_iterations: 0, volumetric_flow_factor: 0, heal_time_myr: 1e30, damage_work_mpa_km: 1e30 });
+    const strains = [0, -1e-3];
+    const place = (k, strain, turn) => {
+      const c = 6 * a * k, h = Math.asin(a * (1 + strain));
+      const xa = [Math.sin(c - h), 0, Math.cos(c - h)], xb = [Math.sin(c + h), 0, Math.cos(c + h)];
+      return [xa, M.rotate(xb, xa, turn)];
+    };
+    const n = 2 * strains.length;
+    const pos0 = strains.flatMap((s, k) => place(k, s, 0));
+    const fill = (v) => new Float32Array(n).fill(v);
+    await plate.loadState({
+      particles: { count: n, position: Float32Array.from(pos0.flat()), thickness: fill(7), compositionDensity: fill(3000), age: fill(100), temperature: fill(278), apothem: fill(a) },
+      bonds: { count: strains.length, a: Uint32Array.from(strains, (_, k) => 2 * k), b: Uint32Array.from(strains, (_, k) => 2 * k + 1), damage: fill(1).subarray(0, strains.length) },
+      yieldStressMPa: 1e9,
+    });
+    const before = await plate.debug.edges();
+    const p = plate.sim.params, dTurn = 5e-3, steps = 60;
+    for (let s = 1; s <= steps; s++) {
+      M.movePredicted(strains.flatMap((st, k) => place(k, st, s * dTurn)));
+      await plate.runSteps(1);
+    }
+    const after = await plate.debug.edges();
+    // CPU sequence for each pair from the same geometry.
+    const pairs = strains.map((st, k) => {
+      const e = after.pairs.get(`${2 * k},${2 * k + 1}`);
+      const colA = Pr.columnOfParticle(after.P, 2 * k), colB = Pr.columnOfParticle(after.P, 2 * k + 1);
+      const rest = 2 * a;
+      let sn = Array.from(before.E.slice_stress_mpa.subarray(8 * e, 8 * e + 8)), tau = new Array(8).fill(0), slip = 0, edge, snUsed;
+      for (let s = 1; s <= steps; s++) {
+        snUsed = sn;
+        edge = L.edgeSlices(colA, colB, 0, p, sn);
+        const [xa0, xb0] = place(k, st, (s - 1) * dTurn), [xa, xb] = place(k, st, s * dTurn);
+        const L0 = Math.hypot(...xb0.map((v, c) => v - xa0[c]));
+        const sh = L.maxwellShear(tau, edge, L.tangentialDisplacement(xa0, xb0, xa, xb, L0, 0.5, 0, 0) / rest, p);
+        tau = sh.stored; slip = sh.slip; // (the edge reports the last step's slip)
+        sn = L.maxwellUpdate(sn, edge, 0, p).stored;
+      }
+      const gpu = Array.from(after.E.slice_shear_mpa.subarray(8 * e, 8 * e + 8));
+      const cap = edge.slices.map((sl) => sl.shear);
+      return { gpu, ref: tau, cap, sn: snUsed, slipRef: slip, slip: after.E.slip[e], shearMean: after.E.stress_shear_mpa[e], integrity: after.E.integrity[e] };
+    });
+
+    // (2) Rigid rotation of a bonded patch, with the solve: once turned, once
+    // not (the loaded patch relaxes a little by itself: its baseline).
+    await plate.setParams({ ...elastic, mantle_drive: 0, solver_iterations: 32, volumetric_flow_factor: 0 });
+    const pts = H.patch(2, a), m = pts.length, centre = pts[9];
+    const d = (i, j) => Math.hypot(...pts[i].map((v, c) => v - pts[j][c]));
+    const bonds = [];
+    for (let i = 0; i < m; i++) for (let j = i + 1; j < m; j++) if (d(i, j) < 2.1 * a) bonds.push([i, j, 0]);
+    const run = async (turn) => {
+      await plate.loadState(H.state(pts, a, bonds));
+      M.movePredicted(pts.map((x) => M.rotate(x, centre, turn)));
+      await plate.runSteps(1);
+      return { r: await plate.debug.edges(), P: await M.particles(m) };
+    };
+    const turn = 0.02;
+    const still = await run(0), turned = await run(turn);
+    // The patch's rotation about its centre: mean turn of the outer columns.
+    const ang = (v) => Math.atan2(v[1], v[0]);
+    const rot = [];
+    for (let i = 0; i < m; i++) {
+      const r0 = pts[i].map((v, c) => v - centre[c]), r1 = turned.P[i].x.map((v, c) => v - centre[c]);
+      if (Math.hypot(...r0) > 1.5 * a) rot.push(((ang(r1) - ang(r0) + 3 * Math.PI) % (2 * Math.PI)) - Math.PI);
+    }
+    const patchTurn = rot.reduce((s, v) => s + v, 0) / rot.length;
+    // Drag resists the turn by its two parallel-axis terms: orbital (sum r^2)
+    // and spin (sum of squared radii of gyration, area / 2 pi). The patch
+    // keeps the orbital share of the imposed turn.
+    const r2 = pts.reduce((s, x) => s + d(pts.indexOf(x), 9) ** 2, 0), g2 = m * (2 * Math.sqrt(3) * a * a) / (2 * Math.PI);
+    let maxShear = 0;
+    for (const [k, e] of turned.r.pairs) maxShear = Math.max(maxShear, Math.abs(turned.r.E.stress_shear_mpa[e] - still.r.E.stress_shear_mpa[still.r.pairs.get(k)]));
+    return { pairs, patchTurn, expectedTurn: turn * r2 / (r2 + g2), spins: turned.P.map((q) => q.rotation), maxShear, G: p.shear_stiffness_ratio * p.crust_youngs_modulus_gpa * 1000, turn, mu: p.friction_coefficient };
+  }, [PATCH_HELPERS, MOTION_HELPERS, BRITTLE, ELASTIC]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+
+  out.pairs.forEach((q, k) => {
+    const worst = Math.max(...q.gpu.map((g, s) => Math.abs(g - q.ref[s]) / Math.max(q.cap[s], 1)));
+    console.log(`  pair ${k} (${k ? 'pressed' : 'touching'}): mean shear ${q.shearMean.toFixed(1)} MPa, top/bottom slice ${q.gpu[0].toFixed(1)} / ${q.gpu[7].toFixed(1)} MPa (caps ${q.cap[0].toFixed(1)} / ${q.cap[7].toFixed(1)}), worst slice vs reference ${worst.toExponential(1)} of the cap`);
+    assert.ok(worst < 1e-3, `pair ${k}: GPU ${q.gpu} vs reference ${q.ref}`);
+    assert.ok(Math.abs(q.gpu[0] - q.cap[0]) < 1e-3 * q.cap[0], 'the top slice slips at its friction cap');
+    assert.ok(q.slip > 0 && Math.abs(q.slip / q.slipRef - 1) < 1e-2, `slip ${q.slip} vs ${q.slipRef}`);
+    assert.equal(q.integrity, 0);
+  });
+  // Pressing the faces together (stored normal stress sigma_n < 0) raises friction by mu |sigma_n|.
+  const [free, pressed] = out.pairs;
+  for (let s = 0; s < 8; s++) {
+    if (free.ref[s] < free.cap[s] - 1e-6) continue; // only slices at their cap
+    assert.ok(Math.abs(pressed.cap[s] - free.cap[s] - out.mu * (free.sn[s] - pressed.sn[s])) < 1e-5 * pressed.cap[s], `slice ${s}: caps ${free.cap[s]} / ${pressed.cap[s]}, sigma_n ${free.sn[s]} / ${pressed.sn[s]}`);
+  }
+  assert.ok(pressed.shearMean > free.shearMean, 'pressed faces are stronger');
+
+  const spinErr = Math.max(...out.spins.map((s) => Math.abs(s / out.patchTurn - 1)));
+  console.log(`  rigid turn of ${out.turn} rad: patch turned ${out.patchTurn.toFixed(5)} (parallel-axis share ${out.expectedTurn.toFixed(5)}), spins within ${(100 * spinErr).toFixed(2)}% of it; shear added ${out.maxShear.toFixed(2)} MPa at most (${(100 * out.maxShear / (out.G * out.turn)).toFixed(2)}% of G_t x turn)`);
+  assert.ok(Math.abs(out.patchTurn / out.expectedTurn - 1) < 0.01, 'the patch keeps the orbital share of the turn');
+  assert.ok(spinErr < 0.01, 'columns turn with the patch');
+  // (The remainder is the 32-iteration solve's residual for a turn of 0.02 rad in one step, ~1000x a fast plate's.)
+  assert.ok(out.maxShear < 0.02 * out.G * out.turn, 'rigid rotation stores (almost) no shear');
+});
+
+// Weak, hot rock: every slice flows (no strength), so imposed motion is all inelastic.
+const VISCOUS = { olivine_log10_a: 60, diabase_log10_a: 60, quartzite_log10_a: 60 };
+
+test('spreading elongates columns along the pull and splits them into rows across it; shear elongates to the aspect cap and never splits', { timeout: 300_000 }, async () => {
+  // Phase G (design 4.8). A 61-column patch of hot, weak rock (every slice
+  // flows), young (thin lithosphere: new area melts), moved by hand (no
+  // solve), so all strain is inelastic. (1) Uniaxial stretch along x by 7%
+  // per step: interior columns' reference area and aspect ratio both follow
+  // the stretch, long axis along x, and every lattice pair stays at its rest
+  // length (no pair leaves range); past aspect 2 they split across the long
+  // axis, the halves round and touching along x (rows parallel to the
+  // ridge); crust volume = initial + melt. (2) Simple shear by 0.05 per step
+  // at constant area (no solve, so the columns do not spin: the shapes turn
+  // with the material by the fitted relative rotation): at shear 1 the
+  // aspect ratio is the finite-strain ellipse's, (1/2 + sqrt(5/4))^2 = 2.618;
+  // it reaches the cap (3) and stops, pairs leave range, the area stays, and
+  // nothing splits (area guard).
+  const page = await openPage({ small: true });
+  const out = await page.evaluate(async ([helperSrc, motionSrc, viscous]) => {
+    const H = eval(helperSrc), M = eval(motionSrc), S = plate.debug.shape;
+    const a = 0.0175, base = 2 * Math.sqrt(3) * a * a;
+    await plate.setParams({ ...viscous, mantle_drive: 0, solver_iterations: 0, split_area_factor: 100 }); // shape splits only
+    const pts = H.patch(4, a), n0 = pts.length;
+    const young = (st) => { st.particles.age.fill(0); return st; };
+    const d0 = (i, j) => Math.hypot(...pts[i].map((v, c) => v - pts[j][c]));
+    const lattice = [];
+    for (let i = 0; i < n0; i++) for (let j = i + 1; j < n0; j++) if (d0(i, j) < 2.1 * a) lattice.push(`${i},${j}`);
+    const interior = pts.map((p, i) => Math.hypot(p[0], p[1]) < 2.5 * 2 * a ? i : -1).filter((i) => i >= 0);
+    const affine = (x, F) => { const X = F[0][0] * x[0] + F[0][1] * x[1], Y = F[1][0] * x[0] + F[1][1] * x[1]; return [X, Y, Math.sqrt(1 - X * X - Y * Y)]; };
+
+    // (1) Spreading. One still step first: edges are created at the loaded
+    // positions (a pair's first step measures nothing).
+    await plate.loadState(young(H.state(pts, a)));
+    await plate.runSteps(1);
+    const V0 = (await M.particles(n0)).reduce((s, q) => s + q.volume, 0);
+    const spread = { stages: [] };
+    let cur = pts.map((p) => [...p]), lambda = 1, count = n0, splitStep = null;
+    for (let s = 1; s <= 14 && splitStep === null; s++) {
+      const P = await M.particles(1024);
+      const act = P.map((q, i) => (q.active ? i : -1)).filter((i) => i >= 0);
+      if (act.length > count) { splitStep = s - 1; break; }
+      if (s === 10) {
+        // Just before the splits: shapes and areas vs the stretch; lattice pairs kept.
+        const r = await plate.debug.edges();
+        const lost = lattice.filter((k) => !r.pairs.has(k));
+        const st = interior.map((i) => { const ax = S.shapeAxes(P[i].p, P[i].q); const b = P[i].axis, x = P[i].x;
+          const u = [0, 1, 2].map((c) => Math.cos(ax.axis) * b[c] + Math.sin(ax.axis) * [x[1] * b[2] - x[2] * b[1], x[2] * b[0] - x[0] * b[2], x[0] * b[1] - x[1] * b[0]][c]);
+          return { aspect: ax.aspect, area: P[i].areaRef / base, along: Math.abs(u[0]) }; });
+        spread.stages.push({ lambda, lost: lost.length, edges: r.pairs.size, st });
+      }
+      lambda *= 1.07;
+      cur = act.map((i) => affine(P[i].x, [[1.07, 0], [0, 1]]));
+      M.movePredicted(cur.slice(0, n0));
+      if (act.length > n0) for (const [k, i] of act.entries()) if (i >= n0) M.movePredicted([cur[k]], i);
+      await plate.runSteps(1);
+    }
+    // The step after the splits.
+    const r = await plate.debug.edges();
+    const P = await M.particles(1024);
+    const act = P.map((q, i) => (q.active ? i : -1)).filter((i) => i >= 0);
+    const tNow = plate.sim.timeMyr - plate.sim.params.dt_crust_myr;
+    const halves = [];
+    for (const [k, e] of r.pairs) {
+      if (Math.abs(r.E.born_myr[e] - tNow) > 1e-6 || r.E.integrity[e] < 0.99) continue;
+      const [i, j] = k.split(',').map(Number);
+      const dv = P[j].x.map((v, c) => v - P[i].x[c]), L = Math.hypot(...dv);
+      halves.push({ along: Math.abs(dv[0]) / L, gap: L / r.E.rest[e] - 1, aspect: Math.max(S.shapeAxes(P[i].p, P[i].q).aspect, S.shapeAxes(P[j].p, P[j].q).aspect) });
+    }
+    const c = await plate.debug.counters();
+    const V = act.reduce((s, i) => s + P[i].volume, 0);
+    spread.result = { splitStep, lambdaAtSplit: lambda, splits: act.length - n0, halves, V0, V, source: c.volumeSource, problems: r.problems.length };
+
+    // (2) Simple shear.
+    await plate.loadState(young(H.state(pts, a)));
+    await plate.runSteps(1);
+    cur = pts.map((p) => [...p]);
+    const at = [];
+    for (let s = 1; s <= 36; s++) {
+      cur = cur.map((x) => affine(x, [[1, 0.05], [0, 1]]));
+      M.movePredicted(cur);
+      await plate.runSteps(1);
+      if (s === 20) at.push((await M.particles(n0)).filter((_, i) => interior.includes(i)).map((q) => S.shapeAxes(q.p, q.q).aspect));
+    }
+    const Q = await M.particles(1024), rs = await plate.debug.edges();
+    const shear = {
+      active: Q.filter((q) => q.active).length,
+      aspects: interior.map((i) => S.shapeAxes(Q[i].p, Q[i].q).aspect),
+      areas: interior.map((i) => Q[i].areaRef / base),
+      newEdges: [...rs.pairs.values()].filter((e) => rs.E.born_myr[e] > 0).length,
+      lost: lattice.filter((k) => !rs.pairs.has(k)).length,
+      cap: plate.sim.params.shape_aspect_cap,
+      atUnitShear: at[0],
+    };
+    return { spread, shear, n0 };
+  }, [PATCH_HELPERS, MOTION_HELPERS, VISCOUS]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+
+  const st = out.spread.stages[0];
+  const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+  console.log(`  stretch ${st.lambda.toFixed(3)}: interior aspect ${mean(st.st.map((q) => q.aspect)).toFixed(3)}, area ${mean(st.st.map((q) => q.area)).toFixed(3)} x base, long axis . x ${Math.min(...st.st.map((q) => q.along)).toFixed(3)} (min); lattice pairs lost ${st.lost}`);
+  for (const q of st.st) {
+    assert.ok(Math.abs(q.aspect / st.lambda - 1) < 0.05, `aspect ${q.aspect} vs stretch ${st.lambda}`);
+    assert.ok(Math.abs(q.area / st.lambda - 1) < 0.05, `area ${q.area} vs stretch ${st.lambda}`);
+    assert.ok(q.along > 0.99, `long axis off the pull: ${q.along}`);
+  }
+  assert.equal(st.lost, 0, 'lattice pairs left range while stretching');
+  const res = out.spread.result;
+  console.log(`  split at stretch ${res.lambdaAtSplit.toFixed(2)} (step ${res.splitStep}): ${res.splits} splits; halves along the pull ${Math.min(...res.halves.map((h) => h.along)).toFixed(3)} (min), gap vs rest ${Math.max(...res.halves.map((h) => Math.abs(h.gap))).toExponential(1)}, aspect ${Math.max(...res.halves.map((h) => h.aspect)).toFixed(3)} (max)`);
+  console.log(`  crust volume ${res.V0.toExponential(4)} -> ${res.V.toExponential(4)}, melt ${res.source.toExponential(4)}`);
+  // (Columns near the patch's free edge have clipped cells and do not split.)
+  assert.ok(res.splits >= 7 && res.halves.length === res.splits, `${res.splits} splits, ${res.halves.length} half pairs`);
+  for (const h of res.halves) {
+    assert.ok(h.along > 0.95, `halves not along the pull: ${h.along}`);
+    assert.ok(Math.abs(h.gap) < 1e-3, `halves not touching: ${h.gap}`);
+    assert.ok(h.aspect < 1.1, `halves not round: ${h.aspect}`);
+  }
+  assert.ok(Math.abs(res.V - res.V0 - res.source) < 1e-4 * res.V, 'volume budget');
+  assert.ok(res.source > 0, 'stretching young lithosphere melts');
+  assert.equal(res.problems, 0);
+
+  const sh = out.shear;
+  const ellipse = (0.5 + Math.sqrt(1.25)) ** 2;
+  console.log(`  simple shear 1: interior aspect ${Math.min(...sh.atUnitShear).toFixed(3)}..${Math.max(...sh.atUnitShear).toFixed(3)} (finite-strain ellipse ${ellipse.toFixed(3)})`);
+  console.log(`  simple shear 1.8: interior aspect ${Math.min(...sh.aspects).toFixed(3)}..${Math.max(...sh.aspects).toFixed(3)} (cap ${sh.cap}), area ${Math.min(...sh.areas).toFixed(3)}..${Math.max(...sh.areas).toFixed(3)} x base, ${sh.newEdges} new edges, ${sh.lost} lattice pairs gone, ${sh.active} columns`);
+  assert.ok(sh.atUnitShear.every((x) => Math.abs(x / ellipse - 1) < 0.05), 'finite-strain ellipse at shear 1');
+  assert.equal(sh.active, out.n0, 'shear split a column');
+  assert.ok(sh.aspects.every((x) => Math.abs(x / sh.cap - 1) < 0.01), 'aspect ratio at the cap');
+  assert.ok(sh.areas.every((x) => Math.abs(x - 1) < 0.05), 'shear changed area');
+  assert.ok(sh.lost > 0, 'pairs leave range past the cap');
 });

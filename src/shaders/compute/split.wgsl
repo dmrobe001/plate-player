@@ -1,8 +1,19 @@
-// Splits (design 4.8, phase E). CPU reference: splitColumn in
-// src/columns/volume.js. A surface column whose actual (tessellated) area
-// exceeds split_area_factor x the base hexagon, and whose cell is not clipped, splits along its cell's major
-// axis: parent and child go to the centroid -/+ SPLIT_OFFSET x spread along
-// that axis, and share volume and area_ref equally. The child copies the
+// Splits (design 4.8, phases E and G). A surface column whose cell is not
+// clipped splits
+//   - by shape (phase G; splitShape in src/columns/shape.js): when its
+//     reference shape is elongated past split_aspect_ratio and its reference
+//     area is at least split_area_guard x the base hexagon. It splits across
+//     its long axis: each half has half the area and half the aspect ratio,
+//     and sits at its own radius along the axis from the parent's position,
+//     so the halves touch at their rest length (round halves at aspect 2).
+//     Columns stretched along the pull (spreading) split into rows across it;
+//     elongation at constant area (shear) never splits.
+//   - by area (phase E; splitColumn in src/columns/volume.js): when its actual
+//     (tessellated) area exceeds split_area_factor x the base hexagon, for
+//     stretching with no preferred direction. It splits along its cell's major
+//     axis: parent and child go to the centroid -/+ SPLIT_OFFSET x spread along
+//     that axis; the shape is kept.
+// Either way the halves share volume and area_ref equally. The child copies the
 // parent's material (composition, thermal age, age). The edge between them
 // starts intact (integrity 1) and stress-free; edges to former neighbours are
 // re-attached to whichever half is closer. Splits are stress-neutral: every
@@ -25,8 +36,13 @@ fn columns_split(@builtin(global_invocation_id) id: vec3<u32>) {
     let base_area = 3.4641016 * sim.base_apothem * sim.base_apothem;
     // A clipped cell has a free side (no neighbour within reach): its area is
     // not a measure of stretching, so it does not split.
-    if (particles[idx].cell_area <= sim.split_area_factor * base_area || particles[idx].cell_clipped != 0u
-        || particles[idx].split_child != NONE) { return; }
+    if (particles[idx].cell_clipped != 0u || particles[idx].split_child != NONE) { return; }
+    let sp = particles[idx].shape_p;
+    let sq = particles[idx].shape_q;
+    let s = length(vec2f(sp, sq));
+    let by_shape = s >= 0.5 * log(sim.split_aspect_ratio) && particles[idx].area_ref >= sim.split_area_guard * base_area;
+    let by_area = particles[idx].cell_area > sim.split_area_factor * base_area;
+    if (!by_shape && !by_area) { return; }
 
     let ticket = atomicAdd(&particle_pool.requests, 1u);
     let p_count = atomicLoad(&particle_pool.counter);
@@ -35,16 +51,36 @@ fn columns_split(@builtin(global_invocation_id) id: vec3<u32>) {
     let child = particle_pool.indices[p_count - 1u - ticket];
     let edge = edge_pool.indices[c_count - 1u - ticket];
 
-    // Halves' positions in the parent's gnomonic tangent coordinates.
     let p = particles[idx].position.xyz;
-    let e1 = tangent_e1(p);
-    let e2 = cross(p, e1);
-    let shape = particles[idx].cell_shape;
-    let off = SPLIT_OFFSET * shape.w * vec2f(cos(shape.z), sin(shape.z));
-    let up = shape.xy - off;
-    let uc = shape.xy + off;
-    let xp = vec4f(normalize(p + up.x * e1 + up.y * e2), 1.0);
-    let xc = vec4f(normalize(p + uc.x * e1 + uc.y * e2), 1.0);
+    var xp: vec4f;
+    var xc: vec4f;
+    if (by_shape) {
+        // Across the long axis of the reference shape (splitShape).
+        let s_new = s - 0.5 * log(2.0);
+        let k = s_new / s;
+        let axis = 0.5 * atan2(sq, sp);
+        let b = particles[idx].body_axis.xyz;
+        let u = cos(axis) * b + sin(axis) * cross(p, b);
+        let off = particles[idx].apothem / sqrt(2.0) * exp(s_new);
+        xp = vec4f(normalize(p - off * u), 1.0);
+        xc = vec4f(normalize(p + off * u), 1.0);
+        particles[idx].shape_p = sp * k;
+        particles[idx].shape_q = sq * k;
+    } else {
+        // Halves' positions in the parent's gnomonic tangent coordinates.
+        let e1 = tangent_e1(p);
+        let e2 = cross(p, e1);
+        let shape = particles[idx].cell_shape;
+        let off = SPLIT_OFFSET * shape.w * vec2f(cos(shape.z), sin(shape.z));
+        let up = shape.xy - off;
+        let uc = shape.xy + off;
+        xp = vec4f(normalize(p + up.x * e1 + up.y * e2), 1.0);
+        xc = vec4f(normalize(p + uc.x * e1 + uc.y * e2), 1.0);
+    }
+    // Each half keeps the body axis, carried to its own tangent plane.
+    let b0 = particles[idx].body_axis.xyz;
+    let bp = vec4f(normalize(b0 - dot(b0, xp.xyz) * xp.xyz), 0.0);
+    let bc = vec4f(normalize(b0 - dot(b0, xc.xyz) * xc.xyz), 0.0);
 
     particles[idx].area_ref *= 0.5;
     particles[idx].apothem = sqrt(particles[idx].area_ref / 3.4641016);
@@ -53,10 +89,12 @@ fn columns_split(@builtin(global_invocation_id) id: vec3<u32>) {
     particles[idx].split_child = child;
     particles[idx].position = xp;
     particles[idx].predicted_pos = xp;
+    particles[idx].body_axis = bp;
 
     particles[child] = particles[idx];
     particles[child].position = xc;
     particles[child].predicted_pos = xc;
+    particles[child].body_axis = bc;
     particles[child].split_child = child; // marks "just split" for crust_rewire_edges
     particles[child].is_active = 1u;
     // No dilatation (melt, thermal thinning) is counted for either half next step.
@@ -66,6 +104,7 @@ fn columns_split(@builtin(global_invocation_id) id: vec3<u32>) {
     var c = new_edge(idx, child, 1.0);
     for (var k = 0u; k < 8u; k++) { c.slice_stress_mpa[k] = 0.0; }
     edges[edge] = c;
+    // (new_edge reads the halves' new positions and shapes: its rest length is their distance.)
 }
 
 // Single thread: pop the slots claimed in columns_split.
@@ -106,7 +145,11 @@ fn crust_rewire_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let b = edges[c_idx].particle_b;
     if (childA != NONE || childB != NONE || particles[a].geometry_reset != 0u || particles[b].geometry_reset != 0u) {
-        edges[c_idx].length = length(edge_offset(a, b, particles[a].position.xyz, particles[b].position.xyz));
+        let d = edge_offset(a, b, particles[a].position.xyz, particles[b].position.xyz);
+        edges[c_idx].length = length(d);
+        edges[c_idx].direction_x = d.x;
+        edges[c_idx].direction_y = d.y;
+        edges[c_idx].direction_z = d.z;
     }
 }
 

@@ -20,6 +20,7 @@ import * as law from './edges/law.js';
 import * as flow from './columns/flow.js';
 import * as area from './columns/area.js';
 import * as volume from './columns/volume.js';
+import * as shape from './columns/shape.js';
 import * as topology from './edges/topology.js';
 import { CAPACITY } from './sim/simulation.js';
 
@@ -239,6 +240,7 @@ async function main() {
       flow,
       area,
       volume,
+      shape,
       counters: () => exclusive(() => sim.counters()),
     },
   };

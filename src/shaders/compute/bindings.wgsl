@@ -13,7 +13,7 @@ const FIXED_POINT: f32 = 100000000.0;
 // Stack of free slot indices. `requests` is used by two-phase allocation
 // (columns_split reserves, crust_commit_splits pops; see split.wgsl).
 struct FreeList { counter: atomic<u32>, requests: atomic<u32>, pad2: u32, pad3: u32, indices: array<u32> }
-// Per-particle scratch: summed position corrections (reset every
+// Per-particle scratch: summed position and spin corrections (reset every
 // iteration) and the particle's slot list: the edges touching it, sorted by
 // the partner's angle around it (rebuilt every step; SLOTS in layout.js).
 // slot_count is the true number of edges and may exceed MAX_SLOTS, which is
@@ -23,10 +23,13 @@ const MAX_SLOTS: u32 = 12u;
 // bending weights c = shared cell boundary / distance (flexure.wgsl).
 struct ParticleDelta {
     dx: atomic<i32>, dy: atomic<i32>, dz: atomic<i32>, count: atomic<i32>,
-    slot_count: atomic<u32>, cell_count: u32, pad2: u32, pad3: u32,
+    slot_count: atomic<u32>, cell_count: u32, dspin: atomic<i32>, pad3: u32,
     slots: array<u32, 12>,
     cell_nbr: array<u32, 12>,
     cell_coef: array<f32, 12>,
+    // Position corrections from tangential rows (phase G), kept apart: they
+    // are not extrapolated by Chebyshev (crust_chebyshev_combine, solver.wgsl).
+    tdx: atomic<i32>, tdy: atomic<i32>, tdz: atomic<i32>, pad4: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> grid: array<GridNode>;
@@ -90,6 +93,18 @@ fn add_delta(i: u32, d: vec3f, count: i32) {
     add_delta_fixed(i, to_fixed(d), count);
 }
 
+fn add_tangential_delta(i: u32, d: vec3f) {
+    let f = to_fixed(d);
+    atomicAdd(&particle_deltas[i].tdx, f.x);
+    atomicAdd(&particle_deltas[i].tdy, f.y);
+    atomicAdd(&particle_deltas[i].tdz, f.z);
+}
+
+// Spin corrections (rad), same fixed point.
+fn add_spin(i: u32, v: f32) {
+    atomicAdd(&particle_deltas[i].dspin, i32(round(v * FIXED_POINT)));
+}
+
 // Return an index to a free list (used when particles melt or edges leave range).
 // Pushes only ever run in dispatches without pops, so the slot written is
 // never being read concurrently.
@@ -124,9 +139,63 @@ fn edge_offset(a: u32, b: u32, xa: vec3f, xb: vec3f) -> vec3f {
     return xb - xa;
 }
 
-// An edge's rest length is always the sum of its particles' apothems, whatever
-// changed them (growth, splitting, ...).
+// Reference shape (design 4.2, phase G; src/columns/shape.js): the column's
+// radius toward direction d (any 3D vector) is its apothem stretched by
+// U = exp(L), L = [[p, q], [q, -p]] in its body frame (body_axis, x x body_axis)
+// at unit position x: apothem / sqrt(n^T exp(-2L) n).
+fn shape_radius_factor(p: f32, q: f32, n: vec2f) -> f32 {
+    let s = length(vec2f(p, q));
+    let f = select(2.0, sinh(2.0 * s) / s, s > 1e-6);
+    let nln = p * (n.x * n.x - n.y * n.y) + 2.0 * q * n.x * n.y;
+    return 1.0 / sqrt(cosh(2.0 * s) - f * nln);
+}
+fn body_frame(i: u32, x: vec3f, d: vec3f) -> vec2f {
+    let b = particles[i].body_axis.xyz;
+    return vec2f(dot(d, b), dot(d, cross(x, b)));
+}
+fn column_radius(i: u32, x: vec3f, d: vec3f) -> f32 {
+    let p = particles[i].shape_p;
+    let q = particles[i].shape_q;
+    if (p == 0.0 && q == 0.0) { return particles[i].apothem; }
+    let u = body_frame(i, x, d);
+    let l = length(u);
+    if (!(l > 0.0)) { return particles[i].apothem; }
+    return particles[i].apothem * shape_radius_factor(p, q, u / l);
+}
+// Rest length of a pair: the two radii along it (positions xa, xb).
+fn contact_length(a: u32, b: u32, xa: vec3f, xb: vec3f) -> f32 {
+    let d = xb - xa;
+    return column_radius(a, xa, d) + column_radius(b, xb, -d);
+}
+// Tangential channel (phase G; tangentialDisplacement in src/edges/law.js).
+// Rotation of the pair line since the last update (the edge's stored
+// direction -> the current iterate), about the outward radial at the pair,
+// CCW positive. Like `length`, the stored direction is the edge's memory: it
+// is reset where geometry jumps (splits), so a jump slides nothing.
+fn pair_rotation(c: Edge) -> f32 {
+    let a = c.particle_a;
+    let b = c.particle_b;
+    let d0 = vec3f(c.direction_x, c.direction_y, c.direction_z);
+    let xa = particles[a].predicted_pos.xyz;
+    let xb = particles[b].predicted_pos.xyz;
+    let d = xb - xa;
+    let up = normalize(xa + xb);
+    let y = dot(cross(d0, d), up);
+    let x = dot(d0, d);
+    // atan(y/x) where the pair turned less than a right angle: SwiftShader's
+    // atan2 returns pi for y = -0 (a pair that did not move at all).
+    if (x > 0.0) { return atan(y / x); }
+    return atan2(y, x);
+}
+// Sliding of the faces this step (unit sphere): L0 psi - l_a spin_a - l_b spin_b,
+// levers from the last-update distance L0 (edge.length) split at the contact point.
+fn tangential_displacement(c: Edge) -> f32 {
+    let L0 = c.length;
+    return L0 * (pair_rotation(c) - c.lever_a * particles[c.particle_a].spin - (1.0 - c.lever_a) * particles[c.particle_b].spin);
+}
+
+// An edge's rest length this step (set by edges_law, law.wgsl).
 fn rest_length(c: Edge) -> f32 {
-    return particles[c.particle_a].apothem + particles[c.particle_b].apothem;
+    return c.rest;
 }
 

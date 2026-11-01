@@ -51,6 +51,32 @@ export const SIM_PARAMS = [
   // A surface column splits when its actual (tessellated) area exceeds this
   // factor x the base hexagon area (design 4.8).
   ['split_area_factor', 'f32', 2.0],
+  // ... and when its reference shape is elongated past this aspect ratio while
+  // its reference area is at least split_area_guard x the base hexagon (design
+  // 4.8, phase G): it splits across its long axis, into two halves that are
+  // round at aspect ratio 2. Constant-area elongation (shear) never splits.
+  ['split_aspect_ratio', 'f32', 2.0],
+  ['split_area_guard', 'f32', 1.3],
+
+  // --- tangential channel, rotation and shape (design 4.2, 4.5; phase G) ---
+  // Edges resist relative sliding of their faces, with the columns' own
+  // rotations (spins) as unknowns, so rigid rotation is free. On a triangular
+  // lattice, normal and tangential stiffnesses k_n, k_t give Poisson's ratio
+  // (k_n - k_t) / (3 k_n + k_t) and shear modulus E / 2 (1 + nu): 0.2 gives
+  // nu = 0.25; 0 = no tangential channel (nu = 1/3). The tangential caps are
+  // friction, mu (1 - lambda_pore)(P - sigma_n) + phi c, or the flow stress.
+  ['shear_stiffness_ratio', 'f32', 0.2],
+  // Flat faces resist relative rotation of the two columns (k_n face^2 / 12),
+  // up to the kern rule: the face opens at one end once the moment exceeds
+  // (compression + tension cap) x face / 6. Scales that stiffness; 0 = off.
+  ['rolling_stiffness_factor', 'f32', 1.0],
+  // Distributed (ductile) inelastic strain changes a column's reference
+  // shape: the deviatoric part elongates it (the volumetric part changes its
+  // area, volumetric_flow_factor). 1 = physical; 0 = shapes stay round.
+  ['shape_flow_factor', 'f32', 1.0],
+  // Largest aspect ratio of a reference shape. Beyond it, deviatoric flow is
+  // taken up by neighbour exchange alone.
+  ['shape_aspect_cap', 'f32', 3.0],
   // An edge exists while its pair's map-view gap is below this fraction of the
   // apothem sum (and their depth intervals overlap); design 3.2.
   ['edge_range_margin', 'f32', 0.1],

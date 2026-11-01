@@ -7,15 +7,20 @@ export const EARTH_RADIUS_M = 6.371e6;
 
 /**
  * Volumetric flow: a column's reference area changes by the isotropic part of
- * its edges' inelastic strain, d ln area_ref = 2 x mean(inelastic) (area
- * scales as length squared). Deviatoric parts (pure shear) cancel in the
- * mean. Crust volume does not change; thickness is volume / actual area
- * (src/columns/area.js), so it follows the geometry, not area_ref.
+ * its edges' inelastic strain. With the strain tensor fitted from its edges
+ * (`fit`, fitStrain in src/columns/shape.js; phase G) that is its trace,
+ * d ln area_ref = exx + eyy. Without one (edges in fewer than two
+ * directions), 2 x mean(inelastic) (area scales as length squared) if there
+ * are at least three edges, else nothing: the mean is the trace only for
+ * edges spread evenly in angle, and a one-sided neighbourhood over-counts.
+ * Deviatoric parts (pure shear) cancel either way. Crust volume does not
+ * change; thickness is volume / actual area (src/columns/area.js), so it
+ * follows the geometry, not area_ref.
  */
-export function columnFlow({ area }, inelastic, factor = 1) {
+export function columnFlow({ area }, inelastic, factor = 1, fit = null) {
   if (!inelastic.length) return { area, apothem: Math.sqrt(area / (2 * Math.sqrt(3))) };
   const mean = inelastic.reduce((a, b) => a + b, 0) / inelastic.length;
-  const f = Math.exp(2 * factor * mean);
+  const f = Math.exp(factor * (fit ? fit.exx + fit.eyy : inelastic.length >= 3 ? 2 * mean : 0));
   return { area: area * f, apothem: Math.sqrt((area * f) / (2 * Math.sqrt(3))) };
 }
 

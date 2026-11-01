@@ -11,6 +11,7 @@
 // edge state, src/edges/transitions.js, not from overlap.)
 
 import { CellList } from '../init/cell-list.js';
+import { radiusAlong } from '../columns/shape.js';
 
 const SECONDS_PER_MYR = 3.15576e13;
 /** Columns lighter than this (kg/m^3 at mantle temperature) are continental. */
@@ -45,8 +46,15 @@ export function columnsFrom(P, params, { stride = 4, positionField = 'predicted_
     // The column spans its crust and its lithosphere, whichever reaches deeper (column_bottom in edges.wgsl).
     bottom[i] = P.elevation[i] - Math.max(lithosphereThicknessKm(P.composition_density[i], (P.thermal_age_myr ?? P.age)[i], params), P.thickness_km?.[i] ?? 0);
   }
+  // Reference shapes (phase G): body axis (stride 4) and log-stretch; round if absent.
+  const bodyAxis = new Float64Array(3 * count), shapeP = new Float64Array(count), shapeQ = new Float64Array(count);
+  for (let i = 0; i < count; i++) {
+    if (P.body_axis) for (let c = 0; c < 3; c++) bodyAxis[3 * i + c] = P.body_axis[4 * i + c];
+    shapeP[i] = P.shape_p?.[i] ?? 0;
+    shapeQ[i] = P.shape_q?.[i] ?? 0;
+  }
   return {
-    count, position, top, bottom,
+    count, position, top, bottom, bodyAxis, shapeP, shapeQ,
     apothem: Float64Array.from(P.apothem.subarray(0, count)),
     surface: Uint8Array.from({ length: count }, (_, i) => P.state[i] === 1),
     active: Uint8Array.from({ length: count }, (_, i) => P.is_active[i] !== 0),
@@ -58,9 +66,27 @@ const chord = (cols, i, j) => Math.hypot(
   cols.position[3 * i + 1] - cols.position[3 * j + 1],
   cols.position[3 * i + 2] - cols.position[3 * j + 2]);
 
-/** Map-view overlap (apothem sum minus centre distance; negative = gap). */
+/**
+ * Radius of column i toward column j: its apothem stretched by its reference
+ * shape (src/columns/shape.js; column_radius in bindings.wgsl). The frame is
+ * the body axis at i's (predicted) position.
+ */
+export function radiusToward(cols, i, j) {
+  if (cols.shapeP === undefined || (cols.shapeP[i] === 0 && cols.shapeQ[i] === 0)) return cols.apothem[i];
+  const x = [0, 1, 2].map((c) => cols.position[3 * i + c]);
+  const l = Math.hypot(...x);
+  const xn = x.map((v) => v / l);
+  const b = [0, 1, 2].map((c) => cols.bodyAxis[3 * i + c]);
+  const d = [0, 1, 2].map((c) => cols.position[3 * j + c] - x[c]);
+  return radiusAlong(cols.apothem[i], cols.shapeP[i], cols.shapeQ[i], xn, b, d);
+}
+
+/** Rest length of a pair: the sum of the two radii along it. */
+export const contactLength = (cols, i, j) => radiusToward(cols, i, j) + radiusToward(cols, j, i);
+
+/** Map-view overlap (rest length minus centre distance; negative = gap). */
 export function overlap(cols, i, j) {
-  return cols.apothem[i] + cols.apothem[j] - chord(cols, i, j);
+  return contactLength(cols, i, j) - chord(cols, i, j);
 }
 
 /**
@@ -69,8 +95,7 @@ export function overlap(cols, i, j) {
  * float rounding of the boundary when comparing with the GPU.
  */
 export function rangeMargin(cols, i, j, params) {
-  const contact = cols.apothem[i] + cols.apothem[j];
-  return overlap(cols, i, j) / contact + params.edge_range_margin;
+  return overlap(cols, i, j) / contactLength(cols, i, j) + params.edge_range_margin;
 }
 
 export function depthOverlap(cols, i, j) {
@@ -86,7 +111,7 @@ export const pairKey = (i, j) => (i < j ? `${i},${j}` : `${j},${i}`);
 /** Every in-range pair, as a Set of pairKey strings. */
 export function inRangePairs(cols, params) {
   let amax = 0;
-  for (let i = 0; i < cols.count; i++) if (cols.active[i]) amax = Math.max(amax, cols.apothem[i]);
+  for (let i = 0; i < cols.count; i++) if (cols.active[i]) amax = Math.max(amax, cols.apothem[i] * Math.exp(Math.hypot(cols.shapeP?.[i] ?? 0, cols.shapeQ?.[i] ?? 0)));
   const cutoff = 2 * amax * (1 + params.edge_range_margin) * 1.001;
   const pos32 = Float32Array.from(cols.position);
   const out = new Set();

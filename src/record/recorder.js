@@ -11,7 +11,7 @@ import { BUILD_INFO } from '../build-info.js';
 import { eastNorth, latLonDeg, sampleToMesh } from './sampling.js';
 import { readZip, writeZip } from './zip.js';
 
-export const SCHEMA = { name: 'plate-player-record', version: '0.6.0' };
+export const SCHEMA = { name: 'plate-player-record', version: '0.7.0' };
 const EARTH_RADIUS_KM = 6371;
 
 /** Field series written for every sample. Order here is order in the manifest. */
@@ -24,6 +24,8 @@ export const FIELDS = [
   { name: 'velocity_east', units: 'mm yr-1', long_name: 'eastward surface velocity (1 mm/yr = 1 km/Myr)', kind: 'intensive' },
   { name: 'velocity_north', units: 'mm yr-1', long_name: 'northward surface velocity', kind: 'intensive' },
   { name: 'edge_integrity', units: '1', long_name: 'mean integrity of the edges touching the crust (0 = no cohesion, 1 = intact)', kind: 'intensive' },
+  { name: 'shape_aspect', units: '1', long_name: 'aspect ratio of the columns\' reference shapes (finite strain of distributed flow, capped)', kind: 'intensive' },
+  { name: 'vertical_axis_rotation', units: 'degree', long_name: 'rotation of the crust about the vertical since the run started (counter-clockwise positive; cf. paleomagnetic declination)', kind: 'intensive' },
   { name: 'slab_fraction', units: '1', long_name: 'fraction of nearby crust that is subducting slab', kind: 'intensive' },
   { name: 'mantle_velocity_east', units: 'mm yr-1', long_name: 'eastward mantle flow beneath the plates (basal forcing)', kind: 'mantle' },
   { name: 'mantle_velocity_north', units: 'mm yr-1', long_name: 'northward mantle flow beneath the plates (basal forcing)', kind: 'mantle' },
@@ -126,6 +128,8 @@ export class Recorder {
       ch.velocity_east[k] = nan((vx * east[0] + vy * east[1] + vz * east[2]) * EARTH_RADIUS_KM);
       ch.velocity_north[k] = nan((vx * north[0] + vy * north[1] + vz * north[2]) * EARTH_RADIUS_KM);
       ch.edge_integrity[k] = surface && edgeCount[i] > 0 ? integritySum[i] / edgeCount[i] : NaN;
+      ch.shape_aspect[k] = nan(Math.exp(2 * Math.hypot(P.shape_p[i], P.shape_q[i])));
+      ch.vertical_axis_rotation[k] = nan((P.rotation_total[i] * 180) / Math.PI);
       ch.slab_fraction[k] = surface ? 0 : 1;
       plateChannel[k] = plateIds ? plateIds[i] : 0;
     });

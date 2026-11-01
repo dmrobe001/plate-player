@@ -24,13 +24,17 @@
 fn column_top(i: u32) -> f32 { return particles[i].elevation; }
 fn column_bottom(i: u32) -> f32 { return particles[i].elevation - column_depth_km(i); }
 
-// Map-view overlap on predicted positions (negative = gap).
+// Map-view overlap on predicted positions (negative = gap): the two columns'
+// radii along the pair (their reference shapes) minus their distance.
+fn pair_contact(i: u32, j: u32) -> f32 {
+    return contact_length(i, j, particles[i].predicted_pos.xyz, particles[j].predicted_pos.xyz);
+}
 fn pair_overlap(i: u32, j: u32) -> f32 {
-    return particles[i].apothem + particles[j].apothem - distance(particles[i].predicted_pos.xyz, particles[j].predicted_pos.xyz);
+    return pair_contact(i, j) - distance(particles[i].predicted_pos.xyz, particles[j].predicted_pos.xyz);
 }
 
 fn in_range(i: u32, j: u32) -> bool {
-    let contact = particles[i].apothem + particles[j].apothem;
+    let contact = pair_contact(i, j);
     let depth_overlap = min(column_top(i), column_top(j)) > max(column_bottom(i), column_bottom(j));
     return pair_overlap(i, j) > -sim.edge_range_margin * contact && depth_overlap;
 }
@@ -69,8 +73,13 @@ fn new_edge(a: u32, b: u32, integrity: f32) -> Edge {
     c.lambda_prev = 0.0;
     c.stress_normal_mpa = 0.0;
     c.stress_shear_mpa = 0.0;
-    let rest = particles[a].apothem + particles[b].apothem;
-    c.length = length(edge_offset(a, b, particles[a].position.xyz, particles[b].position.xyz));
+    let rest = contact_length(a, b, particles[a].position.xyz, particles[b].position.xyz);
+    c.rest = rest;
+    let d = edge_offset(a, b, particles[a].position.xyz, particles[b].position.xyz);
+    c.length = length(d);
+    c.direction_x = d.x;
+    c.direction_y = d.y;
+    c.direction_z = d.z;
     c.strain = (c.length - rest) / rest;
     c.inelastic_strain = 0.0;
     c.work_mpa_km = 0.0;
@@ -80,12 +89,23 @@ fn new_edge(a: u32, b: u32, integrity: f32) -> Edge {
     c.lambda_min = 0.0;
     c.lambda_max = 0.0;
     c.overlap_km = 0.0;
-    c.stored_stress_t0 = 0.0;
-    c.stored_stress_t1 = 0.0;
-    c.slip_anchor0 = 0.0;
-    c.slip_anchor1 = 0.0;
     c.timer = 0.0;
     c.born_myr = sim.time_myr;
+    // Tangential channel and rolling: no history (a new face slides freely from here).
+    for (var k = 0u; k < 8u; k++) { c.slice_shear_mpa[k] = 0.0; }
+    c.moment = 0.0;
+    c.lever_a = 0.5;
+    c.face_length = 0.0;
+    c.stiffness_t = 0.0;
+    c.reference_t = 0.0;
+    c.lambda_t = 0.0;
+    c.lambda_t_max = 0.0;
+    c.stiffness_r = 0.0;
+    c.reference_r = 0.0;
+    c.lambda_r = 0.0;
+    c.lambda_r_max = 0.0;
+    c.inelastic_shear = 0.0;
+    c.slip = 0.0;
     return c;
 }
 
@@ -107,6 +127,8 @@ fn edges_prune(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     edges[e].lambda = 0.0;
     edges[e].lambda_prev = 0.0;
+    edges[e].lambda_t = 0.0;
+    edges[e].lambda_r = 0.0;
     list_edge(a, e);
     list_edge(b, e);
 }

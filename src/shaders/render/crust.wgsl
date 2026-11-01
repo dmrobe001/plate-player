@@ -1,4 +1,6 @@
-// Crust particles as discs of radius = apothem, coloured by elevation.
+// Crust particles as their reference shapes (phase G): an ellipse of mean
+// radius = apothem, stretched by U = exp(L) in the body frame, coloured by
+// elevation. Round columns are discs.
 // Edges as stress glyphs:
 //   - a line joining the two particle centres; black = compression,
 //     white = tension, width proportional to |normal stress|
@@ -55,7 +57,14 @@ fn vs_disc(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Di
     let n = p.position.xyz;
     let r = surface_radius(p);
     let uv = QUAD[v];
-    let world = n * r + tangent_frame(n) * (uv * p.apothem * r);
+    // U uv = cosh(s) uv + sinh(s)/s L uv, L = [[sp, sq], [sq, -sp]], in (body_axis, n x body_axis).
+    let s = length(vec2f(p.shape_p, p.shape_q));
+    let f = select(1.0, sinh(s) / s, s > 1e-6);
+    let su = cosh(s) * uv + f * vec2f(p.shape_p * uv.x + p.shape_q * uv.y, p.shape_q * uv.x - p.shape_p * uv.y);
+    let b = p.body_axis.xyz;
+    var frame = tangent_frame(n);
+    if (dot(b, b) > 0.5) { frame = mat2x3f(b, cross(n, b)); }
+    let world = n * r + frame * (su * p.apothem * r);
     out.clip = view.view_proj * vec4f(world, 1.0);
     out.uv = uv;
 
@@ -109,7 +118,7 @@ fn vs_bond(@builtin(vertex_index) v: u32, @builtin(instance_index) ci: u32) -> B
         out.shade = select(0.0, 1.0, c.stress_normal_mpa > 0.0);
     } else {
         if ((view.flags & 2u) == 0u) { return out; }
-        let half_width = 0.5 * min(apothem * c.stress_shear_mpa / view.stress_ref_mpa, apothem);
+        let half_width = 0.5 * min(apothem * abs(c.stress_shear_mpa) / view.stress_ref_mpa, apothem); // (signed since phase G)
         let half_length = 0.5 * (2.0 / sqrt(3.0)) * apothem; // half a hexagon edge
         world = mid * (1.0 + 0.0005 / length(mid)) + across * (q.x * half_length) + along * (q.y * half_width);
         out.shade = 0.0;

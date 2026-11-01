@@ -5,10 +5,14 @@
 //                      the least-squares gradient of GPE over its listed
 //                      neighbours (ridge push, plateau collapse), as a change
 //                      of this step's predicted position against basal drag
-//   columns_flow       after edges_maxwell: volumetric flow, d ln area_ref =
-//                      2 x mean inelastic strain of the column's edges. Crust
-//                      volume is unchanged; thickness follows the actual
-//                      (tessellated) area, area.wgsl
+//   columns_flow       after edges_maxwell: the column's distributed inelastic
+//                      strain tensor, fitted from its edges (normal and
+//                      ductile tangential parts; phase G, src/columns/shape.js).
+//                      Volumetric flow: d ln area_ref = its trace (2 x the
+//                      edges' mean inelastic strain when it cannot be fitted).
+//                      Crust volume is unchanged; thickness follows the actual
+//                      (tessellated) area, area.wgsl. Its deviatoric part
+//                      elongates the reference shape, up to the aspect cap
 
 @compute @workgroup_size(64)
 fn columns_flow(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -17,9 +21,66 @@ fn columns_flow(@builtin(global_invocation_id) id: vec3<u32>) {
     let n = atomicLoad(&particle_deltas[idx].count);
     if (n == 0i) { return; }
     let mean = f32(atomicLoad(&particle_deltas[idx].dx)) / FIXED_POINT / f32(n);
-    let f = exp(2.0 * sim.volumetric_flow_factor * mean);
-    particles[idx].area_ref *= f;
+
+    // The column's inelastic strain tensor (fitStrain in shape.js): least
+    // squares over its surface edges, two equations each, in its body frame;
+    // unknowns exx, eyy, exy and w, the neighbourhood's rotation relative to
+    // the column's spin.
+    let x = particles[idx].predicted_pos.xyz;
+    let m = min(atomicLoad(&particle_deltas[idx].slot_count), MAX_SLOTS);
+    var A = mat4x4f(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
+    var r = vec4f(0.0);
+    for (var k = 0u; k < m; k++) {
+        let e = particle_deltas[idx].slots[k];
+        let j = other_end(e, idx);
+        if (particles[j].state != 1u) { continue; }
+        let u = body_frame(idx, x, particles[j].predicted_pos.xyz - x);
+        let l = length(u);
+        if (!(l > 0.0)) { continue; }
+        let nx = u.x / l;
+        let ny = u.y / l;
+        let an = vec4f(nx * nx, ny * ny, 2.0 * nx * ny, 0.0);
+        let at = vec4f(-nx * ny, nx * ny, nx * nx - ny * ny, 1.0);
+        A += mat4x4f(an * an.x, an * an.y, an * an.z, an * an.w) + mat4x4f(at * at.x, at * at.y, at * at.z, at * at.w);
+        r += an * edges[e].inelastic_strain + at * edges[e].inelastic_shear;
+    }
+    let det = determinant(A);
+    let tr = A[0][0] + A[1][1] + A[2][2] + A[3][3];
+    let fitted = particles[idx].state == 1u && abs(det) > 1e-6 * tr * tr * tr * tr;
+
+    // Volumetric flow (columnFlow in flow.js): the fitted trace. Where the
+    // tensor cannot be fitted (fewer than two edge directions), 2 x the mean
+    // only for a column with at least three edges; else no change: the mean
+    // of a one-sided neighbourhood is not its dilatation.
+    var dln = select(0.0, 2.0 * mean, n >= 3i);
+    var exx = 0.0;
+    var eyy = 0.0;
+    var exy = 0.0;
+    var w = 0.0;
+    if (fitted) {
+        w = determinant(mat4x4f(A[0], A[1], A[2], r)) / det;
+        exx = determinant(mat4x4f(r, A[1], A[2], A[3])) / det;
+        eyy = determinant(mat4x4f(A[0], r, A[2], A[3])) / det;
+        exy = determinant(mat4x4f(A[0], A[1], r, A[3])) / det;
+        dln = exx + eyy;
+    }
+    particles[idx].area_ref *= exp(sim.volumetric_flow_factor * dln);
     particles[idx].apothem = sqrt(particles[idx].area_ref / 3.4641016);
+
+    // Shape (updateShape in shape.js): turned with the material (by w
+    // relative to the body frame, which turns with the spin), then the
+    // deviatoric part, up to the aspect cap.
+    if (sim.shape_flow_factor <= 0.0 || !fitted) { return; }
+    let ang = 2.0 * sim.shape_flow_factor * w;
+    let p0 = particles[idx].shape_p;
+    let q0 = particles[idx].shape_q;
+    var sp = cos(ang) * p0 - sin(ang) * q0 + sim.shape_flow_factor * 0.5 * (exx - eyy);
+    var sq = sin(ang) * p0 + cos(ang) * q0 + sim.shape_flow_factor * exy;
+    let sl = length(vec2f(sp, sq));
+    let smax = 0.5 * log(sim.shape_aspect_cap);
+    if (sl > smax) { sp *= smax / sl; sq *= smax / sl; }
+    particles[idx].shape_p = sp;
+    particles[idx].shape_q = sq;
 }
 
 @compute @workgroup_size(64)

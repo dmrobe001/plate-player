@@ -32,8 +32,31 @@
 // touching, where the law is stiff again: no overshoot.
 //
 // Stresses are normal stresses on the interface (MPa, + tension), integrated
-// over depth as S (MPa km). Normal only: a tangential (shear) channel needs
-// particle orientations to avoid resisting rigid rotation (design 10).
+// over depth as S (MPa km).
+//
+// Tangential channel (phase G). Each slice also carries a tangential stress
+// tau, a Maxwell element of stiffness G_t = shear_stiffness_ratio x E and the
+// same Maxwell factor r. Its strain increment is the faces' relative sliding
+// over the step, over the rest length:
+//     delta_t = L0 psi - l_a theta_a - l_b theta_b
+// psi the rotation of the pair line, theta the columns' spins, l the levers
+// from each centre to the contact point (l_a + l_b = L0). Rigid rotation
+// (psi = theta_a = theta_b) slides nothing. Caps per slice, symmetric:
+//     friction  phi c + mu max((1 - lambda_pore) P - sigma_n, 0)
+//     (sigma_n the slice's stored normal stress, + tension: compression across
+//     the face strengthens it, tension weakens it, an open crack is frictionless)
+//     or the ductile flow stress, whichever is weaker.
+// Above the cap a brittle slice slips: that is a fault, a jump between the
+// columns, and goes to `slip`. Inelastic shear of a ductile slice is spread
+// through the columns and goes to `ductile`, which changes their shapes
+// (src/columns/shape.js). Plastic work of both kinds feeds damage.
+//
+// Rolling (phase G). Flat faces resist relative rotation of the two columns:
+// a rotation dtheta opens one end of the face and closes the other, a moment
+// K face^2 / (12 rest) dtheta (K the normal stiffness). It decays with the
+// mean Maxwell factor and is capped by the kern rule: the face opens at one
+// end once |M| > (compression + tension cap) x face / 6. Without it a column
+// in a slipping zone could spin like a ball bearing.
 
 import { geotherm, ductile, flowLaw, columnProfile, GRAVITY, SECONDS_PER_MYR } from '../columns/profile.js';
 
@@ -61,7 +84,7 @@ export function slicePressure(prof, d) {
  * Per slice: dz (km), r (Maxwell factor), comp and tens caps (MPa), and
  * whether tension is brittle-limited (cracks) rather than ductile (flows).
  */
-export function edgeSlices(a, b, phi, p) {
+export function edgeSlices(a, b, phi, p, normalStress = null) {
   const top = Math.min(a.elevationKm, b.elevationKm);
   const bottom = Math.max(a.elevationKm - columnDepthKm(a, p), b.elevationKm - columnDepthKm(b, p));
   const overlap = Math.max(top - bottom, 0);
@@ -88,12 +111,16 @@ export function edgeSlices(a, b, phi, p) {
     const ductileCap = 1 / invStrength;
     const brittleComp = phi * p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * pressure;
     const brittle = brittleComp < ductileCap;
+    const sigmaN = normalStress ? normalStress[k] : 0;
+    const brittleShear = phi * p.cohesion_mpa + p.friction_coefficient * Math.max((1 - p.pore_fluid_factor) * pressure - sigmaN, 0);
     slices.push({
       z, dz, T,
       r: 1 / (1 + edtOverEta),
       comp: Math.min(brittleComp, ductileCap) * iface,
       tens: brittle ? phi * p.cohesion_mpa : ductileCap * (1 - p.ductile_damage_weakening * (1 - phi)),
       cracks: brittle,
+      shear: Math.min(brittleShear, ductileCap),
+      slips: brittleShear < ductileCap,
     });
   }
   return { top, bottom, overlap, slices };
@@ -193,4 +220,95 @@ export function healTimeMyr(T, p) {
 export function integrityStep(phi, work, T, p) {
   const damaged = Math.max(phi - work / p.damage_work_mpa_km, 0);
   return 1 - (1 - damaged) * Math.exp(-p.dt_crust_myr / healTimeMyr(T, p));
+}
+
+// --- Tangential channel and rolling (phase G) ------------------------------
+
+/**
+ * Sliding of the faces over the step (unit sphere): positions at the last
+ * update (xa0, xb0; the GPU keeps their difference as the edge's `direction`)
+ * and now (xa, xb), unit vectors; L0 the start distance; f the
+ * lever fraction r_a / (r_a + r_b); spins (rad, CCW about the outward radial).
+ * Positive when b moves along +t = up x n relative to a.
+ */
+export function tangentialDisplacement(xa0, xb0, xa, xb, L0, f, spinA, spinB) {
+  const d0 = xb0.map((v, c) => v - xa0[c]), d = xb.map((v, c) => v - xa[c]);
+  const up = xa.map((v, c) => v + xb[c]), lu = Math.hypot(...up);
+  const cr = [d0[1] * d[2] - d0[2] * d[1], d0[2] * d[0] - d0[0] * d[2], d0[0] * d[1] - d0[1] * d[0]];
+  const psi = Math.atan2((cr[0] * up[0] + cr[1] * up[1] + cr[2] * up[2]) / lu, d0[0] * d[0] + d0[1] * d[1] + d0[2] * d[2]);
+  return L0 * psi - f * L0 * spinA - (1 - f) * L0 * spinB;
+}
+
+/**
+ * Linear tangential law for this step: S_t = S0 + K (delta_t / rest),
+ * clamped to +-Scap. Returns S0, K (MPa km per unit strain), the stiffness
+ * factor K / (E h_ref) (0 = no channel), the offset at zero force (unit
+ * sphere) and the multiplier bound.
+ */
+export function linearizeShear(tau, edge, rest, p) {
+  const E = E_MPA(p), ratio = p.shear_stiffness_ratio;
+  let S0 = 0, K = 0, Scap = 0;
+  edge.slices.forEach((s, k) => {
+    S0 += tau[k] * s.r * s.dz;
+    K += ratio * E * s.r * s.dz;
+    Scap += s.shear * s.dz;
+  });
+  if (!(ratio > 0) || !(edge.overlap > 0)) return { S0: 0, K: 0, stiffness: 0, zeroOffset: 0, Scap: 0, lambdaMax: 0 };
+  const Keff = Math.max(K, 1e-6 * ratio * E * p.stiffness_reference_km);
+  const scale = (p.bond_rate_myr_inv * p.dt_crust_myr * rest) / (E * p.stiffness_reference_km);
+  return { S0, K, stiffness: Keff / (E * p.stiffness_reference_km), zeroOffset: (-S0 / Keff) * rest, Scap, lambdaMax: scale * Scap };
+}
+
+/**
+ * After the solve: advance each slice's tangential stress by the strain
+ * dGamma = delta_t / rest, cap, store. The stiffest slice decides what the
+ * inelastic part is: slip on a fault if it is brittle and at its cap,
+ * distributed (ductile) otherwise. Returns stored stresses, S, work, slip,
+ * ductile and the mean stress.
+ */
+export function maxwellShear(tau, edge, dGamma, p) {
+  const G = p.shear_stiffness_ratio * E_MPA(p);
+  if (!(G > 0)) return { stored: tau.map(() => 0), S: 0, work: 0, slip: 0, ductile: 0, meanStress: 0 };
+  const stored = [];
+  let S = 0, work = 0, rMax = -1, inelastic = 0, faultSlip = false;
+  edge.slices.forEach((s, k) => {
+    const relaxed = (tau[k] + G * dGamma) * s.r;
+    const capped = Math.min(Math.max(relaxed, -s.shear), s.shear);
+    stored.push(capped);
+    S += capped * s.dz;
+    if (relaxed !== capped) work += Math.abs(capped * (relaxed - capped) / (G * Math.max(s.r, 1e-30))) * s.dz;
+    if (s.r > rMax) { rMax = s.r; inelastic = dGamma - (capped - tau[k]) / G; faultSlip = s.slips && relaxed !== capped; }
+  });
+  if (!(edge.overlap > 0)) inelastic = 0;
+  return {
+    stored, S, work,
+    slip: faultSlip ? inelastic : 0, ductile: faultSlip ? 0 : inelastic,
+    meanStress: edge.overlap > 0 ? S / edge.overlap : 0,
+  };
+}
+
+/**
+ * Rolling law for this step: M = M0 + K_r (spin_b - spin_a), clamped to
+ * +-cap. `moment` the stored moment, face the shared boundary (unit sphere),
+ * S0n the start-of-step normal force (MPa km, + tension), Stens the tension
+ * cap. Returns M0, K_r, cap, the solver stiffness factor and offset, and the bound.
+ */
+export function linearizeRolling(moment, edge, face, rest, S0n, Stens, p) {
+  const E = E_MPA(p);
+  let K = 0;
+  edge.slices.forEach((s) => { K += E * s.r * s.dz; });
+  if (!(face > 0) || !(edge.overlap > 0) || !(p.rolling_stiffness_factor > 0)) return { M0: 0, K: 0, cap: 0, stiffness: 0, zeroRotation: 0, lambdaMax: 0 };
+  const rbar = K / (E * edge.overlap);
+  const geom = (p.rolling_stiffness_factor * face * face) / 12;
+  const Keff = Math.max(K, 1e-6 * E * p.stiffness_reference_km);
+  const Kr = (Keff * geom) / rest;
+  const M0 = moment * rbar;
+  const cap = ((Math.max(-S0n, 0) + Stens) * face) / 6;
+  const scale = (p.bond_rate_myr_inv * p.dt_crust_myr * rest) / (E * p.stiffness_reference_km);
+  return { M0, K: Kr, cap, stiffness: (Keff / (E * p.stiffness_reference_km)) * geom, zeroRotation: -M0 / Kr, lambdaMax: scale * cap };
+}
+
+/** The stored moment after the step: M0 + K_r dTheta, capped (the face rocks open beyond it). */
+export function rollingUpdate(lin, dTheta) {
+  return Math.min(Math.max(lin.M0 + lin.K * dTheta, -lin.cap), lin.cap);
 }
