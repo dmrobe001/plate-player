@@ -97,7 +97,9 @@ fn columns_hinge(@builtin(global_invocation_id) id: vec3<u32>) {
             let j = other_end(e, idx);
             if (particles[j].state != 1u) { continue; }
             let fj = profiles[j].freeboard_km;
-            if (!(fi < fj)) { continue; } // equal columns have no polarity: neither goes down
+            // Polarity needs a buoyancy contrast: near-equal columns (within 50 m of
+            // freeboard, e.g. two old ocean columns) have none, and neither goes down.
+            if (!(fi < fj - 0.05)) { continue; }
             let xj = particles[j].position.xyz;
             let ov = contact_length(idx, j, xi, xj) - distance(xi, xj);
             if (ov > best) { best = ov; partner = j; edge = e; }
