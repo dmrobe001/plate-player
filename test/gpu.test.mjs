@@ -1640,8 +1640,7 @@ test('trench hinge: slab pull bends the flap, the contact gives way, the column 
   // A row along the equator: eight bonded old-ocean columns, the last across a
   // broken edge from a four-column continental plate; a slab at the first
   // continental column's position, hanging from the leading ocean column. No
-  // mantle flow: slab pull is the only driver. Damage off (the damage law
-  // tears a plate under slab pull, design 9.2), so the test isolates the hinge.
+  // mantle flow: slab pull is the only driver. Damage off, so the test isolates the hinge.
   const page = await openPage({ small: true });
   const out = await page.evaluate(async () => {
     const a = 0.0175, half = Math.asin(a), N = 8;

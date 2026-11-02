@@ -1273,12 +1273,35 @@ counter (`slabsLost`). Measured:
   the edge behind the hinge: slabs now hang at the trench. (5) The derived Chebyshev ρ
   diverged under concentrated pull (columns jumped ~1,000 km in a step): positions
   extrapolated apart from clamped multipliers (fixed, 5.2).
-- **Still open: the damage law tears plates under slab pull.** Shallow brittle slices
-  crack under a few MPa of tension; their plastic work lowers the whole edge's
-  integrity, the caps fall with it, and the edge behind the hinge fails (strip:
-  integrity 1 → 0.14 in 0.4 Myr). A single integrity per edge couples shallow
-  normal faulting to whole-plate strength. Candidates: damage from the load-bearing
-  slices only, or integrity per slice. Decide with W_D (the handles above).
+- **The damage law did not tear the strip (re-measured with the warm-started solve,
+  5.2).** The earlier finding (integrity 1 → 0.14 in 0.4 Myr) was made under the
+  old extrapolation, which drove columns apart. Now, with a converged solve, the
+  strip runs the same with damage on (W_D = 50) or off until the leading column
+  subducts at 1.5 Myr; integrity behind the hinge only falls to 0.66–0.9. What fails
+  next is not damage: 0.75 Myr after the subduction the detached rest of the strip
+  (no hinge, its slab free) moves at 5 m/yr with strains of order 1 per step, with
+  damage off as well, with the warm start off and with plain Jacobi. Its brittle
+  slices store crack trial stresses several times their caps (137 MPa against 37),
+  which pull back at the cap once the load goes. Not resolved.
+- **The damage law under sustained tension** (CPU reference, one 100 Myr ocean edge
+  at a constant fraction of its intact tension cap, 4,880 MPa·km; dt 0.25 Myr).
+  The ductile base creeps and hands its load to the brittle lid, so the long-term
+  strength without damage is the lid's, ~65% of the cap (90% creeps without bound).
+  Damage removes integrity, and the brittle tension cap scales with integrity
+  (friction included), so damage lowers that strength further:
+
+  | W_D (MPa·km) | 30% | 40% | 60% | 90% |
+  |---|---|---|---|---|
+  | 50 (default) | holds | fails at 39 Myr | 2.75 Myr | 0.25 Myr |
+  | 500 | holds | holds (φ 0.81 at 200 Myr) | 41 Myr | 0.5 Myr |
+  | 5000 | holds | holds | holds | 5 Myr |
+
+  Below ~30% (where the top slice first cracks) nothing is damaged. The strip's slab
+  load (~10¹⁸ N over a 223 km column, ~4.5×10¹² N/m, ~90% of the cap) exceeds even
+  the undamaged long-term strength: no damage law keeps that plate whole. Counting
+  damage as plastic displacement (a slip-weakening distance in km) instead of work
+  does not make it independent of column size, because the creep it follows is a
+  strain spread over the cell.
 - **Two-plate planet (162 columns, 40 Myr):** all 9 seeded slabs hang at first, the
   hinges bend 4–23° and yield plastically; the slabs (1,600 km long, ~5× heavier than
   the plate can hold) neck, and five trench columns subduct within 8 Myr, but as free
