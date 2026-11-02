@@ -1143,54 +1143,44 @@ Measured (software GPU, 162 columns):
   within 1.5 Myr, nothing else subducts, and A pushes B through the trench, both
   turning at ~3.3 cm/yr against A's mantle at 7 (B's mantle at rest).
 
-#### Plan: the trench hinge (in progress)
+#### The trench hinge: findings
 
 A heuristic for the subduction rules, to hold as an outcome, not to be coded: *a
 slab does not disappear before the tile it is dragging has started to subduct.*
-Today every seeded slab breaks it. Slabs sink at a prescribed Stokes rate (~50
-cm/yr at 1,900 km), their edge goes when the depth intervals stop overlapping
-(~100 km), and initiation is a stress timer that solver residual can trip.
-
-The replacement treats subduction as forces and torques on a bend inside the tile.
-- **Bend state per surface column:** a hinge angle β (state), with the plastic part
-  β_p (state). Direction and position are derived each step from geometry. The
-  hinge faces the column's trench partner: a surface neighbour across a broken edge
-  (integrity < 0.5) that is more buoyant, or else the slab hanging from it.
-- **Where the hinge is:** the flexural setback x* = πℓ/4 behind the trench line,
-  with flexural length ℓ = (4D/K)^¼ (where a plate on a buoyant foundation, loaded at
-  its end, bends most; Hetényi). The trench line is the overriding partner's front
-  face, or the hanging slab. The length of tile already past that line, u, is the
-  pair's map-view overlap. Flap length L_f = x* + u; tip depth δ = L_f sin β.
-- **Torque balance about the hinge,** per unit hinge length, solved quasi-statically
-  each step. Drive: the hanging slabs' weight F_s at the tip, plus the negative
-  buoyancy of the underthrust part, w_u (L_f² − x*²)/2. Resistance: the foundation
-  under the outboard part, K x*³/3 per radian; the hinge, elastic D/ℓ up to the
-  plastic moment M_y (integrated slice strength). In-plane compression P makes it
-  less stable: −P L_f per radian. Where the net stiffness goes negative, the bend
-  runs away. The threshold for initiation follows from D, K, M_y, μ and buoyancy.
-- **Contact:** the hinge pair's compression cap falls from the full face strength to
-  the lubricated interface (`slab_interface_weakening`) as the flap tip goes below
-  the overriding column's base (δ / H). Underthrust is not distributed strain, so
-  it feeds no volumetric flow, and the two cells do not clip each other: they
-  overlap, two layers.
-- **Becoming a slab:** when the hinge reaches the tile's back face (u + x* ≥ 2r).
-  This replaces the stress timer and its propagation rule (suturing keeps its
-  timer).
-- **Slabs hang:** a new slab is attached to the tile behind it, and a slab can hang
-  from a slab (a chain). An attached slab has no edges; its top is at the parent's
-  flap tip (or the parent slab's bottom); it moves with the mantle; its weight plus
-  the weight of everything hanging from it loads the parent. Slab pull reaches the
-  plate as a body force on the parent, F_s sin β down-dip (toward the trench). The
-  slab breaks off (becomes free and sinks at the Stokes rate, as before) when its
-  load exceeds the tensile strength of the weaker of the two columns (`slab_attach_factor`
-  scales it; 0 = no attachment). Free slabs keep their edges and today's rules.
-- **Measure:** a counter of slabs lost (broken off or removed) while hanging from a
-  surface tile, the heuristic as a number.
-- **Tests:** CPU: the hinge setback and stiffness against a finite-difference beam
-  on a foundation; the elastic, plastic and runaway branches of the torque balance.
-  GPU: a strip with an overriding block, a hinged ocean column and a hanging slab: the
-  flap goes down, the column subducts, the slab is still attached when it does.
-  Then the two-plate planet.
+Under the stress timer every seeded slab broke it: slabs sank at ~50 cm/yr (Stokes
+size = map width), their edges went at ~100 km depth, and solver residual tripped
+the timer. The trench hinge (section 6) replaces the timer; the heuristic is now a
+counter (`slabsLost`). Measured:
+- **Strip (default resolution, 220 km columns):** the heuristic holds. The leading
+  column bends, goes 145 km under a continent and subducts at 5.25 Myr with its slab
+  still hanging (GPU test, damage off).
+- **Found on the way, and fixed:** (1) the edge law's brittle tension cap was
+  cohesion alone, so a plate could transmit at most ~2×10¹² N/m, less than any
+  lubricated trench contact resists: now Anderson's extension strength (4.5). (2) A
+  contact that gave way only when the flap tip passed the overriding plate's base
+  (100–150 km) could never start: now it gives way with dip, toward the optimal thrust
+  angle. (3) Viscous support from the hang point's motion, and the lagged load, made
+  load and bend flip every step: support now from the plate's feed rate, load
+  under-relaxed. (4) Slabs left at their mantle position fell behind the advancing
+  plate, and the "far-side" arc reset the subducting plate's lithosphere, which ended
+  the edge behind the hinge: slabs now hang at the trench. (5) The derived Chebyshev ρ
+  diverged under concentrated pull (columns jumped ~1,000 km in a step).
+- **Still open: the damage law tears plates under slab pull.** Shallow brittle slices
+  crack under a few MPa of tension; their plastic work lowers the whole edge's
+  integrity, the caps fall with it, and the edge behind the hinge fails (strip:
+  integrity 1 → 0.14 in 0.4 Myr). A single integrity per edge couples shallow
+  normal faulting to whole-plate strength. Candidates: damage from the load-bearing
+  slices only, or integrity per slice. Decide with W_D (the handles above).
+- **Two-plate planet (162 columns, 40 Myr):** all 9 seeded slabs hang at first, the
+  hinges bend 4–23° and yield plastically; the slabs (1,600 km long, ~5× heavier than
+  the plate can hold) neck, and five trench columns subduct within 8 Myr, but as free
+  slabs: the damage law had already broken the edges behind them. Then the trench goes
+  quiet; one slab counted lost while hanging. A 1,900 km column must also go ~1,800 km
+  under before its hinge passes its back face, so subduction there is granular:
+  whole-tile conversion is too coarse at this resolution. A resolution-free
+  alternative: consume the column through its hinge, moving area and volume into its
+  hanging slab as it goes under (the column shrinks from the front, its centroid moving
+  back), so the slab is fed continuously. Not built.
 
 ### 9.3 Physics extensions
 
