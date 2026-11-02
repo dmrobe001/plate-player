@@ -1085,6 +1085,55 @@ Measured (software GPU, 162 columns):
   within 1.5 Myr, nothing else subducts, and A pushes B through the trench, both
   turning at ~3.3 cm/yr against A's mantle at 7 (B's mantle at rest).
 
+#### Plan: the trench hinge (in progress)
+
+A heuristic for the subduction rules, to hold as an outcome, not to be coded: *a
+slab does not disappear before the tile it is dragging has started to subduct.*
+Today every seeded slab breaks it. Slabs sink at a prescribed Stokes rate (~50
+cm/yr at 1,900 km), their edge goes when the depth intervals stop overlapping
+(~100 km), and initiation is a stress timer that solver residual can trip.
+
+The replacement treats subduction as forces and torques on a bend inside the tile.
+- **Bend state per surface column:** a hinge angle β (state), with the plastic part
+  β_p (state). Direction and position are derived each step from geometry. The
+  hinge faces the column's trench partner: a surface neighbour across a broken edge
+  (integrity < 0.5) that is more buoyant, or else the slab hanging from it.
+- **Where the hinge is:** the flexural setback x* = πℓ/4 behind the trench line,
+  with flexural length ℓ = (4D/K)^¼ (where a plate on a buoyant foundation, loaded at
+  its end, bends most; Hetényi). The trench line is the overriding partner's front
+  face, or the hanging slab. The length of tile already past that line, u, is the
+  pair's map-view overlap. Flap length L_f = x* + u; tip depth δ = L_f sin β.
+- **Torque balance about the hinge,** per unit hinge length, solved quasi-statically
+  each step. Drive: the hanging slabs' weight F_s at the tip, plus the negative
+  buoyancy of the underthrust part, w_u (L_f² − x*²)/2. Resistance: the foundation
+  under the outboard part, K x*³/3 per radian; the hinge, elastic D/ℓ up to the
+  plastic moment M_y (integrated slice strength). In-plane compression P makes it
+  less stable: −P L_f per radian. Where the net stiffness goes negative, the bend
+  runs away. The threshold for initiation follows from D, K, M_y, μ and buoyancy.
+- **Contact:** the hinge pair's compression cap falls from the full face strength to
+  the lubricated interface (`slab_interface_weakening`) as the flap tip goes below
+  the overriding column's base (δ / H). Underthrust is not distributed strain, so
+  it feeds no volumetric flow, and the two cells do not clip each other: they
+  overlap, two layers.
+- **Becoming a slab:** when the hinge reaches the tile's back face (u + x* ≥ 2r).
+  This replaces the stress timer and its propagation rule (suturing keeps its
+  timer).
+- **Slabs hang:** a new slab is attached to the tile behind it, and a slab can hang
+  from a slab (a chain). An attached slab has no edges; its top is at the parent's
+  flap tip (or the parent slab's bottom); it moves with the mantle; its weight plus
+  the weight of everything hanging from it loads the parent. Slab pull reaches the
+  plate as a body force on the parent, F_s sin β down-dip (toward the trench). The
+  slab breaks off (becomes free and sinks at the Stokes rate, as before) when its
+  load exceeds the tensile strength of the weaker of the two columns (`slab_attach_factor`
+  scales it; 0 = no attachment). Free slabs keep their edges and today's rules.
+- **Measure:** a counter of slabs lost (broken off or removed) while hanging from a
+  surface tile, the heuristic as a number.
+- **Tests:** CPU: the hinge setback and stiffness against a finite-difference beam
+  on a foundation; the elastic, plastic and runaway branches of the torque balance.
+  GPU: a strip with an overriding block, a hinged ocean column and a hanging slab: the
+  flap goes down, the column subducts, the slab is still attached when it does.
+  Then the two-plate planet.
+
 ### 9.3 Physics extensions
 
 - **Faster bending solve.** Damped Jacobi needs ~(α/ℓ)⁴ sweeps. Chebyshev
