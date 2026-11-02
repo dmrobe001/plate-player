@@ -512,6 +512,10 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       the extrapolated multipliers, each solve is warm-started from the last step's
       edge forces, and ρ is capped by what the iteration budget can use: 32
       iterations do what 256 did (design.md §5.2).
+- [x] ~~The planet could drift as a whole.~~ Each step's area-weighted net
+      rotation is removed (the geodesists' no-net-rotation frame; design.md §5.3).
+      In the two-plate world it was nearly all the motion: the trench is locked
+      and both plates turned together at half the mantle's rate.
 - [x] ~~Growth recreated bond/contact conflicts~~ (a growing particle's bonds
       kept their rest length while collisions pushed to the new apothem sum). A
       bond's rest length is now *always* the sum of its particles' apothems,

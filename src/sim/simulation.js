@@ -37,8 +37,8 @@ const MAX_SOLVER_ITERATIONS = 1024; // size of the Chebyshev weight table
  * bindings.wgsl): counters since load. Volume sums are 64-bit fixed point.
  */
 export const SOLVER_HEADER = {
-  words: 20, edgePoolEmpty: 1, slotOverflow: 2, clippedCells: 3, source: 4, sink: 6, breakups: 8, slabsLost: 9,
-  particleHigh: 10, edgeHigh: 11, dispatch: 12, drawInstances: 18, volumeFixed: 1e12,
+  words: 32, edgePoolEmpty: 1, slotOverflow: 2, clippedCells: 3, source: 4, sink: 6, breakups: 8, slabsLost: 9,
+  particleHigh: 10, edgeHigh: 11, dispatch: 12, drawInstances: 18, netRotationSums: 20, netRotation: 29, volumeFixed: 1e12,
 };
 const WORKGROUP = 64;
 // GPU submissions. Long stretches of GPU work can exceed the browser's GPU
@@ -179,6 +179,7 @@ export class Simulation {
       'solver_find_high', 'solver_dispatch_sizes',
       'solver_begin', 'solver_next_iteration', 'crust_warm_start',
       'crust_clear_deltas', 'crust_solve_edges', 'crust_apply_deltas',
+      'crust_net_rotation_sum', 'crust_net_rotation_solve', 'crust_remove_net_rotation',
       'crust_integrate',
     ];
     this.pipelines = Object.fromEntries(entryPoints.map((entryPoint) => [
@@ -477,6 +478,13 @@ export class Simulation {
       run('crust_apply_deltas', crust);
       run('solver_next_iteration', 1);
     }
+    // No net rotation (design 5.3): the planet's mean rigid rotation this step
+    // is measured and removed, before the stresses are updated.
+    if (this.params.remove_net_rotation) {
+      run('crust_net_rotation_sum', crust);
+      run('crust_net_rotation_solve', 1);
+      run('crust_remove_net_rotation', crust);
+    }
     run('crust_clear_deltas', crust);
     run('edges_maxwell', edges);     // slice stresses, inelastic strain, plastic work, integrity (design 4.5, 4.7)
     run('columns_flow', crust);      // volumetric flow at fixed crust volume (design 4.7)
@@ -501,9 +509,11 @@ export class Simulation {
   async counters() {
     const h = new Uint32Array((await this.readBuffers(['solver'])).solver, 0, SOLVER_HEADER.words);
     const sum = (k) => (h[k + 1] * 4294967296 + h[k]) / SOLVER_HEADER.volumeFixed;
+    const theta = new Float32Array(h.buffer, 4 * SOLVER_HEADER.netRotation, 3);
     return {
       volumeSource: sum(SOLVER_HEADER.source), volumeSink: sum(SOLVER_HEADER.sink), breakups: h[SOLVER_HEADER.breakups],
       slabsLost: h[SOLVER_HEADER.slabsLost], // slabs broken off or removed while hanging from a surface column (design 9.2)
+      netRotation: Array.from(theta, (v) => v / this.params.dt_crust_myr), // removed in the last step, rad/Myr (design 5.3)
       clippedCells: h[SOLVER_HEADER.clippedCells], edgePoolEmpty: h[SOLVER_HEADER.edgePoolEmpty], slotOverflow: h[SOLVER_HEADER.slotOverflow],
     };
   }

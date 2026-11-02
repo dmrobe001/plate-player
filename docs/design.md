@@ -734,6 +734,7 @@ writes named buffers only, so any one can be run alone on dumped or synthetic in
  7. solve           warm start (positions to last step's edge forces); solver_iterations
                     (32) sweeps: all edges' normal, tangential and rolling rows (Jacobi),
                     Chebyshev extrapolation of the normal multipliers (5.2)
+ 7b. no net rotation  the area-weighted rigid rotation of the step removed (5.3)
  8. irreversible    slice stresses, inelastic strain, slip, plastic work, integrity, moment,
                     edge timers and suturing (4.7, 6); area and shape (4.7)
  9. integrate       position = solved position; velocity (diagnostic); body axis carried and
@@ -854,7 +855,44 @@ positions rigidly without a matching λ would change the physics, and a matching
 needs the global solve being accelerated. Alternatives, if iterations become too
 costly at fine resolution, are in section 9.3.
 
-### 5.3 Parallelism and determinism
+### 5.3 No net rotation
+
+Each step, after the solve and before the irreversible updates, the planet's net
+rotation is removed (`remove_net_rotation`, on by default; `crust_net_rotation_*` in
+`solver.wgsl`, CPU reference `netRotation` in `src/geometry/net-rotation.js`). The
+net rotation is the rotation vector θ that best explains the step's displacements
+u = x̃ − x of the surface columns as one rigid rotation, weighted by cell area:
+it minimises Σ a |u − θ × x|², so I θ = L with L = Σ a x × u and I = Σ a (1 − x xᵀ).
+On a fully covered sphere I = (2/3)·4π·1, and θ is the area-mean of x × u. Every
+column, slabs included, is then turned by −θ, and its spin loses θ·x, so no
+length and no face sliding changes. Velocities, Euler poles and arrows are therefore
+in the no-net-rotation (NNR) frame that geodesy uses for plate motions.
+
+- GPU: a shared-memory reduction per workgroup, one float atomic per workgroup and
+  sum, a one-thread 3×3 solve. A patch too small to define a rotation (I nearly
+  singular) removes nothing. Small angles use series for sin and cos: WGSL allows
+  them ~5×10⁻⁴ absolute error, more than a step's whole rotation (the first version
+  misplaced columns by 3×10⁻⁵ rad that way).
+- Turning by −θ removes θ to first order; what is left is ~|θ|·|u|, 10⁻⁴ of θ in
+  the test's 0.03 rad step and far less at real step sizes (~10⁻⁴ rad).
+- It is a frame change for the crust only: the mantle is not turned with it, so the
+  next step's drag is computed against the mantle where it is. In effect the crust
+  gets whatever uniform torque cancels its net rotation, and stays registered to
+  the mantle's pattern instead of drifting over it. A lava-lamp mantle has no net
+  rotation of its own (a gradient flow), so there the removed part comes from the
+  crust: drag varying with lithosphere thickness, and slab and GPE forces.
+- Mechanism tests on an empty page turn it off: on a patch it would remove the
+  patch's own rigid motion.
+
+Measured (two-plate world, software GPU): the removed rotation is a steady
+0.34°/Myr about the mantle's Euler pole, half the mantle's 0.72°/Myr, and what is
+left is 10⁻⁵ of it. Without the removal both plates turn together at ~0.33°/Myr
+(each half's fit about the pole: 0.31–0.37°/Myr over 1.5 Myr) — the trench is
+locked (9.2), and the two plates move as one shell dragged by half the mantle. With
+it, each plate's rotation about the pole is under 0.04°/Myr and the rms speed
+0.3–0.9 cm/yr: the net rotation was nearly all of the motion.
+
+### 5.4 Parallelism and determinism
 
 - Jacobi sweeps with per-iteration integer atomics; no graph colouring.
 - Thread-timing-dependent behaviour (free-list pops, edge creation order, which free
@@ -1204,8 +1242,10 @@ Measured (software GPU, 162 columns):
   lifetime bounds it: slabs sink at w ∝ column width (`slab_sink_rate_km_myr`), so
   1,900 km wide slabs sink ~50 cm/yr and are gone in ~1.3 Myr, and their pull needs
   several steps.
-- **With 32 cold-started iterations at dt ≤ 0.25 the trench locked** (not re-measured
-  with the warm start): the seeded slabs drop out
+- **With 32 cold-started iterations at dt ≤ 0.25 the trench locked** (with the warm
+  start it is still locked over the first 16 Myr: both halves turn at 0.31–0.37°/Myr
+  about the mantle's pole, i.e. ~3 cm/yr rms, until the net rotation is removed, 5.3,
+  and then barely move): the seeded slabs drop out
   within 1.5 Myr, nothing else subducts, and A pushes B through the trench, both
   turning at ~3.3 cm/yr against A's mantle at 7 (B's mantle at rest).
 

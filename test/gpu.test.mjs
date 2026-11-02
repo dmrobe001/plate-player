@@ -28,6 +28,7 @@ import { Edge, Particle, SLOTS, unpack } from '../src/gpu/layout.js';
 import { checkEdgeStorage } from '../src/edges/topology.js';
 import { readZip } from '../src/record/zip.js';
 import { createIcosphere } from '../src/geometry/icosphere.js';
+import { netRotation, rotate } from '../src/geometry/net-rotation.js';
 import { CHAIN, chainExact, chainState } from './support/chain.mjs';
 import { tessellate } from '../src/columns/area.js';
 import { splitColumn, volumeStep } from '../src/columns/volume.js';
@@ -65,6 +66,9 @@ async function openPage({ small = false, query = '', world = 'random' } = {}) {
   page.on('console', (m) => { if (m.type() === 'error' && !m.text().includes('favicon')) errors.push(m.text()); });
   await page.goto(PAGE.replace('world=random', `world=${world}`) + (small ? SMALL_PAGE : '') + query);
   await page.waitForFunction(() => window.plate?.ready, null, { timeout: 120_000 });
+  // Mechanism tests on an empty page work in a fixed frame: no net rotation
+  // removed (it would remove a patch's own rigid motion; design 5.3).
+  if (small || query.includes('empty')) await page.evaluate(() => plate.setParams({ remove_net_rotation: 0 }));
   page.errors = errors;
   return page;
 }
@@ -1690,4 +1694,57 @@ test('trench hinge: slab pull bends the flap, the contact gives way, the column 
   assert.equal(down.lost, 0);
   assert.ok(rows.every((r) => r.continents.every((x) => x === 1)), 'continents never subduct');
   assert.ok(Math.abs(down.sinkStep / down.leadVolume - 1) < 1e-4, 'its volume leaves the surface budget');
+});
+
+test('no net rotation: the GPU removes the area-weighted rigid rotation of the mantle-driven motion, as the reference does, and keeps the rest', { timeout: 300_000 }, async () => {
+  const { pts, spacing, state } = sphereState();
+  const theta = [0.02, -0.01, 0.015], c = [0.01, 0.02, -0.005]; // rad/Myr: a rigid rotation plus a gradient flow (c - (c.x) x)
+  const page = await openPage(SPHERE_PAGE);
+  const out = await page.evaluate(async ([st, params, readSrc, theta, c]) => {
+    const read = eval(readSrc);
+    await plate.setParams({ ...params, mantle_drive: 1, remove_net_rotation: 1, dt_crust_myr: 1 });
+    const restore = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, Array.isArray(v) ? Float32Array.from(v) : v]));
+    await plate.loadState({ ...st, particles: restore(st.particles), bonds: restore(st.bonds) });
+    const m = plate.sim.mantle, pos = m.mesh.pos;
+    for (let i = 0; i < m.mesh.n; i++) {
+      const x = [pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]], d = c[0] * x[0] + c[1] * x[1] + c[2] * x[2];
+      const w = [theta[1] * x[2] - theta[2] * x[1], theta[2] * x[0] - theta[0] * x[2], theta[0] * x[1] - theta[1] * x[0]];
+      for (let k = 0; k < 3; k++) m.velocity[3 * i + k] = w[k] + c[k] - d * x[k];
+    }
+    m.advanceTo = () => false; // keep this flow
+    plate.sim.uploadMantle();
+    const before = await read(st.particles.count, ['position', 'mantle_node']);
+    await plate.runSteps(1);
+    const after = await read(st.particles.count, ['position', 'cell_area', 'state']);
+    const h = new Float32Array((await plate.readBuffers(['solver'])).solver, 0, 32);
+    return { before, after, removed: Array.from(h.subarray(29, 32)), mantle: Array.from(m.velocity) };
+  }, [jsonState(state), SPHERE_PARAMS(spacing), READ_COLUMNS, theta, c]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+  const n = pts.length;
+  const v4 = (a, i) => [a[4 * i], a[4 * i + 1], a[4 * i + 2]];
+  const x0 = [], u = [], area = [];
+  for (let i = 0; i < n; i++) {
+    const x = v4(out.before.position, i), node = out.before.mantle_node[i];
+    const y = x.map((v, k) => v + out.mantle[3 * node + k]), l = Math.hypot(...y);
+    x0.push(x); u.push(y.map((v, k) => v / l - x[k])); area.push(out.after.cell_area[i]);
+  }
+  assert.ok(out.after.state.every((s) => s === 1));
+  // The rotation removed: the reference's, from the same displacements and areas.
+  const ref = netRotation(x0, u, area);
+  const err = Math.hypot(...out.removed.map((v, k) => v - ref[k])) / Math.hypot(...ref);
+  // What is left: each column where the reference puts it, and no net rotation.
+  let worst = 0;
+  const left = x0.map((x, i) => {
+    const want = rotate(x.map((v, k) => v + u[i][k]), ref.map((v) => -v)), got = v4(out.after.position, i);
+    worst = Math.max(worst, Math.hypot(...got.map((v, k) => v - want[k])));
+    return got.map((v, k) => v - x[k]);
+  });
+  const residual = Math.hypot(...netRotation(x0, left, area));
+  console.log(`  imposed ${Math.hypot(...theta).toFixed(4)} rad: removed ${Math.hypot(...out.removed).toFixed(4)} (vs reference ${err.toExponential(1)}); worst column ${worst.toExponential(1)} rad; net rotation left ${residual.toExponential(1)} rad`);
+  assert.ok(err < 1e-4, `removed ${out.removed} vs reference ${ref}`);
+  assert.ok(worst < 1e-5);
+  // (Turning by -theta removes theta to first order; the rest is ~theta |u|,
+  // here 0.03 rad of motion in one step, ~100x a fast plate's.)
+  assert.ok(residual < 1e-3 * Math.hypot(...theta));
 });

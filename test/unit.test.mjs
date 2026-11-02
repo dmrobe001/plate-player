@@ -1109,3 +1109,35 @@ test('hinge: column strength in bending and in tension from its slices', () => {
   const b = hinge.columnStrength([{ depthKm: 5, thicknessKm: 10, pressureMpa: 100, ductileMpa: 1e6 }], p);
   assert.ok(Math.abs(b.tensileStrength / ((20 + 0.6 * 0.6 * 100) / 3.1196 * 10 * 1e9) - 1) < 1e-4); // brittle: / Anderson's ratio, as the edge law
 });
+
+// ---------------------------------------------------------------------------
+// No net rotation (design 5.3)
+import { netRotation, rotate } from '../src/geometry/net-rotation.js';
+import { cross } from '../src/geometry/vec.js';
+
+test('net rotation: recovers a rigid rotation; a gradient flow has none; removal leaves none, on the sphere and on a patch', () => {
+  const pts = createIcosphere(3).vertices;
+  const rng = mulberry32(7);
+  const w = pts.map(() => 0.5 + rng());
+  const theta = [0.003, -0.001, 0.002];
+  // Gradient of a scalar (c . x) on the sphere: c - (c . x) x. Poloidal, so no net rotation.
+  const c = [0.002, 0.004, -0.001];
+  const grad = (x) => { const d = c[0] * x[0] + c[1] * x[1] + c[2] * x[2]; return c.map((v, k) => v - d * x[k]); };
+  const rigid = (x) => cross(theta, x);
+  const close = (a, b, tol) => a.every((v, k) => Math.abs(v - b[k]) < tol);
+  // Equal weights on the near-uniform icosphere: the gradient part vanishes.
+  const ones = pts.map(() => 1);
+  assert.ok(close(netRotation(pts, pts.map((x) => rigid(x).map((v, k) => v + grad(x)[k])), ones), theta, 2e-5));
+  // Any weights: a pure rigid rotation is recovered exactly.
+  assert.ok(close(netRotation(pts, pts.map(rigid), w), theta, 1e-15));
+  // Removing theta from finite displacements (rotation by -theta) leaves none.
+  for (const subset of [pts, pts.filter((x) => x[2] > 0.6)]) {
+    const ws = subset.map((_, i) => w[i]);
+    const u = subset.map((x) => { const y = rotate(x, theta).map((v, k) => v + grad(x)[k]); const l = Math.hypot(...y); return y.map((v, k) => v / l - x[k]); });
+    const t = netRotation(subset, u, ws);
+    const u2 = subset.map((x, i) => rotate(subset[i].map((v, k) => v + u[i][k]), t.map((v) => -v)).map((v, k) => v - x[k]));
+    assert.ok(Math.hypot(...netRotation(subset, u2, ws)) < 1e-3 * Math.hypot(...theta), `${subset.length} points`);
+  }
+  // A single column cannot define a rotation.
+  assert.deepEqual(netRotation([[0, 0, 1]], [[0.01, 0, 0]], [1]), [0, 0, 0]);
+});

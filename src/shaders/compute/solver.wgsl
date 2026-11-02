@@ -280,3 +280,87 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
     atomicStore(&particle_deltas[idx].child_load, 0u);
     particles[idx].slab_child = NONE;
 }
+
+// No net rotation (design 5.3; netRotation in src/geometry/net-rotation.js).
+// The rotation vector theta that best explains this step's displacements u
+// (predicted - position) of the surface columns as one rigid rotation, in
+// the area-weighted least-squares sense: minimise sum a |u - theta x x|^2,
+// so I theta = L with L = sum a x cross u and I = sum a (1 - x x^T). Each
+// workgroup sums its columns in shared memory, then adds its partial sums
+// to the solver header (float atomics: one per workgroup and word).
+var<workgroup> net_rotation_partial: array<array<f32, 9>, 64>;
+
+@compute @workgroup_size(64)
+fn crust_net_rotation_sum(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let i = id.x;
+    var s: array<f32, 9>;
+    if (i < sim.max_particles && particles[i].is_active != 0u && particles[i].state == 1u) {
+        let x = particles[i].position.xyz;
+        let u = particles[i].predicted_pos.xyz - x;
+        let a = select(particles[i].area_ref, particles[i].cell_area, particles[i].cell_area > 0.0);
+        let l = a * cross(x, u);
+        s = array<f32, 9>(l.x, l.y, l.z,
+            a * (1.0 - x.x * x.x), a * (1.0 - x.y * x.y), a * (1.0 - x.z * x.z),
+            -a * x.x * x.y, -a * x.x * x.z, -a * x.y * x.z);
+    }
+    net_rotation_partial[li] = s;
+    workgroupBarrier();
+    for (var stride = 32u; stride > 0u; stride = stride / 2u) {
+        if (li < stride) {
+            for (var k = 0u; k < 9u; k++) { net_rotation_partial[li][k] += net_rotation_partial[li + stride][k]; }
+        }
+        workgroupBarrier();
+    }
+    if (li == 0u) {
+        for (var k = 0u; k < 9u; k++) { atomic_add_f32(&solver.net_rotation_sums[k], net_rotation_partial[0][k]); }
+    }
+}
+
+// Solve I theta = L (one thread) and clear the sums for the next step. A
+// patch too small to define a rotation (I nearly singular) removes nothing.
+@compute @workgroup_size(1)
+fn crust_net_rotation_solve() {
+    var v: array<f32, 9>;
+    for (var k = 0u; k < 9u; k++) {
+        v[k] = bitcast<f32>(atomicLoad(&solver.net_rotation_sums[k]));
+        atomicStore(&solver.net_rotation_sums[k], 0u);
+    }
+    let L = vec3f(v[0], v[1], v[2]);
+    let I = mat3x3f(vec3f(v[3], v[6], v[7]), vec3f(v[6], v[4], v[8]), vec3f(v[7], v[8], v[5]));
+    let t = (v[3] + v[4] + v[5]) / 3.0;
+    let det = determinant(I);
+    var theta = vec3f(0.0);
+    if (t > 0.0 && det > 1e-3 * t * t * t) {
+        // Inverse by cofactors (I is symmetric).
+        let c0 = cross(I[1], I[2]);
+        let c1 = cross(I[2], I[0]);
+        let c2 = cross(I[0], I[1]);
+        theta = (c0 * L.x + c1 * L.y + c2 * L.z) / det;
+    }
+    solver.net_rotation[0] = theta.x;
+    solver.net_rotation[1] = theta.y;
+    solver.net_rotation[2] = theta.z;
+}
+
+// Turn every column (surface and slab) by -theta: a change of frame, so it
+// changes no length, and each column's spin loses theta's radial component,
+// which keeps the faces' sliding unchanged (bindings.wgsl, tangential_displacement).
+@compute @workgroup_size(64)
+fn crust_remove_net_rotation(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i >= sim.max_particles || particles[i].is_active == 0u) { return; }
+    let theta = vec3f(solver.net_rotation[0], solver.net_rotation[1], solver.net_rotation[2]);
+    let angle = length(theta);
+    if (!(angle > 0.0)) { return; }
+    let k = theta / angle;
+    let p = particles[i].predicted_pos.xyz;
+    // Rodrigues, angle -angle about k. WGSL's sin and cos may err by ~5e-4
+    // (absolute), more than a step's whole rotation, so small angles use
+    // their series (error ~angle^5 / 120).
+    let a2 = angle * angle;
+    let s = select(sin(angle), angle * (1.0 - a2 / 6.0 * (1.0 - a2 / 20.0)), angle < 0.1);
+    let one_minus_c = select(1.0 - cos(angle), 0.5 * a2 * (1.0 - a2 / 12.0 * (1.0 - a2 / 30.0)), angle < 0.1);
+    let q = p - cross(k, p) * s + cross(k, cross(k, p)) * one_minus_c;
+    particles[i].predicted_pos = vec4f(normalize(q), particles[i].predicted_pos.w);
+    particles[i].spin -= dot(theta, particles[i].position.xyz);
+}

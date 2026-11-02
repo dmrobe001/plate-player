@@ -43,6 +43,11 @@ export const SIM_PARAMS = [
   // elastic stress (and positions move to match), so a step's solve corrects
   // the increment instead of rebuilding the whole stress from zero (design 5.2).
   ['solver_warm_start', 'u32', 1],
+  // No net rotation (design 5.3): each step, the area-weighted mean rigid
+  // rotation of the surface columns is removed from the whole planet (a frame
+  // choice, as in geodesy's no-net-rotation frame). 0 = keep it (mechanism
+  // tests on a patch, where "the whole planet" is not meant).
+  ['remove_net_rotation', 'u32', 1],
   // Lithosphere Young's modulus. With 32 Chebyshev-accelerated iterations the
   // solve converges well enough that residual stresses stay at a few MPa
   // (design.md, Chebyshev findings); plain Jacobi needed a 2 GPa stop-gap.

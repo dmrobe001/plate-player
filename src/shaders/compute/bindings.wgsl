@@ -52,14 +52,20 @@ struct ParticleDelta {
 // slot high-water marks (one past the highest particle / edge slot ever
 // used; the free lists hand out the lowest free slot first, so these track
 // the live problem size) and the indirect dispatch sizes and draw instance
-// count made from them (solver_dispatch_sizes); then the Chebyshev weight for
-// each iteration (written by simulation.js; see chebyshevWeights).
+// count made from them (solver_dispatch_sizes); then the net rotation sums
+// and the rotation removed this step (crust_net_rotation_*, solver.wgsl);
+// then the Chebyshev weight for each iteration (written by simulation.js; see
+// chebyshevWeights).
 struct SolverState {
     iteration: u32, edge_pool_empty: atomic<u32>, slot_overflow: atomic<u32>, clipped_cells: atomic<u32>,
     budget: array<atomic<u32>, 4>,   // source lo, hi; sink lo, hi
     breakups: atomic<u32>, slabs_lost: atomic<u32>, particle_high: atomic<u32>, edge_high: atomic<u32>,
     dispatch: array<u32, 6>,   // workgroups x, y, z over particle slots, then over edge slots
     draw_instances: u32, pad19: u32,
+    // Area-weighted sums over surface columns, f32 bits: L = sum a x cross u
+    // (3), then I = sum a (1 - x x^T) as xx, yy, zz, xy, xz, yz (6).
+    net_rotation_sums: array<atomic<u32>, 9>,
+    net_rotation: array<f32, 3>,   // rotation vector removed this step (rad)
     omega: array<f32>,
 }
 const BUDGET_SOURCE: u32 = 0u;
