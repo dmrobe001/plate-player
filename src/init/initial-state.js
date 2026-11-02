@@ -181,7 +181,7 @@ function relax(position, contact, iterations) {
  * when the largest |C| / (a_i + a_j) is below `tolerance`. Modifies
  * `position` (renormalised onto the sphere); returns the apothems.
  */
-function fitApothems(position, apothem0, bonds, tolerance, iterations) {
+export function fitApothems(position, apothem0, bonds, tolerance, iterations) {
   const p = position, n = p.length / 3;
   const a = new Float64Array(n).fill(apothem0);
   const key = (i, j) => (i < j ? i * n + j : j * n + i);

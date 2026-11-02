@@ -8,6 +8,8 @@ import { initDevice } from './gpu/device.js';
 import { SphereMesh } from './mantle/sphere-mesh.js';
 import { Mantle, MANTLE_DEFAULTS } from './mantle/mantle.js';
 import { generateInitialState, INIT_DEFAULTS } from './init/initial-state.js';
+import { generateTwoPlateState, TWO_PLATE_DEFAULTS } from './init/two-plate.js';
+import { KinematicMantle } from './mantle/kinematic.js';
 import { Simulation } from './sim/simulation.js';
 import { Renderer } from './render/renderer.js';
 import { OrbitCamera } from './render/camera.js';
@@ -102,6 +104,8 @@ async function main() {
   const urlSeed = Number.parseInt(query.get('seed'), 10);
   if (Number.isFinite(urlSeed)) $('seed').value = urlSeed;
   if (query.has('paused')) $('pause').checked = true;
+  // ?world=random|two-plate: which world Regenerate builds (default: the two-plate test planet).
+  if (['random', 'two-plate'].includes(query.get('world'))) $('world').value = query.get('world');
 
   // The simulation advances only when nothing asynchronous (a readback for
   // recording, a restore) is in flight, so every record is taken at an exact step.
@@ -138,15 +142,29 @@ async function main() {
     if (want.fields || want.snapshot) await recorder.capture(want, snap);
   }
 
-  function regenerate(seed = Number.parseInt($('seed').value, 10) || 0, options = {}) {
+  function regenerate(seed = Number.parseInt($('seed').value, 10) || 0, options = {}, world = $('world').value) {
     return exclusive(async () => {
       $('seed').value = seed;
+      $('world').value = world;
       const t0 = performance.now();
-      const initOptions = { ...INIT_DEFAULTS, ...options, seed };
-      const state = generateInitialState(initOptions);
-      // The mantle runs alone first, so the crust never sees its artificial start.
-      const mantle = new Mantle(seed, {}, mantleMesh);
-      mantle.spinUp();
+      let state, mantle, initOptions;
+      if (world === 'two-plate') {
+        // Deterministic (no seed); its own parameters scale lengths with its column size.
+        initOptions = { ...TWO_PLATE_DEFAULTS, ...options, world };
+        state = generateTwoPlateState(initOptions);
+        sim.resetParams(state.params);
+        mantle = new KinematicMantle(state.mantle, mantleMesh);
+        // Face the trench, turned toward plate A: the continent, the trench and the incoming microcontinent.
+        const { q, normal: m } = state.frame;
+        camera.lookToward(q.map((v, c) => -0.8 * v + 0.6 * m[c]));
+      } else {
+        initOptions = { ...INIT_DEFAULTS, ...options, seed, world };
+        state = generateInitialState(initOptions);
+        sim.resetParams({});
+        // The mantle runs alone first, so the crust never sees its artificial start.
+        mantle = new Mantle(seed, {}, mantleMesh);
+        mantle.spinUp();
+      }
       sim.load(state, mantle);
       initStats = { ...state.stats, seed, ms: performance.now() - t0 };
       recorder.reset({ seed, init_options: initOptions, init_stats: state.stats, restarted_from: null });
@@ -198,6 +216,7 @@ async function main() {
   }
 
   $('regenerate').addEventListener('click', () => regenerate());
+  $('world').addEventListener('change', () => regenerate());
   $('snapshotNow').addEventListener('click', () => exclusive(() => recorder.capture({ fields: false, snapshot: true })));
   $('downloadRecord').addEventListener('click', () => exclusive(() => {
     download(recorder.exportZip(), `plate-player_seed${$('seed').value}_step${sim.steps}.zip`);
@@ -268,6 +287,7 @@ async function main() {
       showMantle: $('showMantle').checked,
       colorByPlate: $('colorByPlate').checked,
       showForce: $('showForce').checked,
+      showVelocity: $('showVelocity').checked,
       showStress: $('showStress').checked,
       stressRefMPa: stressRef(),
     });
@@ -278,7 +298,8 @@ async function main() {
       lastStatsUpdate = now;
       const fmt = (v, d = 2) => (typeof v === 'number' ? v.toFixed(d) : '–');
       showStats([
-        ['Seed', initStats.seed],
+        ['World', initStats.world ?? 'random'],
+        ['Seed', initStats.world === 'two-plate' ? '– (deterministic)' : initStats.seed],
         ['Initial particles', initStats.particles ?? '–'],
         ['Bonds per particle', fmt(initStats.bondsPerParticle)],
         ['Continental fraction', fmt(initStats.continentalFraction)],

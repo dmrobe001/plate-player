@@ -17,6 +17,12 @@
       </summary>
 
       <div class="controls">
+        <label class="row">World
+          <select id="world">
+            <option value="two-plate" selected>Two plates (162 columns)</option>
+            <option value="random">Random planet (~10k columns)</option>
+          </select>
+        </label>
         <label class="row">Seed
           <input id="seed" type="number" min="0" step="1" value="1">
           <button id="regenerate" type="button">Regenerate</button>
@@ -25,7 +31,8 @@
         <label class="row"><input id="spin" type="checkbox"> Auto-spin globe</label>
         <label class="row"><input id="showMantle" type="checkbox" checked> Show mantle</label>
         <label class="row"><input id="colorByPlate" type="checkbox"> Colour by plate</label>
-        <label class="row" title="Sum of the forces the edges exert on each column (balanced by basal drag), drawn as a traction: force / (depth x column width)"><input id="showForce" type="checkbox" checked> Net force arrows</label>
+        <label class="row" title="Sum of all forces on each column: its edges, basal drag and the GPE push. The model has no inertia, so this is zero in a converged solve: what is left is the solver's residual. Drawn as a traction: force / (depth x column width)"><input id="showForce" type="checkbox"> Net force arrows (residual)</label>
+        <label class="row" title="Mantle flow beneath each column (cyan) and the column's own velocity (magenta); one apothem = 5 cm/yr"><input id="showVelocity" type="checkbox" checked> Mantle / column velocity</label>
         <label class="row" title="Principal axes of each column's stress tensor: arrows out = tension, in = compression"><input id="showStress" type="checkbox" checked> Principal stress arrows</label>
         <label class="row" title="Stress at which an arrow is one apothem long">Arrow scale
           <input id="stressRef" type="range" min="0" max="3" step="0.05" value="2.18">
@@ -39,6 +46,8 @@
         <div class="key"><span class="item"><span class="swatch compression"></span>&rarr;&larr; compression</span>
           <span class="item"><span class="swatch tension"></span>&larr;&rarr; tension</span>
           <span class="item"><span class="swatch force"></span>net force</span>
+          <span class="item"><span class="swatch mantle"></span>mantle</span>
+          <span class="item"><span class="swatch column"></span>column</span>
           <span class="item"><span class="swatch slab"></span>slab</span></div>
       </div>
 

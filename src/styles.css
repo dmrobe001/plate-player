@@ -95,6 +95,8 @@ button:hover { border-color: var(--accent); }
 .swatch.tension { background: #fff; }
 .key .item { white-space: nowrap; margin-right: 4px; }
 .swatch.force { background: #ffd126; }
+.swatch.mantle { background: #26d9f2; }
+.swatch.column { background: #f040d9; }
 .swatch.slab { width: 10px; height: 10px; border-radius: 50%; background: #fff; }
 
 .record { margin: 10px 0 0; padding: 6px 8px 8px; border: 1px solid var(--border); border-radius: 6px; display: grid; gap: 6px; }

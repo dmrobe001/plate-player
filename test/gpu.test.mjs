@@ -44,7 +44,7 @@ const jsonState = (st) => ({
 const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 
-const PAGE = pathToFileURL(fileURLToPath(new URL('../dist/plate-player.html', import.meta.url))).href + '?paused';
+const PAGE = pathToFileURL(fileURLToPath(new URL('../dist/plate-player.html', import.meta.url))).href + '?paused&world=random';
 const SMALL_PAGE = '&empty&capacity=1024';
 const PLANET = process.env.PLATE_PLANET === '1' ? {} : { skip: 'planet-scale; set PLATE_PLANET=1' };
 const MAX_PARTICLES = 25000;      // planet pages only
@@ -58,12 +58,12 @@ test.before(async () => { browser = await chromium.launch({ headless: false, arg
 test.after(async () => { await browser?.close(); });
 
 /** A page with a generated planet, or (small = true) an empty page with small buffers. */
-async function openPage({ small = false, query = '' } = {}) {
+async function openPage({ small = false, query = '', world = 'random' } = {}) {
   const page = await browser.newPage({ viewport: { width: 320, height: 240 } });
   const errors = [];
   page.on('pageerror', (e) => errors.push(e.message));
   page.on('console', (m) => { if (m.type() === 'error' && !m.text().includes('favicon')) errors.push(m.text()); });
-  await page.goto(PAGE + (small ? SMALL_PAGE : '') + query);
+  await page.goto(PAGE.replace('world=random', `world=${world}`) + (small ? SMALL_PAGE : '') + query);
   await page.waitForFunction(() => window.plate?.ready, null, { timeout: 120_000 });
   page.errors = errors;
   return page;
@@ -1592,4 +1592,37 @@ test('spreading elongates columns along the pull and splits them into rows acros
   assert.ok(sh.aspects.every((x) => Math.abs(x / sh.cap - 1) < 0.01), 'aspect ratio at the cap');
   assert.ok(sh.areas.every((x) => Math.abs(x - 1) < 0.05), 'shear changed area');
   assert.ok(sh.lost > 0, 'pairs leave range past the cap');
+});
+
+// --- The two-plate test planet (src/init/two-plate.js; design 9.2) ----------
+
+test('two-plate planet: loads with its own scaled parameters and steps without NaN, losing no coverage', { timeout: 300_000 }, async () => {
+  const page = await openPage({ world: 'two-plate', query: '&capacity=2048' });
+  const out = await page.evaluate(async () => {
+    const { sim, layout } = plate;
+    const read = async () => {
+      const buf = (await plate.readBuffers(['particles'])).particles;
+      const f = new Float32Array(buf), u = new Uint32Array(buf), o = layout.Particle.offsets, W = layout.Particle.words;
+      let n = 0, slabs = 0, area = 0, nan = 0;
+      for (let i = 0; i < sim.params.max_particles; i++) {
+        if (!u[i * W + o.is_active]) continue;
+        n++;
+        if ([0, 1, 2].some((c) => Number.isNaN(f[i * W + o.position + c]) || Number.isNaN(f[i * W + o.velocity + c]))) nan++;
+        if (u[i * W + o.state] === 2) slabs++; else area += f[i * W + o.cell_area];
+      }
+      return { n, slabs, nan, coverage: area / (4 * Math.PI) };
+    };
+    const before = await read();
+    await plate.runSteps(4);
+    return { before, after: await read(), params: { ...sim.overrides }, mantle: sim.mantle.kind };
+  });
+  console.log(`  ${JSON.stringify(out)}`);
+  assert.equal(out.mantle, 'kinematic');
+  assert.equal(out.before.n, 162);
+  assert.ok(out.before.slabs > 0);
+  assert.ok(out.params.hash_grid_dim < 32 && out.params.base_apothem > 0.1, 'coarse world: scaled parameters');
+  assert.equal(out.after.nan, 0);
+  assert.ok(out.after.coverage > 0.97, 'surface stays covered');
+  assert.deepEqual(page.errors, []);
+  await page.close();
 });

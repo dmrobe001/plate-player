@@ -1032,6 +1032,59 @@ intended); no slab forms in 20 steps (the window is 1 Myr); a 10× time step (1.
 per step) stays bounded (p99 speed 5.9 cm/yr, max 24); a record resumed in a fresh
 page continues the run.
 
+#### The two-plate test planet
+
+Integration starts on a planet built so that every mechanism should happen once, in
+order, at the coarsest resolution that still resolves them (`src/init/two-plate.js`,
+the page's default world). Columns per feature, not particles per planet, set that
+resolution: a continent needs ≥ 7 columns (one interior column), an ocean ≥ 4 from
+ridge to trench (an age gradient), a ridge or trench ≥ 5 along its length, a slab
+chain 2–3. That gives 100–150 columns on Earth (spacing ~2,000 km); the 162 vertices of
+a twice-subdivided icosahedron are used, bonded along its edges with apothems fitted
+to the bond lengths (largest initial strain 1e-5, coverage 99.4%; the 12 pentagons
+leave the gaps).
+
+- **Plates.** The simplest plate system on a sphere: two hemispherical plates turning
+  relative to each other about an Euler pole P on their boundary. Half the boundary
+  diverges (a ridge), half converges (a trench); the relative speed goes as
+  sin(angle from P), so both taper to zero at P with no transform faults. Bonds across
+  the boundary are broken.
+- **Mantle** (`src/mantle/kinematic.js`): prescribed, not convecting. Plate B's mantle
+  is at rest (the reference frame); A's turns about P at ω (8 cm/yr at 90° from P),
+  with a tanh step of 0.05 rad at the boundary, so it upwells along the ridge half and
+  downwells along the trench half and nowhere else.
+- **Crust.** Seafloor age is the steady state of symmetric spreading, 2φ/ω, φ the
+  angle around P from the ridge. B carries a 17-column continent along the trench half
+  (an Andean margin); A carries a 7-column microcontinent placed to reach the trench
+  after ~100 Myr at the mantle's rate. A's leading row on the trench half (9 columns)
+  starts as slabs, in place: a slab is a column that sinks where it subducted (its
+  edges need overlapping depth intervals), so it is seeded at the trench, not under
+  the overriding plate.
+- **Scaled parameters.** Lengths on the unit sphere scale with the column size
+  (apothem 0.149 against 0.0175): `base_apothem`, `cell_clip_radius` (0.34),
+  `arc_reach` (0.42), and 4 hash cells per axis (reach of the tessellation).
+
+Measured (software GPU, 162 columns):
+- **The solve did not converge at 32 iterations.** Summing every force on each
+  surface column (edges + basal drag, `bal` diagnostic; the net-force arrow draws
+  the same sum): at dt = 0.25 Myr the median net edge force was 11.5× the median
+  drag, and plate interiors carried 40–60 MPa of compression that nothing balanced.
+  Above the 50 MPa transition stress, with all old seafloor negatively buoyant, that
+  set off subduction inside both plates, and each new slab shortened its
+  neighbours' window to 0.1 Myr: a cascade (162 → 129 columns in 40 Myr at
+  dt = 0.5; 162 → 71 at dt = 4). Residual / drag against iterations: dt 0.25: 32 →
+  11.5, 128 → 1.3, 512 → 0.45 (worst compression −49, −12, −6 MPa); dt 1: 128 →
+  9.0, 512 → 2.1; dt 4: 1024 → 4.9. At equal cost (iterations per Myr), small steps
+  with more iterations win. Probably the same cause as the scattered subduction
+  seen on the 10k planet; not yet measured there.
+- **Time step:** 0.25 Myr with 256 iterations. Besides convergence, the slab's
+  lifetime bounds it: slabs sink at w ∝ column width (`slab_sink_rate_km_myr`), so
+  1,900 km wide slabs sink ~50 cm/yr and are gone in ~1.3 Myr, and their pull needs
+  several steps.
+- **With 32 iterations at dt ≤ 0.25 the trench locks:** the seeded slabs drop out
+  within 1.5 Myr, nothing else subducts, and A pushes B through the trench, both
+  turning at ~3.3 cm/yr against A's mantle at 7 (B's mantle at rest).
+
 ### 9.3 Physics extensions
 
 - **Faster bending solve.** Damped Jacobi needs ~(α/ℓ)⁴ sweeps. Chebyshev

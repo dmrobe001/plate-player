@@ -34,6 +34,13 @@ export class OrbitCamera {
     return [r * Math.cos(pitch) * Math.sin(yaw), r * Math.sin(pitch), r * Math.cos(pitch) * Math.cos(yaw)];
   }
 
+  /** Turn to look at the sphere point in direction d (keeps the distance). */
+  lookToward(d) {
+    const l = Math.hypot(...d);
+    this.yaw = Math.atan2(d[0], d[2]);
+    this.pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, Math.asin(d[1] / l)));
+  }
+
   update() {
     if (this.spin) this.yaw -= 0.005;
   }

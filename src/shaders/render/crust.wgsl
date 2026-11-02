@@ -3,9 +3,13 @@
 // elevation. Round columns are discs.
 // Subducting slabs are white. Per-column glyphs (CPU reference
 // src/columns/stress.js), from the forces the edges exert on the column:
-//   - net force: one yellow arrow from the centre, the sum of the edge
-//     forces (balanced by basal drag in this overdamped model), drawn as the
-//     traction |F| / (h x 2 apothem), h the mean depth overlap of its edges;
+//   - net force: one yellow arrow from the centre, the sum of every force on
+//     the column: its edges, basal drag -gamma (v - u) and the GPE push. The
+//     model has no inertia, so this is zero where the solve converged: the
+//     arrow is the solver's residual. Drawn as the traction |F| / (h x 2
+//     apothem), h the mean depth overlap of its edges;
+//   - velocities: the mantle flow beneath the column (cyan) and the column's
+//     own velocity this step (magenta), one apothem per 5 cm/yr;
 //   - stress: the principal axes of the column's (Love-Weber) stress tensor,
 //     each a pair of arrows from the centre, pointing out for tension (white)
 //     and in for compression (black).
@@ -165,6 +169,47 @@ fn glyph_world(p: Particle, frame: mat2x3f, dir: vec2f, q: vec2f) -> vec3f {
     return p.position.xyz * r + (along * q.x + across * q.y) * r;
 }
 
+// Basal drag on column i (solver.wgsl, inverse_drag): gamma = A eta / h, in the
+// force units of column_stress (MPa km x unit length = 1e9 N x R / 1 m):
+// F = -area_ref R^2 eta (v - u) / (h s_per_Myr 1e9), v and u in rad/Myr.
+fn drag_force(i: u32) -> vec3f {
+    let p = particles[i];
+    let u = grid[p.mantle_node].velocity.xyz * sim.mantle_drive;
+    let age_s = max(p.thermal_age_myr, 0.0) * 3.15576e13;
+    let cap = select(sim.oceanic_lithosphere_max_km, sim.continental_lithosphere_km, p.composition_density < 2850.0);
+    let lith = min(2.32 * sqrt(sim.thermal_diffusivity_m2_s * age_s) / 1000.0, cap);
+    let h_m = max(sim.asthenosphere_base_km - lith, sim.min_channel_km) * 1000.0;
+    let R = 6.371e6;
+    return -(p.area_ref * R * R * sim.asthenosphere_viscosity_pa_s / (h_m * 3.15576e13 * 1e9)) * (p.velocity.xyz - u);
+}
+
+// GPE push (flow.wgsl, columns_gpe_force): -gpe_force_factor area_ref grad(Gamma),
+// the gradient fitted from the column's edge partners, in the same units.
+fn gpe_force(i: u32) -> vec3f {
+    if (sim.gpe_force_factor == 0.0 || particles[i].state != 1u) { return vec3f(0.0); }
+    let n = min(slot_words[i * SLOT_WORDS + SLOT_COUNT_WORD], SLOT_CAPACITY);
+    if (n < 2u) { return vec3f(0.0); }
+    let xi = particles[i].position.xyz;
+    let ref_axis = select(vec3f(0.0, 0.0, 1.0), vec3f(1.0, 0.0, 0.0), abs(xi.z) > 0.9);
+    let e1 = normalize(cross(ref_axis, xi));
+    let e2 = cross(xi, e1);
+    let fi = profiles[i].gpe_mpa_km;
+    var a11 = 0.0; var a12 = 0.0; var a22 = 0.0; var b1 = 0.0; var b2 = 0.0;
+    for (var k = 0u; k < n; k++) {
+        let e = edges[slot_words[i * SLOT_WORDS + SLOT_FIRST_WORD + k]];
+        let j = select(e.particle_a, e.particle_b, e.particle_a == i);
+        let d = particles[j].position.xyz - xi;
+        let u = dot(d, e1);
+        let v = dot(d, e2);
+        let df = profiles[j].gpe_mpa_km - fi;
+        a11 += u * u; a12 += u * v; a22 += v * v; b1 += u * df; b2 += v * df;
+    }
+    let det = a11 * a22 - a12 * a12;
+    if (!(det > 1e-12 * (a11 + a22) * (a11 + a22))) { return vec3f(0.0); }
+    let grad = ((a22 * b1 - a12 * b2) / det) * e1 + ((a11 * b2 - a12 * b1) / det) * e2;
+    return -sim.gpe_force_factor * particles[i].area_ref * grad;
+}
+
 // 9 vertices per column: the net force arrow.
 @vertex
 fn vs_force(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> GlyphOut {
@@ -175,11 +220,38 @@ fn vs_force(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> G
     if (p.is_active == 0u) { return out; }
     let frame = glyph_frame(p);
     let s = column_stress(i, frame);
-    let F = length(s.force);
-    if (!(F > 0.0) || !(s.h > 0.0)) { return out; }
+    if (!(s.h > 0.0)) { return out; }
+    let body = drag_force(i) + gpe_force(i);
+    let total = s.force + vec2f(dot(body, frame[0]), dot(body, frame[1]));
+    let F = length(total);
+    if (!(F > 0.0)) { return out; }
     let traction = F / (s.h * 2.0 * p.apothem);
     let len = min(p.apothem * traction / view.stress_ref_mpa, 2.0 * p.apothem);
-    out.clip = view.view_proj * vec4f(glyph_world(p, frame, s.force / F, arrow_point(v, len, p.apothem, false)), 1.0);
+    out.clip = view.view_proj * vec4f(glyph_world(p, frame, total / F, arrow_point(v, len, p.apothem, false)), 1.0);
+    return out;
+}
+
+// 18 vertices per column: the mantle flow beneath it (0-8, cyan) and its own
+// velocity (9-17, magenta); one apothem per 5 cm/yr.
+const VELOCITY_REF_RAD_MYR: f32 = 50.0 / 6371.0; // 5 cm/yr = 50 km/Myr
+@vertex
+fn vs_velocity(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> GlyphOut {
+    var out: GlyphOut;
+    out.clip = HIDDEN;
+    let p = particles[i];
+    if (p.is_active == 0u) { return out; }
+    let frame = glyph_frame(p);
+    var w = p.velocity.xyz;
+    out.color = vec3f(0.94, 0.25, 0.85);
+    if (v < 9u) {
+        w = grid[p.mantle_node].velocity.xyz * sim.mantle_drive;
+        out.color = vec3f(0.15, 0.85, 0.95);
+    }
+    let w2 = vec2f(dot(w, frame[0]), dot(w, frame[1]));
+    let speed = length(w2);
+    if (!(speed > 0.0)) { return out; }
+    let len = min(p.apothem * speed / VELOCITY_REF_RAD_MYR, 2.0 * p.apothem);
+    out.clip = view.view_proj * vec4f(glyph_world(p, frame, w2 / speed, arrow_point(v % 9u, len, p.apothem, false)), 1.0);
     return out;
 }
 

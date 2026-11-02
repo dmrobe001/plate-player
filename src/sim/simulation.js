@@ -4,6 +4,8 @@ import { ColumnProfile, Edge, GridNode, NONE, Particle, SLOTS } from '../gpu/lay
 import { createShaderModule } from '../gpu/device.js';
 import { normalStiffnessPerModulus } from '../columns/shape.js';
 import { tangentBasis } from '../columns/flow.js';
+import { KinematicMantle } from '../mantle/kinematic.js';
+import { Mantle } from '../mantle/mantle.js';
 import { packSimParams, SIM_PARAMS, SIM_PARAMS_BYTES, simParamsWGSL } from './params.js';
 
 import bindingsWGSL from '../shaders/compute/bindings.wgsl';
@@ -93,6 +95,12 @@ export class Simulation {
     this.#createPipelines(onError);
   }
 
+  /** Replace all parameter overrides (a new world or a restored record). */
+  resetParams(overrides = {}) {
+    this.overrides = {};
+    this.setParams(overrides);
+  }
+
   /** Set parameter overrides (merged with previous ones), recompute derived values, upload. */
   setParams(overrides) {
     Object.assign(this.overrides, overrides);
@@ -105,8 +113,10 @@ export class Simulation {
       num_nodes: this.numNodes,
       max_particles: CAPACITY.maxParticles,
       max_edges: CAPACITY.maxEdges,
-      hash_grid_dim: CAPACITY.hashGridDim,
+      // A world may use fewer, larger hash cells (coarse columns); the buffer holds CAPACITY.hashGridDim^3.
+      hash_grid_dim: this.overrides.hash_grid_dim ?? CAPACITY.hashGridDim,
     });
+    if (this.params.hash_grid_dim > CAPACITY.hashGridDim) throw new Error(`hash_grid_dim > ${CAPACITY.hashGridDim}`);
     if (this.params.solver_iterations > MAX_SOLVER_ITERATIONS) throw new Error(`solver_iterations > ${MAX_SOLVER_ITERATIONS}`);
     this.device.queue.writeBuffer(this.buffers.params, 0, packSimParams(this.params));
     const rho = this.params.chebyshev_rho < 0 ? jacobiSpectralRadius(this.params) : this.params.chebyshev_rho;
@@ -432,7 +442,7 @@ export class Simulation {
   }
 
   restore(snap) {
-    this.setParams(snap.overrides ?? {});
+    this.resetParams(snap.overrides ?? {});
     for (const name of STATE_BUFFERS) {
       const data = snap.buffers[name];
       if (data.byteLength !== this.buffers[name].size) {
@@ -442,6 +452,8 @@ export class Simulation {
     }
     this.steps = snap.step;
     this.timeMyr = snap.timeMyr;
+    if (snap.mantle.kind === 'kinematic' && this.mantle.kind !== 'kinematic') this.mantle = new KinematicMantle(snap.mantle.options, this.mantleMesh);
+    if (snap.mantle.kind !== 'kinematic' && this.mantle.kind === 'kinematic') this.mantle = new Mantle(1, snap.mantle.options, this.mantleMesh);
     this.mantle.setState(snap.mantle);
     this.uploadMantle();
   }

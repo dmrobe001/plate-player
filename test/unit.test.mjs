@@ -979,3 +979,52 @@ test('column stress: a hexagon under uniform strain reads the plane-stress conti
   const f = columnStress([{ n: [1, 0], sigmaN: 10, tau: 0, overlap: h, rest: 2 * a, lever: 0.5, dist: 2 * a }], 1, r).force;
   assert.ok(f[0] > 0 && f[1] === 0);
 });
+
+import { generateTwoPlateState } from '../src/init/two-plate.js';
+import { kinematicFlow } from '../src/mantle/kinematic.js';
+
+test('two-plate planet: 162 bonded columns at rest, broken boundary, continents, slabs on the trench half', () => {
+  const s = generateTwoPlateState();
+  const { pole: P, normal: m, q, plateA, kind } = s.frame;
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  assert.equal(s.particles.count, 162);
+  assert.ok(Math.abs(dot(P, m)) < 1e-9 && Math.abs(Math.hypot(...P) - 1) < 1e-9);
+  assert.ok(s.stats.maxBondStrain < 1e-5, 'bonds start at their rest length');
+  assert.ok(s.stats.coverage > 0.98);
+  assert.ok(s.stats.continent >= 7 && s.stats.microcontinent === 7 && s.stats.slabs >= 5);
+  const x = (i) => [0, 1, 2].map((c) => s.particles.position[3 * i + c]);
+  for (let k = 0; k < s.bonds.count; k++) {
+    const i = s.bonds.a[k], j = s.bonds.b[k];
+    assert.equal(s.bonds.damage[k], plateA[i] !== plateA[j] ? 1 : 0, 'only boundary bonds are broken');
+  }
+  for (let i = 0; i < 162; i++) {
+    if (s.particles.state[i] === 2) assert.ok(plateA[i] && dot(x(i), q) < 0, 'slabs: plate A, trench half');
+    if (kind[i] === 'continent') assert.ok(!plateA[i] && dot(x(i), q) < 0, 'continent: plate B, trench half');
+    if (kind[i] === 'micro') assert.ok(plateA[i]);
+  }
+});
+
+test('kinematic mantle: rigid rotation of A, B at rest, upwelling on the ridge half and downwelling on the trench half', () => {
+  const s = generateTwoPlateState();
+  const o = s.mantle;
+  const { pole: P, normal: m, q } = s.frame;
+  const lin = (a, b, t) => a.map((v, c) => Math.cos(t) * v + Math.sin(t) * b[c]);
+  const deep = kinematicFlow(lin(q, m, 1.2), o), still = kinematicFlow(lin(q, m, -1.2), o);
+  assert.ok(Math.abs(Math.hypot(...deep.velocity) / (o.omegaRadMyr * Math.sin(Math.PI / 2)) - 1) < 1e-6, 'A turns at omega');
+  assert.ok(Math.hypot(...still.velocity) < 1e-12 * o.omegaRadMyr);
+  // Divergence against a finite-difference flux through a small cap.
+  for (const [x, sign] of [[q, 1], [q.map((v) => -v), -1]]) {
+    const r = 0.01, k = 64;
+    const e1 = P, e2 = [x[1] * P[2] - x[2] * P[1], x[2] * P[0] - x[0] * P[2], x[0] * P[1] - x[1] * P[0]];
+    let flux = 0;
+    for (let j = 0; j < k; j++) {
+      const t = (2 * Math.PI * j) / k, dir = e1.map((v, c) => Math.cos(t) * v + Math.sin(t) * e2[c]);
+      const y = x.map((v, c) => Math.cos(r) * v + Math.sin(r) * dir[c]);
+      const u = kinematicFlow(y, o).velocity;
+      flux += (u[0] * dir[0] + u[1] * dir[1] + u[2] * dir[2]) * Math.sin(r) * (2 * Math.PI / k);
+    }
+    const numeric = flux / (2 * Math.PI * (1 - Math.cos(r)));
+    const exact = kinematicFlow(x, o).divergence;
+    assert.ok(Math.sign(exact) === sign && Math.abs(numeric / exact - 1) < 0.02, `${numeric} vs ${exact}`);
+  }
+});

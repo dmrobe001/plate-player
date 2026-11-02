@@ -166,7 +166,7 @@ export class Recorder {
         sim_params: sim.params,
         param_overrides: sim.overrides,
         capacity: CAPACITY,
-        mantle: { model: 'lava-lamp buoyancy + screened poloidal flow (src/mantle/mantle.js)', nodes: sim.numNodes, options: sim.mantle.options, velocity_scale: sim.mantle.scale },
+        mantle: { model: sim.mantle.description ?? 'lava-lamp buoyancy + screened poloidal flow (src/mantle/mantle.js)', nodes: sim.numNodes, options: sim.mantle.options, velocity_scale: sim.mantle.scale },
       },
       conventions: {
         position: 'unit sphere, radius 1 = 6371 km, body-fixed',

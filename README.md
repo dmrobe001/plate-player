@@ -28,9 +28,20 @@ npm run build      # writes dist/plate-player.html
 npm run watch      # rebuilds on every save under src/; reload the browser to see changes
 ```
 
-On the page, drag to rotate, scroll to zoom. **Seed** + **Regenerate** rebuilds the
-initial state; the same seed always gives the same initial world. You can also put
-the seed in the URL: `plate-player.html?seed=42`.
+On the page, drag to rotate, scroll to zoom. **World** picks the initial state:
+
+- **Two plates (162 columns)**, the default: a coarse test planet built to show every
+  mechanism in order (design 9.2, `src/init/two-plate.js`). Two plates on a
+  twice-subdivided icosahedron turn relative to each other about an Euler pole on
+  their boundary, driven by a prescribed mantle flow (`src/mantle/kinematic.js`):
+  a ridge on one half of the boundary, a trench with seeded slabs on the other, a
+  continent on the overriding plate at the trench, and a microcontinent on the
+  subducting plate due at the trench after ~100 Myr. Deterministic.
+- **Random planet (~10k columns)**: noise continents, Voronoi plate boundaries, the
+  convecting "lava lamp" mantle. **Seed** + **Regenerate** rebuilds it; the same
+  seed always gives the same world.
+
+URL options: `?world=random|two-plate`, `?seed=42`, `?paused`.
 
 ## What you are looking at
 
@@ -39,7 +50,9 @@ the seed in the URL: `plate-player.html?seed=42`.
 | Disc / ellipse | One crust particle (column), drawn as its reference shape: mean radius = the apothem, elongated by distributed flow (its finite strain, up to aspect 3). Colour = elevation relative to sea level (blues below, greens/browns/white above). **White** discs are subducting slabs. |
 | White arrows pointing out (←·→) | A principal axis of the column's stress in **tension**. Length ∝ that principal stress |
 | Black arrows pointing in (→·←) | A principal axis in **compression**. Each column shows both axes, at right angles |
-| Yellow arrow from the centre | **Net force** the column's edges exert on it: the push and pull of its neighbours. In this overdamped model it is balanced by basal drag, so it points roughly along the column's motion relative to the mantle |
+| Cyan arrow | **Mantle flow** beneath the column (one apothem = 5 cm/yr) |
+| Magenta arrow | The **column's velocity** this step, same scale. Basal drag is η (cyan − magenta) / h per area |
+| Yellow arrow (off by default) | **Net force** on the column: its edges + basal drag + the GPE push. The model has no inertia, so a converged solve makes this zero; what is drawn is the solver's **residual** |
 | Background sphere | Mantle grid, coloured by flow divergence: orange = upwelling, blue = downwelling. With **Show mantle** off it is a plain black sphere |
 | **Colour by plate** | Each plate in its own colour; grey particles belong to no plate (fragments under 20 particles, or slabs) |
 
@@ -52,8 +65,9 @@ S_t its depth-integrated normal and shear stress and c the lattice conversion
 factor that bond stiffness uses. The column's stress is the Love–Weber average
 σ = sym(Σ r ⊗ f) / (A h), with r the contact point, A the reference area and h the
 mean depth overlap of its edges. On a hexagon under uniform strain this gives the
-plane-stress continuum tensor exactly (unit test). The net force is drawn as the
-traction |Σ f| / (h × 2 apothem).
+plane-stress continuum tensor exactly (unit test). The net force adds basal drag,
+−γ (v − u) with γ = A η / h (the solver's drag), and the GPE push, and is drawn as
+the traction |F| / (h × 2 apothem).
 
 ## Model in one page
 

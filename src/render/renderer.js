@@ -27,14 +27,14 @@ export class Renderer {
 
     const visibility = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
     const storageLayout = device.createBindGroupLayout({
-      entries: [0, 1, 2, 3, 4].map((binding) => ({ binding, visibility, buffer: { type: 'read-only-storage' } })),
+      entries: [0, 1, 2, 3, 4, 5].map((binding) => ({ binding, visibility, buffer: { type: 'read-only-storage' } })),
     });
     const uniformLayout = device.createBindGroupLayout({
       entries: [0, 1].map((binding) => ({ binding, visibility, buffer: { type: 'uniform' } })),
     });
     this.storageBindGroup = device.createBindGroup({
       layout: storageLayout,
-      entries: [sim.buffers.particles, sim.buffers.edges, sim.buffers.grid, sim.buffers.plateIds, sim.buffers.deltas]
+      entries: [sim.buffers.particles, sim.buffers.edges, sim.buffers.grid, sim.buffers.plateIds, sim.buffers.deltas, sim.buffers.profiles]
         .map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
     this.uniformBindGroup = device.createBindGroup({
@@ -60,6 +60,7 @@ export class Renderer {
       discs: pipeline('vs_disc', 'fs_disc', 'triangle-list'),
       force: pipeline('vs_force', 'fs_glyph', 'triangle-list'),
       stress: pipeline('vs_stress', 'fs_glyph', 'triangle-list'),
+      velocity: pipeline('vs_velocity', 'fs_glyph', 'triangle-list'),
     };
   }
 
@@ -71,7 +72,7 @@ export class Renderer {
   }
 
   /**
-   * @param view {viewProj: Float32Array(16), lightDir: [x,y,z], stressRefMPa, showMantle, showForce, showStress, colorByPlate}
+   * @param view {viewProj: Float32Array(16), lightDir: [x,y,z], stressRefMPa, showMantle, showForce, showStress, showVelocity, colorByPlate}
    */
   encodeDraw(encoder, view) {
     const colorTexture = this.context.getCurrentTexture();
@@ -82,7 +83,7 @@ export class Renderer {
     f.set(view.viewProj, 0);
     f.set([...view.lightDir, 0], 16);
     f[20] = view.stressRefMPa;
-    u[21] = (view.showForce ? 1 : 0) | (view.showStress ? 2 : 0) | (view.colorByPlate ? 4 : 0) | (view.showMantle ? 0 : 8);
+    u[21] = (view.showForce ? 1 : 0) | (view.showStress ? 2 : 0) | (view.colorByPlate ? 4 : 0) | (view.showMantle ? 0 : 8) | (view.showVelocity ? 16 : 0);
     this.device.queue.writeBuffer(this.viewBuffer, 0, this.viewData);
 
     const pass = encoder.beginRenderPass({
@@ -114,6 +115,10 @@ export class Renderer {
     if (view.showStress) {
       pass.setPipeline(this.pipelines.stress);
       pass.draw(36, CAPACITY.maxParticles);
+    }
+    if (view.showVelocity) {
+      pass.setPipeline(this.pipelines.velocity);
+      pass.draw(18, CAPACITY.maxParticles);
     }
     if (view.showForce) {
       pass.setPipeline(this.pipelines.force);
