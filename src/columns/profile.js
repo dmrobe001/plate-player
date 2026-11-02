@@ -74,11 +74,13 @@ export function geotherm(col, p) {
 
 /**
  * Crust density at mantle temperature: its composition, or for a slab's
- * oceanic crust below eclogite_depth_km (its top's depth, +-10 km) eclogite.
+ * oceanic crust below eclogite_depth_km (the depth of the slab's middle,
+ * top + slabExtentKm / 2, +-10 km) eclogite.
  */
 export function crustDensity(col, p) {
   if (!col.slab || isContinental(col.compositionDensity)) return col.compositionDensity;
-  const f = Math.min(Math.max((-col.elevationKm - (p.eclogite_depth_km - 10)) / 20, 0), 1);
+  const depth = -col.elevationKm + 0.5 * (col.slabExtentKm ?? 0);
+  const f = Math.min(Math.max((depth - (p.eclogite_depth_km - 10)) / 20, 0), 1);
   return col.compositionDensity + f * (p.eclogite_density - col.compositionDensity);
 }
 
@@ -283,7 +285,7 @@ export function columnProfile(col, p) {
 
 /** The column inputs of particle i, from unpacked Particle arrays (layout.js). */
 export const columnOfParticle = (P, i) => ({
-  crustKm: P.thickness_km[i], compositionDensity: P.composition_density[i], ageMyr: (P.thermal_age_myr ?? P.age)[i], elevationKm: P.elevation[i],
+  crustKm: P.thickness_km[i], compositionDensity: P.composition_density[i], ageMyr: (P.thermal_age_myr ?? P.age)[i], elevationKm: P.elevation[i], slabExtentKm: P.slab_extent_km?.[i] ?? 0,
   slab: P.state ? P.state[i] === 2 : false,
 });
 

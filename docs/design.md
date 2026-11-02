@@ -987,13 +987,30 @@ and before the edge law; reference `src/columns/hinge.js`.
   reference area, not its shrinking cell.
 - **Becoming a slab:** when the hinge passes the column's back face, u + x* ≥ 2a
   (the whole column is flap). There is no timer and no propagation rule: a trench
-  propagates where neighbours have partners and are pulled.
+  propagates where neighbours have partners and are pulled. The slab keeps its
+  hinge partner, the overriding column it went under.
+- **The trench lives on.** A column with no buoyant broken neighbour but a slab
+  hanging from it (the column in front has subducted) inherits that slab's
+  overriding column as its partner; its underthrust is measured against it, a gap at
+  first that closes as the plate converges. (It took its own slab as partner, at
+  full overlap, subducted at once, and the trench died.)
 - **Slab pull** reaches the plate as a body force on the hinge column toward the
-  trench (into its drag target, like the GPE push): the down-dip part, sin β, of what
-  hangs from the flap plus the underthrust part's weight. At most what the column can
-  transmit (its tensile strength across its width) and what the plate behind can hold
-  (the tension caps of its edges behind, projected on the pull, × 0.9); more would
-  tear the plate behind the hinge.
+  trench (into its drag target, like the GPE push): the down-dip weight of what
+  hangs from the flap, each slab at its own dip, Σ W sin δ (`child_pull`), plus the
+  underthrust part's weight × sin β (`hingePull`).
+- **Slab drag.** Moving, the column drags its slabs (and its flap) down dip through
+  the mantle: their drag coefficient, Σ W/w_free (`child_drag`), is added to its
+  basal drag, in the solve (`inverse_drag`, `slab_drag_ratio`) and in the pull's
+  displacement. Implicit, because one slab's coefficient is ~400× a column's basal
+  drag. So a plate fed by a vertical slab moves at about the slab's free speed, and
+  the vertical support a slab gets (below) is the vertical part of the same drag.
+  (Without it, only vertical support resisted a plate: at a small bend almost
+  nothing did, and the strip ran at 73 cm/yr, a column width per step.)
+- **What the plate transmits is the slabs' tension at the trench,** pull − drag ×
+  speed, and that is what the column's tensile strength and the plate behind (its
+  edges' tension caps, projected on the pull, × 0.9) bound: pull ≤ cap + drag ×
+  speed. (They bounded the gross down-dip weight: the plate could not outrun the cap,
+  its slab never reached its free speed, was never held by the mantle, and necked.)
 
 **The force budget, from the textbook** (Turcotte & Schubert; CPU reference,
 default parameters). A slab's excess mass per area is B = −ρ_m × freeboard. For 100
@@ -1008,26 +1025,42 @@ move 6–9 cm/yr, those without 1–3: Forsyth & Uyeda 1975.) The plate's edges 
 1.5×10¹³ N/m in tension (4.5): more than the net pull, less than the gross weight.
 - **Eclogite** (`eclogite_depth_km` 60, `eclogite_density` 3500; Hacker et al. 2003):
   a slab's oceanic crust turns from basalt to eclogite at ~1.5–2 GPa, linearly over
-  ±10 km about that depth of its top (`crustDensity` in `profile.js`; `column_of` in
-  `profile.wgsl`). Continental crust stays buoyant. Without it the crust counted as
+  ±10 km about that depth of its middle (top + extent/2; `crustDensity` in
+  `profile.js`; `column_of` in `profile.wgsl`). (Of its top, a hanging slab, whose
+  top stays at the flap tip, never turned.) Continental crust stays buoyant. Without it the crust counted as
   buoyant all the way down and slabs weighed half what they should.
 
 **Slabs hang.** A new slab hangs from the intact surface column behind it (found by
 the hinge), at its bend as dip; a slab can hang from a slab (a chain). Kernel
-`slab_hang` in `thermal.wgsl`; reference `hangSlab`.
-- **Where:** in map view at the trench (its parent's front face toward the parent's
-  trench partner, or under its parent slab); its top at the parent's flap tip, or
-  the parent slab's bottom (top − extent, extent = 2a sin dip). It has no edges.
-- **Load:** its weight above the cutoff (B g A, B = −ρ_m × freeboard), less the
-  viscous support of its descent (descent rate = the parent's speed toward its
-  trench × sin β, over the free sinking rate), plus what hangs from it; under-relaxed
-  (half the change per step: support, descent and bend depend on each other a step
-  apart, and unrelaxed the lagged fixed point flips). Loads accumulate upward by
-  atomic float adds and reach the parent next step.
-- **Necking and break-off:** at most the tensile strength of the weaker column × the
-  narrower width passes up (`slab_attach_factor` 1; 0 = slabs never hang). The excess
-  necks the slab: its top falls behind the hang point at w_free(1 − cap/load). Necked
-  through its thickness, it breaks off and sinks freely.
+`slab_hang` in `thermal.wgsl`; reference `hangSlab`, `slabDipStep`, `slabTension`.
+- **Where:** in map view at the trench: its parent's front face toward the parent's
+  trench partner or, the step it starts hanging (before the parent's hinge has one),
+  toward the overriding column it went under; or under its parent slab. Its top at
+  the parent's flap tip, or the parent slab's bottom (top − extent). It has no edges.
+  (It was put on top of its parent, and the arc then grew on both sides.)
+- **Dip.** Pinned at its top, it turns toward vertical under its own weight like a
+  pendulum in a viscous fluid: dδ/dt = (w_free/L) cos δ, L = 2a; its vertical extent
+  is L sin δ. (It kept the bend it went down at, and a plate pulled by W sin β at a
+  bend of 9° crawled at 0.3 cm/yr.)
+- **Feed.** Its material moves down dip at the rate the plate feeds the trench (the
+  parent's speed toward its partner; a slab hanging from a slab, its parent's).
+- **Load** (vertical, for the bend): its weight above the cutoff (B g A, B = −ρ_m ×
+  freeboard), less the viscous support of its descent (feed × sin δ over the free
+  sinking rate), plus what hangs from it; under-relaxed (half the change per step:
+  support, descent and bend depend on each other a step apart, and unrelaxed the
+  lagged fixed point flips). Loads, down-dip weights and drag coefficients accumulate
+  upward by atomic float adds and reach the parent next step.
+- **Necking and break-off:** on the tension at its top, down dip: T = W sin δ +
+  Σ_below W sin δ − (W/w_free + Σ_below W/w_free) × feed, zero for a slab fed at its
+  free speed. Above the tensile strength of the weaker column × the narrower width
+  (`slab_attach_factor` 1; 0 = slabs never hang) the slab necks: its top falls behind
+  the hang point at w_free(1 − cap/T). Necked through its thickness, it breaks off and
+  sinks freely. (The vertical load was compared before; it stays large, W cos²δ, for
+  a slab the mantle holds.)
+- **Arcs** grow on the overriding side only: away from the plate behind the slab,
+  which for a chain is the surface column at its top. (A slab hanging from a slab
+  took its parent slab, at the trench, as "behind": its arc reset the plate behind
+  the trench, which turned buoyant, killed the trench and flipped its polarity.)
 - **Free sinking:** w = B g h/4η, h the slab's thickness (its column extent): a sheet
   sinks edge-first, whatever its width in map view (~3 cm/yr for old ocean). (It was
   B g (2a)/4η, which made a 1,900 km column sink at 50 cm/yr.)
@@ -1351,14 +1384,29 @@ counter (`slabsLost`). Measured:
   56× in a step, columns grew into their neighbours and were thrown apart. A fit
   whose trace exceeds twice the largest edge normal strain is now rejected (a 2D
   tensor's trace is at most twice its largest principal strain).
-- **Still open: the strip after its first subduction.** With damage on or off, ~0.5
-  Myr after the leading column subducts, a trench hinge forms on the column behind
-  across the edge that just broke, against its own plate neighbour, and its slab
-  pull (a body force on one column against its own basal drag, capped by what the
-  edges behind hold, 3.5× more with the Anderson caps) throws the chain apart. Before
-  the calibration the same strip blew up at 2.25 Myr; now at 1.75–2.0. Not the damage
-  law: the hinge rules after a subduction.
-- **Two-plate planet (162 columns, 40 Myr):** all 9 seeded slabs hang at first, the
+- **The hinge rules after a subduction (refined).** The strip's blow-up after its
+  first subduction had five causes, each a rule above: the slab's drag on the plate
+  was missing (73 cm/yr, a column width per step: the subducting column passed its
+  partner's centre, lost its "behind" and its slab); a hanging slab kept its initial
+  dip (W sin β at a 9° bend: 0.3 cm/yr); the arc grew behind the trench (the column
+  behind turned buoyant, the trench died, polarity flipped inside the plate); the
+  column behind took its own slab as trench partner (it subducted at once); and the
+  strength cap and necking used the gross weight, not the slab's tension (the plate
+  could not outrun the cap, and slabs necked off). A 4-column overriding continent
+  is pushed away by the lubricated contact at the plate's speed (basal drag at 10¹⁹
+  Pa·s holds nothing): the strip test has a 16-column one.
+  Measured (strip, 223 km columns, converged solve, damage on or off, the same): the
+  leading column subducts at 6.5–7.5 Myr with its slab hanging; then 6, 5, 4 and 3
+  follow, one every ~6 Myr, each inheriting the continent as partner; the plate
+  moves 3–5.6 cm/yr (median 3.6); the slab chain hangs to 690 km, dips steepen
+  36° → 80°, no slab is lost in 30 Myr.
+- **Two-plate planet, with the refined rules (30 Myr):** still locked. 15–17
+  hinges, no new subduction (sink volume constant after 2 Myr), the seeded slabs
+  warm and are gone by 16 Myr (one counted lost), the plates move 0.1–0.4 cm/yr
+  relative to each other. Its 1,900 km columns need ~1,850 km of underthrust to
+  subduct: tens of Myr at slab-driven speeds, longer than its slabs stay heavy.
+  Continuous consumption through the hinge (below) is the remedy.
+- **Two-plate planet (162 columns, 40 Myr; before the calibration):** all 9 seeded slabs hang at first, the
   hinges bend 4–23° and yield plastically; the slabs (1,600 km long, ~5× heavier than
   the plate can hold) neck, and five trench columns subduct within 8 Myr, but as free
   slabs: the damage law had already broken the edges behind them. Then the trench goes

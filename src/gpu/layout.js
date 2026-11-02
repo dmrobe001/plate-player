@@ -138,6 +138,9 @@ export const Particle = defineStruct('Particle', [
   ['slab_extent_km', 'f32'],    // slab: depth range from its top to its bottom
   ['child_load', 'f32'],        // load hanging from this column, N (last step)
   ['hang_load', 'f32'],         // slab: load it passed up last step, N (under-relaxed, thermal.wgsl)
+  ['child_pull', 'f32'],        // down-dip weight of the slabs hanging from this column, sum of W sin(dip), unsupported, N (last step; design 6)
+  ['child_drag', 'f32'],        // their viscous drag coefficient, sum of W / w_free, N s / m (last step)
+  ['slab_drag_ratio', 'f32'],   // hinge column: (slabs' + flap's drag coefficient) / its basal drag (hinge.wgsl; inverse_drag)
 ]);
 
 /**

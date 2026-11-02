@@ -124,26 +124,64 @@ export function contactWeakening(beta, mu, weakening) {
 /** A column becomes a slab when its hinge has passed its back face: the flap covers it. */
 export const becomesSlab = (underthrust, setback, width) => underthrust + setback >= width;
 
+/** Seconds per Myr, for rates in km/Myr. */
+const MYR_S = 3.15576e13;
+
 /**
- * A hanging slab (slab_hang in thermal.wgsl), one step. The load it passes up
- * is its weight (the part above the cutoff), less the viscous support of its
- * descent (Stokes drag at descent rate v against its free sinking rate w_free:
- * weight (1 - v / w_free)), plus what hangs from it; at most the attachment's
- * tensile strength `cap`. Any excess makes it neck: its top falls behind the
- * hang point at w_free (1 - cap / load). Necked through its thickness, it
- * breaks off. With `previous` (last step's load) the load is under-relaxed,
- * half the change per step: support, descent and bend depend on each other
- * one step apart, and unrelaxed the lagged fixed point flips. Returns
- * {load, neck, broken}.
+ * A hanging slab's dip, one step (slab_hang in thermal.wgsl): pinned at its
+ * top, it turns toward vertical under its own weight like a pendulum in a
+ * viscous fluid, d dip / dt = (w / L) cos dip, w its free sinking rate, L its
+ * length (km, km/Myr, Myr); at most pi / 2.
  */
-export function hangSlab({ weight, childLoad, descent, freeRate, cap, neck = 0, dt, thicknessKm, previous = null }) {
-  const support = freeRate > 0 ? Math.min(Math.max(descent / freeRate, 0), 1) : 0;
+export const slabDipStep = (dip, freeRate, lengthKm, dt) => Math.min(dip + (dt * freeRate) / Math.max(lengthKm, 1e-3) * Math.cos(dip), Math.PI / 2);
+
+/** A slab's viscous drag coefficient down dip, N s / m: its weight over its free sinking rate (km/Myr). */
+export const slabDrag = (weight, freeRate) => (freeRate > 0 ? weight / ((freeRate * 1000) / MYR_S) : 0);
+
+/**
+ * The tension at a slab's top, down dip, N: the down-dip weight of it and of
+ * what hangs from it (childPull = sum W sin dip), less the mantle's drag on
+ * them (drag coefficients, N s / m) as they move down dip at the feed rate
+ * (km/Myr). Zero for a slab fed at its free speed (held by the mantle).
+ */
+export const slabTension = ({ weight, dip, freeRate, feed, childPull = 0, childDrag = 0 }) =>
+  weight * Math.sin(dip) + childPull - (slabDrag(weight, freeRate) + childDrag) * ((feed * 1000) / MYR_S);
+
+/**
+ * A hanging slab (slab_hang in thermal.wgsl), one step. `load` is the
+ * vertical load it passes up for the hinge's bend: its weight (the part above
+ * the cutoff) less the viscous support of its descent (feed x sin dip, against
+ * its free sinking rate: the vertical part of its drag), plus what hangs from
+ * it. It necks when the down-dip tension at its top (slabTension) exceeds the
+ * attachment's tensile strength `cap`: its top falls behind the hang point at
+ * w_free (1 - cap / T), and the load passes up in proportion; necked through
+ * its thickness, it breaks off. With `previous` (last step's load) the load is
+ * under-relaxed, half the change per step: support, descent and bend depend
+ * on each other one step apart, and unrelaxed the lagged fixed point flips.
+ * Also returns what it passes up the chain: its pull (W sin dip + childPull)
+ * and drag coefficient (W / w_free + childDrag), and its tension.
+ */
+export function hangSlab({ weight, dip, feed, freeRate, childLoad = 0, childPull = 0, childDrag = 0, cap, neck = 0, dt, thicknessKm, previous = null }) {
+  const support = freeRate > 0 ? Math.min(Math.max((feed * Math.sin(dip)) / freeRate, 0), 1) : 0;
   let load = weight * (1 - support) + childLoad;
-  // Under-relaxed against last step's load (the bend that sets the descent lags a step).
   if (previous !== null) load = 0.5 * (previous + load);
-  if (load > cap) {
-    neck += freeRate * (1 - cap / load) * dt;
-    load = cap;
+  const tension = slabTension({ weight, dip, freeRate, feed, childPull, childDrag });
+  if (tension > cap) {
+    neck += freeRate * (1 - cap / tension) * dt;
+    load *= cap / tension;
   }
-  return { load, neck, broken: neck >= thicknessKm };
+  return {
+    load, tension, neck, broken: neck >= thicknessKm,
+    pull: weight * Math.sin(dip) + childPull, drag: slabDrag(weight, freeRate) + childDrag,
+  };
 }
+
+/**
+ * The trench column's in-plane pull (columns_hinge in hinge.wgsl), N: the
+ * down-dip weight of its slabs (childPull) and of its underthrust flap
+ * (flapWeight sin beta), applied against its basal drag plus the slabs' and
+ * flap's drag coefficient `drag`. What it transmits is the slabs' tension at
+ * the trench, pull - drag x speed (speed toward the trench, m/s), and that is
+ * what the column's and the plate's strength `cap` bound.
+ */
+export const hingePull = ({ childPull, flapWeight, beta, cap, drag, speed }) => Math.min(childPull + flapWeight * Math.sin(beta), cap + drag * speed);

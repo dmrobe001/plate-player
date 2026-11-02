@@ -114,10 +114,25 @@ fn columns_hinge(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     var u_unit = max(best, 0.0);
-    if (partner == NONE && particles[idx].slab_child != NONE) {
-        partner = particles[idx].slab_child;
-        let xs = particles[partner].position.xyz;
-        u_unit = max(contact_length(idx, partner, xi, xs) - distance(xi, xs), 0.0);
+    // No such neighbour, but a slab hangs from this column: the column it
+    // came from has subducted, and the trench is still the overriding column
+    // that one went under (the slab keeps it as its hinge_partner): this
+    // column inherits it, its underthrust measured against it (a gap at
+    // first, closing as the plate converges; trenchPartner in hinge.js).
+    // (It took the slab itself as partner, at full overlap: it subducted at
+    // once, and the trench died; design 9.2.)
+    let child = particles[idx].slab_child;
+    if (partner == NONE && child != NONE) {
+        let j = particles[child].hinge_partner;
+        if (j != NONE && j != idx && particles[j].is_active != 0u && particles[j].state == 1u) {
+            partner = j;
+            let xj = particles[j].position.xyz;
+            u_unit = max(contact_length(idx, j, xi, xj) - distance(xi, xj), 0.0);
+        } else {
+            partner = child;
+            let xs = particles[partner].position.xyz;
+            u_unit = max(contact_length(idx, partner, xi, xs) - distance(xi, xs), 0.0);
+        }
     }
     particles[idx].hinge_partner = partner;
     if (partner == NONE) {
@@ -126,6 +141,7 @@ fn columns_hinge(@builtin(global_invocation_id) id: vec3<u32>) {
         particles[idx].hinge_flap_km = 0.0;
         particles[idx].hinge_underthrust_km = 0.0;
         particles[idx].attached_to = NONE;
+        particles[idx].slab_drag_ratio = 0.0;
         return;
     }
 
@@ -150,7 +166,8 @@ fn columns_hinge(@builtin(global_invocation_id) id: vec3<u32>) {
     let free_rate = slab_sink_rate_km_myr(idx);
     let sink = max(u / 1000.0 - particles[idx].hinge_underthrust_km, 0.0) / sim.dt_crust_myr * sin(particles[idx].hinge_angle);
     let support = select(0.0, clamp(sink / free_rate, 0.0, 1.0), free_rate > 0.0);
-    let wu = select(0.0, -sim.mantle_density * fi * 1000.0 * 9.81, fi < 0.0) * (1.0 - support);
+    let wu0 = select(0.0, -sim.mantle_density * fi * 1000.0 * 9.81, fi < 0.0); // per area, unsupported
+    let wu = wu0 * (1.0 - support);
     let drive = Fs * Lf + wu * (Lf * Lf - xs * xs) * 0.5;
     let stiff = K * xs * xs * xs / 3.0 - P * Lf;
     let My = column_strength(idx).moment;
@@ -215,17 +232,33 @@ fn columns_hinge(@builtin(global_invocation_id) id: vec3<u32>) {
     // Subducts once the hinge has passed its back face (becomesSlab).
     if (u + xs >= width) { particles[idx].next_state = 2u; }
 
-    // Slab pull: the down-dip component of what hangs from the flap (and of
-    // the underthrust part itself), a body force toward the trench, applied
-    // against basal drag like the GPE push (flow.wgsl).
-    // At most what the column can transmit (its tensile strength across its
-    // width) and what the plate behind it can hold (its edges' tension caps):
-    // a bigger pull would tear the plate behind the hinge.
-    let pull = min((particles[idx].child_load + wu * u * width) * sin(beta), min(column_strength(idx).tension * width, 0.9 * hold));
+    // Slab pull (hingePull in hinge.js): the tension the slab carries, the
+    // down-dip weight of what hangs from the flap (each slab at its own dip,
+    // thermal.wgsl) and of the underthrust part itself (at the bend), a body
+    // force toward the trench. Moving, the column drags them down dip through
+    // the mantle: their drag coefficient, sum of W / w_free, is added to its
+    // basal drag, in the solve (inverse_drag) and here; so a plate fed by a
+    // vertical slab moves at about the slab's free sinking speed, and the
+    // vertical support the slabs get (thermal.wgsl) is the vertical part of
+    // the same drag. The pull is at most what the column can transmit
+    // (its tensile strength across its width) and what the plate behind it
+    // can hold (its edges' tension caps): more would tear the plate behind.
+    // What it transmits is the slabs' tension at the trench, the down-dip
+    // weight less their drag at the column's speed toward the trench, so
+    // those caps bound that: pull <= cap + drag x speed. (They bounded the
+    // gross down-dip weight: a plate could not outrun the cap, its slab never
+    // reached its free speed, was never held by the mantle, and necked;
+    // design 9.2.)
+    let h = max(sim.asthenosphere_base_km - lithosphere_thickness_km(idx), sim.min_channel_km) * 1000.0;
+    let gamma = particles[idx].area_ref * R_M * R_M * sim.asthenosphere_viscosity_pa_s / h;
+    let flap_weight = wu0 * u * width;
+    let flap_rate = free_rate * 1000.0 / 3.15576e13;
+    let drag = particles[idx].child_drag + select(0.0, flap_weight / flap_rate, flap_rate > 0.0);
+    particles[idx].slab_drag_ratio = drag / gamma;
+    let speed = select(0.0, max(dot(particles[idx].velocity.xyz, nh), 0.0) * R_M / 3.15576e13, nl > 0.0); // m/s toward the trench, last step
+    let pull = min(particles[idx].child_pull + flap_weight * sin(beta), min(column_strength(idx).tension * width, 0.9 * hold) + drag * speed);
     if (pull > 0.0 && nl > 0.0) {
-        let h = max(sim.asthenosphere_base_km - lithosphere_thickness_km(idx), sim.min_channel_km) * 1000.0;
-        let gamma = particles[idx].area_ref * R_M * R_M * sim.asthenosphere_viscosity_pa_s / h;
-        let dx = pull * sim.dt_crust_myr * 3.15576e13 / gamma / R_M;
+        let dx = pull * sim.dt_crust_myr * 3.15576e13 / (gamma + drag) / R_M;
         let x = vec4f(normalize(particles[idx].predicted_pos.xyz + dx * nh), 1.0);
         particles[idx].predicted_pos = x;
     }

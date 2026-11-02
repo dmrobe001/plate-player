@@ -1646,18 +1646,22 @@ test('two-plate planet: loads with its own scaled parameters and steps without N
 
 // --- The trench hinge (design 6; src/columns/hinge.js) -----------------------
 
-test('trench hinge: slab pull bends the flap, the contact gives way, the column goes under and subducts while its slab still hangs', { timeout: 600_000 }, async () => {
+test('trench hinge: slab pull bends the flap, the column goes under and subducts while its slab hangs; the column behind inherits the trench and follows, at a slab-driven speed', { timeout: 900_000 }, async () => {
   // A row along the equator: eight bonded old-ocean columns, the last across a
-  // broken edge from a four-column continental plate; a slab at the first
+  // broken edge from a sixteen-column continental plate (large enough not to
+  // be pushed away: overriding plates are large); a slab at the first
   // continental column's position, hanging from the leading ocean column. No
-  // mantle flow: slab pull is the only driver. Damage off, so the test isolates the hinge.
+  // mantle flow: slab pull is the only driver. Damage off, so the test
+  // isolates the hinge (it changes nothing here: the edges stay below their
+  // thresholds, design 9.2).
   const page = await openPage({ small: true });
   const out = await page.evaluate(async () => {
-    const a = 0.0175, half = Math.asin(a), N = 8;
+    const a = 0.0175, half = Math.asin(a), N = 8, NC = 16;
     const at = (k) => { const t = k * 2 * half; return [Math.sin(t), 0, Math.cos(t)]; };
     const pts = [];
     for (let k = 0; k < N; k++) pts.push(at(k - N + 1));
-    pts.push(at(1), at(1), at(2), at(3), at(4));
+    pts.push(at(1), at(1));
+    for (let k = 2; k <= NC; k++) pts.push(at(k));
     const n = pts.length, lead = N - 1, C = N, S = N + 1;
     const isC = (i) => i === C || i > S;
     const col = (o, c, s) => Float32Array.from(pts, (_, i) => (isC(i) ? c : i === S ? s : o));
@@ -1666,43 +1670,59 @@ test('trench hinge: slab pull bends the flap, the contact gives way, the column 
     await plate.setParams({ mantle_drive: 0, solver_iterations: 256, dt_crust_myr: 0.25, damage_slip_km: 1e9 });
     const ba = [], bb = [], bd = [];
     for (let k = 0; k < N - 1; k++) { ba.push(k); bb.push(k + 1); bd.push(0); }
-    ba.push(lead, lead, C, S + 1, S + 2); bb.push(C, S, S + 1, S + 2, S + 3); bd.push(1, 0, 0, 0, 0);
+    ba.push(lead, lead, C); bb.push(C, S, S + 1); bd.push(1, 0, 0);
+    for (let i = S + 1; i < n - 1; i++) { ba.push(i); bb.push(i + 1); bd.push(0); }
     await plate.loadState({
       particles: { count: n, position: Float32Array.from(pts.flat()), thickness: col(7, 35, 7), compositionDensity: col(3000, 2700, 3000), age: col(100, 1000, 100),
         temperature: new Float32Array(n).fill(278), apothem: new Float32Array(n).fill(a), state: Uint32Array.from(pts, (_, i) => (i === S ? 2 : 1)) },
       bonds: { count: ba.length, a: Uint32Array.from(ba), b: Uint32Array.from(bb), damage: Float32Array.from(bd) },
     });
-    const L = plate.layout.Particle, o = L.offsets, W = L.words, NONE = 0xffffffff;
+    const L = plate.layout.Particle, o = L.offsets, W = L.words;
     const rows = [];
-    for (let s = 1; s <= 40; s++) {
+    const next = lead - 1;
+    for (let s = 1; s <= 64; s++) {
       const V = await plate.debug.counters();
       await plate.runSteps(1);
       const f = new Float32Array((await plate.readBuffers(['particles'])).particles), u = new Uint32Array(f.buffer);
+      const c = await plate.debug.counters();
       rows.push({
         s, leadState: u[lead * W + o.state], beta: f[lead * W + o.hinge_angle], under: f[lead * W + o.hinge_underthrust_km],
-        partner: u[lead * W + o.hinge_partner], slabHangs: u[S * W + o.attached_to], slabActive: u[S * W + o.is_active],
-        continents: [C, S + 1, S + 2, S + 3].map((i) => u[i * W + o.state]), lost: (await plate.debug.counters()).slabsLost,
-        sinkStep: (await plate.debug.counters()).volumeSink - V.volumeSink, leadVolume: f[lead * W + o.crust_volume],
+        slabHangs: u[S * W + o.attached_to], slabActive: u[S * W + o.is_active],
+        leadHangs: u[lead * W + o.attached_to], nextState: u[next * W + o.state], nextPartner: u[next * W + o.hinge_partner],
+        speed: Math.hypot(f[o.velocity], f[o.velocity + 1], f[o.velocity + 2]) * 637.1, // the trailing column, cm/yr
+        continents: Array.from({ length: NC }, (_, k) => u[(k === 0 ? C : S + k) * W + o.state]), lost: c.slabsLost,
+        sinkStep: c.volumeSink - V.volumeSink, leadVolume: f[lead * W + o.crust_volume],
       });
-      if (u[lead * W + o.state] === 2) break;
+      if (u[next * W + o.state] === 2) break;
     }
-    return { rows, lead, S };
+    return { rows, lead, next, C };
   });
   assert.deepEqual(page.errors, []);
   await page.close();
-  const { rows, lead } = out;
+  const { rows, lead, next, C } = out;
   const bent = rows.find((r) => r.leadState === 1 && r.beta > 0.05);
   const down = rows.find((r) => r.leadState === 2);
   const maxUnder = Math.max(...rows.filter((r) => r.leadState === 1).map((r) => r.under));
-  console.log(`  flap bent ${bent ? (bent.beta * 57.3).toFixed(1) : '-'} deg by step ${bent?.s}; underthrust up to ${maxUnder.toFixed(0)} km; leading column subducted at step ${down?.s} (${down ? down.s * 0.25 : '-'} Myr); its slab then hangs from ${down?.slabHangs} (the leading column is ${lead}); slabs lost ${down?.lost}`);
+  const after = rows.filter((r) => down && r.s > down.s);
+  const second = rows.find((r) => r.nextState === 2);
+  const speeds = rows.filter((r) => r.s > 4).map((r) => r.speed).sort((x, y) => x - y);
+  const median = speeds[Math.floor(speeds.length / 2)];
+  console.log(`  flap bent ${bent ? (bent.beta * 57.3).toFixed(1) : '-'} deg by step ${bent?.s}; underthrust up to ${maxUnder.toFixed(0)} km; leading column subducted at ${down ? down.s * 0.25 : '-'} Myr, its slab hanging from ${down?.slabHangs} (the leading column is ${lead}); the column behind took the trench (partner ${after[1]?.nextPartner}, the continent's front is ${C}) and subducted at ${second ? second.s * 0.25 : '-'} Myr, the first hanging from it (${second?.leadHangs}); plate speed median ${median.toFixed(1)} cm/yr; slabs lost ${rows.at(-1).lost}`);
   assert.ok(bent, 'slab pull bends the flap');
   assert.ok(maxUnder > 50, 'the column goes under the overriding plate');
   assert.ok(down, 'the leading column subducts');
   assert.equal(down.slabHangs, lead, 'the slab it dragged still hangs from it (the heuristic)');
   assert.equal(down.slabActive, 1);
-  assert.equal(down.lost, 0);
-  assert.ok(rows.every((r) => r.continents.every((x) => x === 1)), 'continents never subduct');
   assert.ok(Math.abs(down.sinkStep / down.leadVolume - 1) < 1e-4, 'its volume leaves the surface budget');
+  // The trench lives on: the column behind inherits the overriding partner
+  // (not its own slab), goes under in turn, and the first slab hangs from it.
+  assert.ok(after.length > 1 && after.slice(1).every((r) => r.nextState === 2 || r.nextPartner === C), 'the column behind takes the trench');
+  assert.ok(second, 'the column behind subducts');
+  assert.equal(second.leadHangs, next, 'the first slab hangs from the second');
+  assert.equal(rows.at(-1).lost, 0);
+  assert.ok(rows.every((r) => r.continents.every((x) => x === 1)), 'continents never subduct');
+  // Driven by its slab, held back by the slab's drag: a few cm/yr (slab-attached plates move 6-9, Forsyth & Uyeda 1975; this slab is one or two columns).
+  assert.ok(median > 1 && median < 10, `plate speed ${median} cm/yr`);
 });
 
 test('no net rotation: the GPU removes the area-weighted rigid rotation of the mantle-driven motion, as the reference does, and keeps the rest', { timeout: 300_000 }, async () => {

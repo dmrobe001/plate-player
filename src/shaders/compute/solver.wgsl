@@ -36,10 +36,12 @@ fn thermal_age_cap_myr(rho: f32) -> f32 {
 
 // Couette shear across the asthenosphere: drag per area = viscosity / h, with
 // h from the plate's base to the base of the low-viscosity layer. Returned
-// relative to a base-size particle over the reference channel (w = 1).
+// relative to a base-size particle over the reference channel (w = 1). A
+// trench column also drags its slabs (and its flap) down dip through the
+// mantle: slab_drag_ratio times its basal drag (hinge.wgsl, design 6).
 fn inverse_drag(i: u32) -> f32 {
     let channel = max(sim.asthenosphere_base_km - lithosphere_thickness_km(i), sim.min_channel_km);
-    return (base_area() / particles[i].area_ref) * (channel / sim.drag_reference_channel_km);
+    return (base_area() / particles[i].area_ref) * (channel / sim.drag_reference_channel_km) / (1.0 + particles[i].slab_drag_ratio);
 }
 
 // The same basal shear resists the column's spin: drag x squared radius of
@@ -244,7 +246,7 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     // Overdamped: velocity is not state, only a record of this step's motion.
-    particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, particles[idx].velocity.w); // (w: a slab's descent rate, thermal.wgsl)
+    particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, particles[idx].velocity.w); // (w: a hanging slab's feed rate down dip, thermal.wgsl)
     let x = particles[idx].predicted_pos.xyz;
     particles[idx].position = vec4f(x, 1.0);
     // Body axis: carried to the new tangent plane and turned by the spin
@@ -269,15 +271,21 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
         particles[idx].hinge_angle = dip;
         particles[idx].hinge_plastic = 0.0; // a slab's neck (thermal.wgsl, slab_hang)
         particles[idx].slab_extent_km = 2.0 * particles[idx].apothem * EARTH_RADIUS_KM * sin(dip);
-        particles[idx].hinge_partner = NONE;
+        // (hinge_partner kept: the overriding column it went under, which the
+        // column behind inherits as its trench partner, hinge.wgsl.)
         particles[idx].hinge_flap_km = 0.0;
         particles[idx].hinge_underthrust_km = 0.0;
+        particles[idx].slab_drag_ratio = 0.0; // (a slab's drag is its own: it sinks, thermal.wgsl)
         if (sim.slab_attach_factor <= 0.0) { particles[idx].attached_to = NONE; }
     }
     particles[idx].next_state = particles[idx].state;
     // What hung from this column this step loads its hinge (or the slab above) next step.
     particles[idx].child_load = bitcast<f32>(atomicLoad(&particle_deltas[idx].child_load));
     atomicStore(&particle_deltas[idx].child_load, 0u);
+    particles[idx].child_pull = bitcast<f32>(atomicLoad(&particle_deltas[idx].child_pull));
+    atomicStore(&particle_deltas[idx].child_pull, 0u);
+    particles[idx].child_drag = bitcast<f32>(atomicLoad(&particle_deltas[idx].child_drag));
+    atomicStore(&particle_deltas[idx].child_drag, 0u);
     particles[idx].slab_child = NONE;
 }
 

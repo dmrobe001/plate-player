@@ -1108,13 +1108,32 @@ test('hinge: elastic, plastic and runaway branches of the torque balance', () =>
   assert.ok(Math.abs(hinge.contactWeakening(1, 0.6, 0.1) - 0.1) < 1e-12);
   assert.equal(hinge.becomesSlab(1.5e6, 5e4, 1.55e6), true);
   assert.equal(hinge.becomesSlab(1.4e6, 5e4, 1.55e6), false);
-  // A hanging slab passes up its weight less viscous support, capped at the attachment's strength;
-  // the excess necks it, and necked through its thickness it breaks off.
-  const held = hinge.hangSlab({ weight: 10, childLoad: 3, descent: 1, freeRate: 4, cap: 100, dt: 1, thicknessKm: 100 });
-  assert.deepEqual(held, { load: 10 * 0.75 + 3, neck: 0, broken: false });
-  const heavy = hinge.hangSlab({ weight: 40, childLoad: 0, descent: 0, freeRate: 30, cap: 10, neck: 90, dt: 0.5, thicknessKm: 100 });
-  assert.equal(heavy.load, 10);
+  // A hanging slab: vertical load less viscous support for the bend; down-dip
+  // tension at its top for necking. Fed at its free speed along dip, the
+  // mantle holds it: no tension, whatever its weight.
+  const W = 1e18, w = 30, dip = 1.0, Myr = 3.15576e13;
+  assert.ok(Math.abs(hinge.slabDrag(W, w) - W / (w * 1000 / Myr)) < 1);
+  assert.ok(Math.abs(hinge.slabTension({ weight: W, dip, freeRate: w, feed: w * Math.sin(dip) })) < 1e-3 * W);
+  assert.ok(Math.abs(hinge.slabTension({ weight: W, dip, freeRate: w, feed: 0 }) - W * Math.sin(dip)) < 1);
+  const held = hinge.hangSlab({ weight: 10, dip: Math.PI / 2, feed: 1, freeRate: 4, childLoad: 3, cap: 100, dt: 1, thicknessKm: 100 });
+  assert.ok(Math.abs(held.load - (10 * 0.75 + 3)) < 1e-12 && held.neck === 0 && !held.broken);
+  assert.ok(Math.abs(held.pull - 10) < 1e-12 && Math.abs(held.drag - hinge.slabDrag(10, 4)) < 1e-9);
+  // Unfed and too heavy: it necks at w_free (1 - cap / T); necked through its thickness, it breaks off.
+  const heavy = hinge.hangSlab({ weight: 40, dip: Math.PI / 2, feed: 0, freeRate: 30, cap: 10, neck: 90, dt: 0.5, thicknessKm: 100 });
+  assert.ok(Math.abs(heavy.load - 10) < 1e-12);
   assert.ok(Math.abs(heavy.neck - (90 + 30 * 0.75 * 0.5)) < 1e-12 && heavy.broken);
+  // Dip: a pinned slab turns toward vertical, d dip / dt = (w / L) cos dip, and stops there.
+  assert.ok(Math.abs(hinge.slabDipStep(0.5, 20, 200, 0.25) - (0.5 + 0.25 * 0.1 * Math.cos(0.5))) < 1e-12);
+  assert.equal(hinge.slabDipStep(1.5, 1e6, 200, 1), Math.PI / 2);
+  // The trench column's pull: its slabs' down-dip weight; strength bounds the
+  // tension it transmits (pull - drag x speed), so a fast plate can pull more
+  // than its strength while the mantle holds the rest.
+  const C = hinge.slabDrag(W, w);
+  assert.equal(hinge.hingePull({ childPull: W, flapWeight: 0, beta: 0.3, cap: 0.2 * W, drag: C, speed: 0 }), 0.2 * W);
+  const v = 0.9 * w * 1000 / Myr;
+  assert.ok(Math.abs(hinge.hingePull({ childPull: W, flapWeight: 0, beta: 0.3, cap: 0.2 * W, drag: C, speed: v }) - W) < 1);
+  // A plate whose only drag is its vertical slab's moves at the slab's free speed.
+  assert.ok(Math.abs(W / C / (w * 1000 / Myr) - 1) < 1e-12);
 });
 
 test('hinge: column strength in bending and in tension from its yield-strength envelope', () => {

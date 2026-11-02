@@ -199,7 +199,7 @@ export const SIM_PARAMS = [
   ['slab_cutoff_km', 'f32', 660.0],
   // Eclogite (design 6): a slab's oceanic crust turns from basalt to eclogite
   // at ~1.5-2 GPa (50-70 km; delayed in cold slabs), denser than the mantle
-  // (Hacker et al. 2003). Linear over +-10 km about this depth of its top.
+  // (Hacker et al. 2003). Linear over +-10 km about this depth of its middle.
   // Continental crust stays buoyant.
   ['eclogite_depth_km', 'f32', 60.0],
   ['eclogite_density', 'f32', 3500.0],

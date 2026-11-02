@@ -32,7 +32,10 @@ struct ParticleDelta {
     tdx: atomic<i32>, tdy: atomic<i32>, tdz: atomic<i32>, pad4: u32,
     // Load of the slabs hanging from this column, N, as f32 bits (atomic_add_f32);
     // copied to Particle.child_load and cleared at the end of the step.
-    child_load: atomic<u32>, pad5: u32, pad6: u32, pad7: u32,
+    // Likewise the down-dip weight (W sin dip, unsupported) and the drag
+    // coefficient (W / w_free, N s / m) of the slabs hanging from it
+    // (Particle.child_pull, child_drag).
+    child_load: atomic<u32>, child_pull: atomic<u32>, child_drag: atomic<u32>, pad7: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> grid: array<GridNode>;

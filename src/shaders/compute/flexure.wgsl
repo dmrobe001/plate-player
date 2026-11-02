@@ -103,18 +103,33 @@ fn slabs_arc_count(@builtin(global_invocation_id) id: vec3<u32>) {
     if (!(particles[idx].arc_supply > 0.0)) { return; }
     var count = 0u;
     let p = particles[idx].position.xyz;
-    // The plate behind the slab: its surface edge partners, weighted by
-    // integrity (slot lists from last step's edges). Arcs grow on the other side.
-    var t = vec3f(0.0);
-    let ns = min(atomicLoad(&particle_deltas[idx].slot_count), MAX_SLOTS);
-    for (var k = 0u; k < ns; k++) {
-        let e = particle_deltas[idx].slots[k];
-        if (edges[e].is_active == 0u) { continue; }
-        let j = other_end(e, idx);
-        if (particles[j].state == 1u) { t += edges[e].integrity * (particles[j].position.xyz - p); }
+    // The plate behind the slab, where arcs do not grow: up the chain of
+    // slabs it hangs from to the surface column at its top (a hanging slab
+    // has no edges); for a free slab (or a chain hanging from one), the
+    // surface edge partners of that top slab, weighted by integrity (slot
+    // lists from last step's edges). (A slab hanging from a slab took the
+    // direction to its parent slab, which sits at the trench: for a chain
+    // that pointed back over the subducting plate, and its arc reset the
+    // column behind the trench; design 9.2.)
+    var top = idx;
+    for (var hop = 0u; hop < 16u; hop++) {
+        let a = particles[top].attached_to;
+        if (a == NONE || particles[a].is_active == 0u) { break; }
+        top = a;
+        if (particles[a].state == 1u) { break; }
     }
-    // A hanging slab has no edges: the plate behind it is what it hangs from.
-    if (particles[idx].attached_to != NONE) { t = particles[particles[idx].attached_to].position.xyz - p; }
+    var t = vec3f(0.0);
+    if (particles[top].state == 1u) {
+        t = particles[top].position.xyz - p;
+    } else {
+        let ns = min(atomicLoad(&particle_deltas[top].slot_count), MAX_SLOTS);
+        for (var k = 0u; k < ns; k++) {
+            let e = particle_deltas[top].slots[k];
+            if (edges[e].is_active == 0u) { continue; }
+            let j = other_end(e, top);
+            if (particles[j].state == 1u) { t += edges[e].integrity * (particles[j].position.xyz - p); }
+        }
+    }
     if (length(t) > 0.0) { particles[idx].slab_trailing = vec4f(normalize(t), 1.0); }
     let home = hash_cell(p);
     let dim = i32(sim.hash_grid_dim);

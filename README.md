@@ -521,8 +521,14 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       physical scale. Intact rock past its tension cap now faults permanently, and
       integrity falls by slip over a fault-maturity distance (10 km): realistic net
       forces never break a plate, overloads break it in geological time (§4.7, §9.2).
-- [ ] **The trench strip blows up ~0.5 Myr after its first subduction:** a hinge
-      forms against the column's own plate neighbour (design.md §9.2).
+- [x] ~~The trench strip blew up after its first subduction.~~ The hinge rules now
+      drag the slab with its plate, steepen hanging slabs, keep arcs on the
+      overriding side, hand the trench on to the column behind, and bound the
+      slab's tension rather than its weight: the strip subducts column after
+      column at 3–5 cm/yr (design.md §6, §9.2).
+- [ ] **The two-plate planet's trench is still locked:** its 1,900 km columns must
+      go ~1,850 km under to subduct. Next: continuous consumption through the
+      hinge (design.md §9.2).
 - [x] ~~The planet could drift as a whole.~~ Each step's area-weighted net
       rotation is removed (the geodesists' no-net-rotation frame; design.md §5.3).
       In the two-plate world it was nearly all the motion: the trench is locked

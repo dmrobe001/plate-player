@@ -48,9 +48,9 @@ fn column_of(i: u32) -> Column {
     c.continental = c.rho_crust < 2850.0;  // CONTINENTAL_DENSITY_MAX
     c.elevation = particles[i].elevation;
     c.slab = particles[i].state == 2u;
-    // A slab's oceanic crust turns to eclogite (crustDensity in profile.js).
+    // A slab's oceanic crust turns to eclogite at its middle's depth (crustDensity in profile.js).
     if (c.slab && !c.continental) {
-        let f = clamp((-c.elevation - (sim.eclogite_depth_km - 10.0)) / 20.0, 0.0, 1.0);
+        let f = clamp((-c.elevation + 0.5 * particles[i].slab_extent_km - (sim.eclogite_depth_km - 10.0)) / 20.0, 0.0, 1.0);
         c.rho_crust = mix(c.rho_crust, sim.eclogite_density, f);
     }
     c.lith_km = lithosphere_thickness_km(i);
