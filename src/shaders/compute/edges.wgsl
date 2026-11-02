@@ -89,6 +89,7 @@ fn new_edge(a: u32, b: u32, integrity: f32) -> Edge {
     c.strain = (c.length - rest) / rest;
     c.inelastic_strain = 0.0;
     c.work_mpa_km = 0.0;
+    c.damage_slip_km = 0.0;
     for (var k = 0u; k < 8u; k++) { c.slice_stress_mpa[k] = sim.crust_youngs_modulus_gpa * 1000.0 * c.strain; }
     c.stiffness = 0.0;
     c.reference_gap = 0.0;

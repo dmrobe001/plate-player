@@ -61,7 +61,11 @@ export function shapeAxes(p, q) {
  * neighbourhood's rotation relative to the column's own spin (zero when the
  * column turns with its surroundings): it is fitted, so a column that lags
  * the local rotation does not read it as shear. Returns {exx, eyy, exy, w},
- * or null when the directions do not determine them.
+ * or null when the directions do not determine them: a singular system, or
+ * a trace beyond twice the largest normal strain any edge saw (a 2D tensor's trace
+ * is at most twice its largest principal strain, and edges spread in angle
+ * sample that; a nearly one-directional neighbourhood, like a strip, passes
+ * the determinant test but extrapolates without bound).
  */
 export function fitStrain(rows) {
   const A = Array.from({ length: 4 }, () => [0, 0, 0, 0]), r = [0, 0, 0, 0];
@@ -74,7 +78,9 @@ export function fitStrain(rows) {
   const tr = A[0][0] + A[1][1] + A[2][2] + A[3][3];
   if (!(Math.abs(d) > 1e-6 * tr ** 4)) return null;
   const col = (k) => A.map((row, i) => row.map((v, j) => (j === k ? r[i] : v)));
-  return { exx: det(col(0)) / d, eyy: det(col(1)) / d, exy: det(col(2)) / d, w: det(col(3)) / d };
+  const fit = { exx: det(col(0)) / d, eyy: det(col(1)) / d, exy: det(col(2)) / d, w: det(col(3)) / d };
+  const seen = rows.reduce((m, { en }) => Math.max(m, Math.abs(en)), 0);
+  return Math.abs(fit.exx + fit.eyy) <= 2 * seen * (1 + 1e-4) ? fit : null;
 }
 
 /** Determinant by elimination with partial pivoting. */

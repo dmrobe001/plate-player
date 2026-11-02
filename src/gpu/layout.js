@@ -168,7 +168,8 @@ export const Edge = defineStruct('Edge', [
   // Diagnostics of the last update (design 4.7, phase D):
   ['strain', 'f32'],            // (|x_b - x_a| - rest) / rest
   ['inelastic_strain', 'f32'],  // strain increment not stored elastically (feeds area_ref)
-  ['work_mpa_km', 'f32'],       // plastic work (feeds damage)
+  ['work_mpa_km', 'f32'],       // plastic work this step (diagnostic)
+  ['damage_slip_km', 'f32'],    // this step's plastic displacement, weighted by the share of strength yielding (feeds damage)
   // Derived each step by edges_law, for the solve:
   ['stiffness', 'f32'],         // effective stiffness / (E * stiffness_reference_km), in [0, 1]
   ['reference_gap', 'f32'],     // gap C (unit sphere) at which the linearised force is zero

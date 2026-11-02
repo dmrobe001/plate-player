@@ -26,10 +26,15 @@
 //   - ductile slices flow, and brittle compression slips: the stored stress
 //     is the capped stress (the slice's stress-free length moves; the pair's
 //     rest length does not; the isotropic part goes to area_ref in phase D);
-//   - brittle tension cracks: the slice carries its cap (nothing at phi = 0) and stays referenced to the rest length: its stored stress is
-//     the elastic trial stress, less only the creep driven by the stress it
-//     actually carries. So a crack closes, and a contact re-engages, exactly
-//     at touching.
+//   - brittle tension: the slice carries its cap; what it is stretched beyond
+//     is split by integrity. The intact share phi is normal faulting:
+//     permanent, stored at the cap, inelastic strain (it thins the column).
+//     The broken share 1 - phi is a crack: it stays referenced to the rest
+//     length (the elastic trial stress, less only the creep driven by the
+//     stress it actually carries), so it closes, and a contact re-engages,
+//     exactly at touching. (All crack before calibration, design 9.2: an
+//     intact plate stretched past its strength then pulled back at the cap
+//     once the load went.)
 //
 // Within a step the law is linear (Chebyshev needs that): every slice
 // contributes its decayed stored stress and its stiffness E r, and the total
@@ -138,7 +143,7 @@ export function edgeSlices(a, b, phi, p, normalStress = null) {
       slips: brittleShear < ductileCap,
     });
   }
-  return { top, bottom, overlap, slices };
+  return { top, bottom, overlap, slices, phi };
 }
 
 const E_MPA = (p) => p.crust_youngs_modulus_gpa * 1000;
@@ -194,22 +199,26 @@ export function lambdaBounds(lin, rest, p) {
 export function maxwellUpdate(stress, edge, dStrain, p) {
   const E = E_MPA(p);
   const stored = [], actual = [];
-  let S = 0, work = 0, inelastic = 0, rMax = -1;
+  let S = 0, work = 0, inelastic = 0, rMax = -1, capSum = 0;
   edge.slices.forEach((s, k) => {
     const elastic = stress[k] + E * dStrain;       // no creep
     const relaxed = elastic * s.r;                 // Maxwell, implicit Euler
     const capped = Math.min(Math.max(relaxed, -s.comp), s.tens);
     const crack = relaxed > s.tens && s.cracks;
-    const kept = crack ? elastic - (1 / s.r - 1) * s.tens : capped;
+    // Beyond a brittle tension cap: the broken share 1 - phi is a crack (trial stress kept), the rest is permanent.
+    const kept = crack ? s.tens + (1 - edge.phi) * (elastic - (1 / s.r - 1) * s.tens - s.tens) : capped;
     actual.push(capped);
     stored.push(kept);
     S += capped * s.dz;
     if (crack) work += s.tens * Math.max(dStrain, 0) * s.dz;
     else if (relaxed !== capped) work += Math.abs(capped * (relaxed - capped) / (E * Math.max(s.r, 1e-30))) * s.dz;
     if (s.r > rMax) { rMax = s.r; inelastic = dStrain - (kept - stress[k]) / E; }
+    capSum += (dStrain > 0 ? s.tens : s.comp) * s.dz;
   });
   return {
     stored, actual, S, work,
+    // Plastic strain weighted by the share of the strength that yields (work over the caps).
+    plasticStrain: capSum > 0 ? work / capSum : 0,
     inelastic: edge.overlap > 0 ? inelastic : 0,
     meanStress: edge.overlap > 0 ? S / edge.overlap : 0,
   };
@@ -228,12 +237,14 @@ export function healTimeMyr(T, p) {
 }
 
 /**
- * Integrity law (design 4.7), one step: damage by plastic work,
- * phi -= W / W_D (floored at 0), then healing toward 1 with time scale
- * tau_heal(T), integrated exactly: 1 - phi decays by exp(-dt / tau).
+ * Integrity law (design 4.7), one step: slip weakening. `slipKm` is the
+ * step's plastic displacement across the edge, weighted by the share of its
+ * strength that yields (plasticStrain of both channels x rest length, km);
+ * phi -= slip / damage_slip_km (floored at 0), then healing toward 1 with
+ * time scale tau_heal(T), integrated exactly: 1 - phi decays by exp(-dt / tau).
  */
-export function integrityStep(phi, work, T, p) {
-  const damaged = Math.max(phi - work / p.damage_work_mpa_km, 0);
+export function integrityStep(phi, slipKm, T, p) {
+  const damaged = Math.max(phi - slipKm / p.damage_slip_km, 0);
   return 1 - (1 - damaged) * Math.exp(-p.dt_crust_myr / healTimeMyr(T, p));
 }
 
@@ -283,20 +294,22 @@ export function linearizeShear(tau, edge, rest, p) {
  */
 export function maxwellShear(tau, edge, dGamma, p) {
   const G = p.shear_stiffness_ratio * E_MPA(p);
-  if (!(G > 0)) return { stored: tau.map(() => 0), S: 0, work: 0, slip: 0, ductile: 0, meanStress: 0 };
+  if (!(G > 0)) return { stored: tau.map(() => 0), S: 0, work: 0, plasticStrain: 0, slip: 0, ductile: 0, meanStress: 0 };
   const stored = [];
-  let S = 0, work = 0, rMax = -1, inelastic = 0, faultSlip = false;
+  let S = 0, work = 0, rMax = -1, inelastic = 0, faultSlip = false, capSum = 0;
   edge.slices.forEach((s, k) => {
     const relaxed = (tau[k] + G * dGamma) * s.r;
     const capped = Math.min(Math.max(relaxed, -s.shear), s.shear);
     stored.push(capped);
     S += capped * s.dz;
+    capSum += s.shear * s.dz;
     if (relaxed !== capped) work += Math.abs(capped * (relaxed - capped) / (G * Math.max(s.r, 1e-30))) * s.dz;
     if (s.r > rMax) { rMax = s.r; inelastic = dGamma - (capped - tau[k]) / G; faultSlip = s.slips && relaxed !== capped; }
   });
   if (!(edge.overlap > 0)) inelastic = 0;
   return {
     stored, S, work,
+    plasticStrain: capSum > 0 ? work / capSum : 0,
     slip: faultSlip ? inelastic : 0, ductile: faultSlip ? 0 : inelastic,
     meanStress: edge.overlap > 0 ? S / edge.overlap : 0,
   };

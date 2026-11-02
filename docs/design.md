@@ -492,10 +492,15 @@ strengths, μP′ + φc, and that over q in tension, with σ_d/2 for ductile sli
 cohesion alone.) The tangential channel keeps Coulomb's rule: there slip is on the
 vertical face itself. Above a cap: ductile slices
 flow and brittle slices slip in compression (the stored stress is the capped
-stress). Brittle slices *crack* in tension: they store their elastic trial stress,
-less only the creep their capped stress drives, so they stay referenced to the rest
-length. Cracks close, and contacts engage, exactly at touching. So an edge at φ = 0
-between cold columns only pushes (a contact). A new edge loads every slice
+stress). A brittle slice stretched beyond its tension cap splits by integrity. The
+intact share φ faults (normal faulting): permanent, stored at the cap, inelastic
+strain that thins the column. The broken share 1 − φ *cracks*: it stores its elastic
+trial stress, less only the creep its capped stress drives, so it stays referenced
+to the rest length, and cracks close, and contacts engage, exactly at touching. So
+an edge at φ = 0 between cold columns only pushes (a contact), and pairs separate
+freely along broken boundaries, as neighbour exchange and diverging plates need in
+a column model. (Before calibration, 9.2, intact slices cracked too: a plate
+stretched past its strength then pulled back at its cap once the load went.) A new edge loads every slice
 elastically from the rest length, σ = E·(strain now): a gap is an open crack, an
 overlap pushes at once.
 
@@ -597,7 +602,8 @@ means solver residuals below yield (~MPa) change nothing permanent.
     relaxing below is load moving to the lid, not shortening);
   - a lid at its cap lets the column flow; an all-hot column flows by its coldest
     part;
-  - crack opening is not inelastic: it closes again;
+  - crack opening (the broken share) is not inelastic: it closes again; normal
+    faulting (the intact share) is;
   - an edge in its first step contributes none: what its slices relax is the load it
     was born with, not flow (in hot rock, the gaps of new neighbours would otherwise
     read as dilatation, e.g. after neighbour exchange in shear).
@@ -613,18 +619,27 @@ means solver residuals below yield (~MPa) change nothing permanent.
   collapse.
 - **Shape:** the deviatoric part of the fit, turned with the material (4.2).
 - **Plastic work:** cap × plastic strain × dz, summed over slices at a cap in both
-  channels, plus cohesion × opening for cracks. Creep below a cap is not counted.
-- **Integrity:**
+  channels, plus cap × opening beyond a brittle tension cap. Creep below a cap is
+  not counted. Kept as `work_mpa_km` (a diagnostic).
+- **Integrity: slip weakening.** The step's plastic displacement across the edge,
+  weighted by the share of its strength that yields: s = (W/ΣS_cap) × rest, per
+  channel (normal: the caps in the step's direction; tangential: the shear caps),
+  summed (`damage_slip_km` on the edge, `plasticStrain` in `law.js`).
 
-  > φ ← max(φ − W/W_D, 0), then 1 − φ decays by exp(−dt/τ_heal(T))
+  > φ ← max(φ − s/d_D, 0), then 1 − φ decays by exp(−dt/τ_heal(T))
 
-  W is positive for compression, extension and shear alike, so any permanent
-  deformation reduces integrity. τ_heal = `heal_time_myr` × exp(Q_h/R (1/T − 1/T_m)),
+  d_D = `damage_slip_km` (10 km): the cumulative slip at which faults become
+  structurally mature (Wesnousky 1988; order of magnitude). It replaces a work
+  scale W_D = 50 MPa·km that had no physical anchor and treated thin young plates and
+  thick old ones alike: weighted by the share of strength, an edge loses integrity
+  by how far it has slipped, not by its thickness. s is positive for compression,
+  extension and shear alike, so any permanent deformation reduces integrity. τ_heal = `heal_time_myr` × exp(Q_h/R (1/T − 1/T_m)),
   T the temperature of the edge's load-bearing part (slice temperatures weighted by
-  r·dz): hot material heals fast. Defaults: W_D = 50 MPa·km; τ_heal = 0.1 Myr at
-  mantle temperature, 53 Myr at 1200 K, effectively never below ~900 K. This mirrors
-  grain-damage theory of plate-boundary formation (Bercovici & Ricard 2012); W_D and
-  τ_heal decide whether damage localises into narrow boundaries (section 10).
+  r·dz): hot material heals fast. τ_heal = 0.1 Myr at mantle temperature, 53 Myr at
+  1200 K, effectively never below ~900 K. This mirrors grain-damage theory of
+  plate-boundary formation (Bercovici & Ricard 2012); d_D and τ_heal decide whether
+  damage localises into narrow boundaries (section 10). The slip is a strain × the
+  column spacing, so at a given strain coarse columns damage faster (below).
 - **Thermal:** thermal age advances (capped by composition); stretching scales it
   (4.8); arcs reset it (section 6).
 - **State transitions:** suturing via the edge timer; subduction when a trench hinge
@@ -632,7 +647,8 @@ means solver residuals below yield (~MPa) change nothing permanent.
 
 **Checked:** uniform shortening at the caps thickens a 19-column patch at the
 predicted rate (ln 0.0479 over steps 6–12 against 0.0481) with volume held to 10⁻⁵;
-integrity matches 1 − ΣW/W_D to 2×10⁻⁷; pure shear changes no area; a patch below
+integrity matches 1 − Σs/d_D to 2×10⁻⁷; pure shear changes no area where the patch
+is broken (cracks) and grows it where intact (the stretched side faults); a patch below
 yield, solved for 30 steps, does zero work and keeps integrity exactly 1.
 
 ### 4.8 Area, volume, melt and splits
@@ -1196,7 +1212,7 @@ result once:
   rigidity (non-rigid strain rate ≲ 10⁻⁹/yr); ridge depth ∝ √age; ~7 km oceanic
   crust; orogen heights bounded by collapse; coverage exact; volume budget closed;
   damage localised into narrow boundaries.
-- **Handles:** basal drag (η_a), the GPE force (on), W_D and τ_heal, the edge
+- **Handles:** basal drag (η_a), the GPE force (on), d_D and τ_heal, the edge
   interaction parameters (`ductile_damage_weakening`, cohesion, the tangential ratio,
   the aspect cap), and subduction's (interface weakening, the buoyancy criterion,
   `slab_attach_factor`).
@@ -1310,26 +1326,38 @@ counter (`slabsLost`). Measured:
   damage off as well, with the warm start off and with plain Jacobi. Its brittle
   slices store crack trial stresses several times their caps (137 MPa against 37),
   which pull back at the cap once the load goes. Not resolved.
-- **The damage law under sustained tension** (CPU reference, one 100 Myr ocean edge
-  at a constant fraction of its intact tension cap, 4,880 MPa·km; dt 0.25 Myr;
-  measured with the Coulomb caps that preceded the Anderson ones, 4.5).
-  The ductile base creeps and hands its load to the brittle lid, so the long-term
-  strength without damage is the lid's, ~65% of the cap (90% creeps without bound).
-  Damage removes integrity, and the brittle tension cap scales with integrity
-  (friction included), so damage lowers that strength further:
+- **Calibration (Anderson caps 4.5, eclogite 6, slip weakening 4.7).** The force
+  budget is now textbook (section 6): gross slab pull ~6×10¹³ N/m before warming,
+  free sinking 6 cm/yr, an old plate's edges holding 1.5×10¹³ N/m in tension. Under
+  sustained tension (CPU reference, one 100 Myr ocean edge at a constant fraction of
+  its intact tension cap, 1.47×10¹³ N/m; dt 0.25 Myr; d_D = 10 km):
 
-  | W_D (MPa·km) | 30% | 40% | 60% | 90% |
-  |---|---|---|---|---|
-  | 50 (default) | holds | fails at 39 Myr | 2.75 Myr | 0.25 Myr |
-  | 500 | holds | holds (φ 0.81 at 200 Myr) | 41 Myr | 0.5 Myr |
-  | 5000 | holds | holds | holds | 5 Myr |
+  | load | 223 km columns | 1,900 km columns |
+  |---|---|---|
+  | 30% (4.4×10¹² N/m) | holds 200 Myr | holds |
+  | 40% | fails at 74 Myr | 7.8 Myr |
+  | 60% | 12 Myr | 1 Myr |
+  | 80% | 0.75 Myr | 0.25 Myr |
 
-  Below ~30% (where the top slice first cracks) nothing is damaged. The strip's slab
-  load (~10¹⁸ N over a 223 km column, ~4.5×10¹² N/m, ~90% of the cap) exceeds even
-  the undamaged long-term strength: no damage law keeps that plate whole. Counting
-  damage as plastic displacement (a slip-weakening distance in km) instead of work
-  does not make it independent of column size, because the creep it follows is a
-  strain spread over the cell.
+  Without damage the ductile base creeps and hands its load to the brittle lid (77%
+  of the cap): 60% creeps 42% in 200 Myr, 80% without bound. So the net forces plates
+  carry on Earth (10¹²–5×10¹²) never break an intact plate, and overloads break it in
+  geological time. Coarse columns fail ~10× sooner: the same strain is 8.5× the slip.
+  (Before, with Coulomb caps and W_D = 50 MPa·km, 40% of a 3× weaker cap failed at 39
+  Myr.)
+- **Found on the way:** the column strain fit (`columns_flow`, `fitStrain`) passed
+  its determinant test for a nearly one-directional neighbourhood (a strip whose
+  columns had drifted a few degrees off line) and extrapolated noise: area_ref grew
+  56× in a step, columns grew into their neighbours and were thrown apart. A fit
+  whose trace exceeds twice the largest edge normal strain is now rejected (a 2D
+  tensor's trace is at most twice its largest principal strain).
+- **Still open: the strip after its first subduction.** With damage on or off, ~0.5
+  Myr after the leading column subducts, a trench hinge forms on the column behind
+  across the edge that just broke, against its own plate neighbour, and its slab
+  pull (a body force on one column against its own basal drag, capped by what the
+  edges behind hold, 3.5× more with the Anderson caps) throws the chain apart. Before
+  the calibration the same strip blew up at 2.25 Myr; now at 1.75–2.0. Not the damage
+  law: the hinge rules after a subduction.
 - **Two-plate planet (162 columns, 40 Myr):** all 9 seeded slabs hang at first, the
   hinges bend 4–23° and yield plastically; the slabs (1,600 km long, ~5× heavier than
   the plate can hold) neck, and five trench columns subduct within 8 Myr, but as free
@@ -1458,7 +1486,7 @@ benchmarks; several already exist as mechanism tests):
 
 - **Localisation:** does work-driven damage with thermal healing concentrate into
   narrow plate boundaries, or weaken plates diffusely? Bercovici's group finds
-  localisation only in a window of healing rates. Decide W_D and τ_heal at
+  localisation only in a window of healing rates. Decide d_D and τ_heal at
   integration.
 - **Fault-zone width:** friction plus face rolling should localise slip onto lines of
   edges; whether that happens at 220 km spacing, and how wide the zones are.

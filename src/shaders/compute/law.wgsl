@@ -188,6 +188,7 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
     let E = sim.crust_youngs_modulus_gpa * 1000.0;
     var S = 0.0;
     var work = 0.0;
+    var cap_sum = 0.0;
     var inelastic = 0.0;
     var r_max = -1.0;
     var w_sum = 0.0;
@@ -199,13 +200,17 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
         let crack = relaxed > s.tens[k] && s.cracks[k] == 1u;
         var kept = capped;
         if (crack) {
-            kept = elastic - (1.0 / s.r[k] - 1.0) * s.tens[k];
+            // Beyond a brittle tension cap: the broken share 1 - phi is a crack
+            // (trial stress kept, closes at touching); the intact share is
+            // normal faulting, permanent (law.js, maxwellUpdate).
+            kept = s.tens[k] + (1.0 - c.integrity) * (elastic - (1.0 / s.r[k] - 1.0) * s.tens[k] - s.tens[k]);
             work += s.tens[k] * max(d_strain, 0.0) * s.dz;
         } else if (relaxed != capped) {
             work += abs(capped * (relaxed - capped) / (E * max(s.r[k], 1e-30))) * s.dz;
         }
         edges[e].slice_stress_mpa[k] = kept;
         S += capped * s.dz;
+        cap_sum += select(s.comp[k], s.tens[k], d_strain > 0.0) * s.dz;
         // Inelastic strain of the stiffest slice (law.js, maxwellUpdate).
         if (s.r[k] > r_max) { r_max = s.r[k]; inelastic = d_strain - (kept - c.slice_stress_mpa[k]) / E; }
         let w = (s.r[k] + 1e-9) * s.dz;
@@ -215,6 +220,8 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
     // The force this step's solve applied, MPa km (+ push), kept for the
     // next step's warm start (edges_law): lambda / scale, the inverse of the
     // caps' scaling.
+    // Plastic strain weighted by the share of strength that yields (integrityStep).
+    var damage_strain = select(0.0, work / cap_sum, cap_sum > 0.0);
     edges[e].lambda = c.lambda * E * sim.stiffness_reference_km / (sim.bond_rate_myr_inv * sim.dt_crust_myr * rest);
     edges[e].length = len;
     edges[e].direction_x = offset.x;
@@ -247,14 +254,19 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
     if (c.stiffness_t > 0.0 && G > 0.0) {
         let dg = tangential_displacement(c) / rest;
         var rt = -1.0;
+        var work_t = 0.0;
+        var cap_t = 0.0;
         for (var k = 0u; k < EDGE_SLICES; k++) {
             let relaxed = (c.slice_shear_mpa[k] + G * dg) * s.r[k];
             let capped = clamp(relaxed, -s.shear[k], s.shear[k]);
             edges[e].slice_shear_mpa[k] = capped;
             St += capped * s.dz;
-            if (relaxed != capped) { work += abs(capped * (relaxed - capped) / (G * max(s.r[k], 1e-30))) * s.dz; }
+            cap_t += s.shear[k] * s.dz;
+            if (relaxed != capped) { work_t += abs(capped * (relaxed - capped) / (G * max(s.r[k], 1e-30))) * s.dz; }
             if (s.r[k] > rt) { rt = s.r[k]; shear_inelastic = dg - (capped - c.slice_shear_mpa[k]) / G; fault = s.slips[k] == 1u && relaxed != capped; }
         }
+        work += work_t;
+        damage_strain += select(0.0, work_t / cap_t, cap_t > 0.0);
     } else {
         for (var k = 0u; k < EDGE_SLICES; k++) { edges[e].slice_shear_mpa[k] = 0.0; }
     }
@@ -277,6 +289,8 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
         edges[e].moment = 0.0;
     }
     edges[e].work_mpa_km = work;
+    let damage_slip = damage_strain * rest * EARTH_RADIUS_KM;
+    edges[e].damage_slip_km = damage_slip;
 
     // Volumetric flow: both columns collect this edge's inelastic strain
     // (surface pairs only: slabs are not part of the area budget).
@@ -288,10 +302,10 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
         atomicAdd(&particle_deltas[c.particle_b].count, 1i);
     }
 
-    // Integrity law: damage by plastic work, then exact exponential healing
-    // at the temperature of the load-bearing part of the interface.
+    // Integrity law: slip weakening (integrityStep in law.js), then exact
+    // exponential healing at the temperature of the load-bearing part.
     let t_heal = select(sim.mantle_temp, wt_sum / w_sum, w_sum > 0.0);
-    let damaged = max(c.integrity - work / sim.damage_work_mpa_km, 0.0);
+    let damaged = max(c.integrity - damage_slip / sim.damage_slip_km, 0.0);
     let exponent = min((sim.heal_activation_kj / sim.gas_constant) * (1.0 / max(t_heal, 1.0) - 1.0 / sim.mantle_temp), 80.0);
     let tau = sim.heal_time_myr * exp(exponent);
     edges[e].integrity = 1.0 - (1.0 - damaged) * exp(-sim.dt_crust_myr / tau);

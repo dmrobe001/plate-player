@@ -129,9 +129,11 @@ export const SIM_PARAMS = [
   // resists separation whatever phi); 1 = a broken edge's ductile part is as
   // weak in tension as its brittle part (shear-zone damage, as in grain-damage theory).
   ['ductile_damage_weakening', 'f32', 0.0],
-  // Integrity law (design 4.7, phase D): damage by plastic work, thermally
-  // activated healing. Provisional; calibrated at integration.
-  ['damage_work_mpa_km', 'f32', 50.0],     // plastic work (per unit edge length and depth) that removes all integrity
+  // Integrity law (design 4.7): slip weakening, thermally activated healing.
+  // Integrity falls by the plastic displacement across the edge (weighted by
+  // the share of its strength that yields) over this distance: the cumulative
+  // slip at which faults become structurally mature, ~10 km (Wesnousky 1988).
+  ['damage_slip_km', 'f32', 10.0],
   ['heal_time_myr', 'f32', 0.1],           // healing time at mantle temperature
   ['heal_activation_kj', 'f32', 250.0],    // Arrhenius: ~50 Myr at 1200 K, effectively never below ~900 K
   // GPE force (design 4.6): push down the gradient of gravitational potential

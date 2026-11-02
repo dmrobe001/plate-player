@@ -536,42 +536,53 @@ test('irreversible: inelastic strain is zero below yield, the full increment at 
   assert.ok(Math.abs(more.inelastic / -2e-4 - 1) < 1e-6, `at yield: inelastic ${more.inelastic}`);
   const expectWork = edge.slices.reduce((a, s) => a + s.comp * 2e-4 * s.dz, 0);
   assert.ok(Math.abs(more.work / expectWork - 1) < 1e-4, `work ${more.work} vs ${expectWork}`); // r = 1 - 1e-8: a little creep is not plastic
-  // A crack opening is recoverable: no inelastic strain, but work against the tension cap
-  // (frictional extension strength, Anderson's fraction of the compressive one).
+  // Stretched past a brittle tension cap (Anderson's normal-fault strength, the
+  // compressive one over q): intact rock faults permanently, a broken pair
+  // cracks and closes again (no inelastic strain). Work against the cap either way.
   const open = law.maxwellUpdate(new Array(8).fill(0), edge, 2.5e-3, p);
-  assert.ok(Math.abs(open.inelastic) < 1e-9);
-  // Only slices whose trial stress passes the cap crack (the cap grows with depth).
   const cracked = edge.slices.filter((s) => E * 2.5e-3 * s.r > s.tens);
   const crackWork = cracked.reduce((a, s) => a + s.tens * 2.5e-3 * s.dz, 0);
   assert.ok(cracked.length > 0 && cracked.length < edge.slices.length, `${cracked.length} of ${edge.slices.length} slices crack`);
   assert.ok(Math.abs(open.work / crackWork - 1) < 1e-6);
+  const top = edge.slices[0]; // the stiffest (first of equals), and it yields
+  assert.ok(Math.abs(open.inelastic - (2.5e-3 - top.tens / (E * top.r))) < 1e-9, `intact: inelastic ${open.inelastic}`);
+  assert.ok(Math.abs(open.stored[0] - top.tens) < 1e-6, 'intact: stored at the cap (no recoil)');
+  assert.ok(Math.abs(open.plasticStrain - open.work / edge.slices.reduce((a, s) => a + s.tens * s.dz, 0)) < 1e-12);
+  const broken = law.edgeSlices(oldOcean(-3), oldOcean(-3), 0, p);
+  const crack = law.maxwellUpdate(new Array(8).fill(0), broken, 2.5e-3, p);
+  assert.ok(Math.abs(crack.inelastic) < 1e-9 && crack.work === 0 && crack.S === 0, 'broken: an open crack, recoverable and free');
   assert.ok(edge.slices.every((s) => Math.abs(s.tens / (s.comp / law.andersonRatio(p.friction_coefficient)) - 1) < 1e-6));
 });
 
-test('irreversible: pure shear of a hexagon of edges leaves the area unchanged; uniform compression shrinks it at twice the strain', () => {
+test('irreversible: pure shear of a broken hexagon of edges leaves the area unchanged; intact, the stretched side faults; uniform compression shrinks it at twice the strain', () => {
   // A column's 6 edges at 0, 60, ..., 300 degrees under the strain field
-  // diag(+e, -e): edge strain e cos 2 theta. With compression elastic and
-  // tension cracking, no edge has inelastic strain. Then all edges at the
-  // compression cap under uniform shortening.
+  // diag(+e, -e): edge strain e cos 2 theta. Broken (phi = 0): compression
+  // elastic, tension cracks (recoverable), so no edge has inelastic strain.
+  // Intact: the stretched edges fault permanently (Anderson's tension
+  // strength is a third of the compressive one), so the area grows. Then
+  // all edges at the compression cap under uniform shortening.
   const E0 = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
-  const p = { ...uniform(1e6 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa };
-  const edge = law.edgeSlices(oldOcean(-3), oldOcean(-3), 1, p);
+  const p = { ...uniform(1e8 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa };
   const e = 2.5e-3;
-  const shear = [0, 60, 120, 180, 240, 300].map((deg) => law.maxwellUpdate(new Array(8).fill(0), edge, e * Math.cos(2 * deg * Math.PI / 180), p));
   const col = { area: 1e-3 };
-  const sheared = flow.columnFlow(col, shear.map((u) => u.inelastic));
+  const hexagon = (edge) => [0, 60, 120, 180, 240, 300].map((deg) => law.maxwellUpdate(new Array(8).fill(0), edge, e * Math.cos(2 * deg * Math.PI / 180), p));
+  const broken = hexagon(law.edgeSlices(oldOcean(-3), oldOcean(-3), 0, p));
+  const sheared = flow.columnFlow(col, broken.map((u) => u.inelastic));
   assert.ok(Math.abs(sheared.area / col.area - 1) < 1e-9, `pure shear changed the area by ${sheared.area / col.area - 1}`);
-  assert.ok(shear.some((u) => u.work > 0), 'the stretched edges should crack (work against cohesion)');
+  const edge = law.edgeSlices(oldOcean(-3), oldOcean(-3), 1, p);
+  const intact = hexagon(edge);
+  assert.ok(intact.every((u, k) => (k % 3 === 0 ? u.inelastic > 0 && u.work > 0 : u.inelastic <= 1e-12)), 'only the stretched edges fault');
+  assert.ok(flow.columnFlow(col, intact.map((u) => u.inelastic)).area > col.area);
   const atCap = edge.slices.map((s) => -s.comp);
   const squeezed = flow.columnFlow(col, new Array(6).fill(law.maxwellUpdate(atCap, edge, -e, p).inelastic));
   assert.ok(Math.abs(Math.log(squeezed.area / col.area) - -2 * e) < 1e-9);
 });
 
-test('irreversible: integrity falls by work / W_D and heals exponentially with an Arrhenius time', () => {
+test('irreversible: integrity falls by weighted plastic slip / d_D and heals exponentially with an Arrhenius time', () => {
   const p = PARAMS;
-  // Cold: no healing; damage is exactly proportional to work.
-  assert.ok(Math.abs(law.integrityStep(0.8, 10, 400, p) - (0.8 - 10 / p.damage_work_mpa_km)) < 1e-12);
-  assert.equal(law.integrityStep(0.1, 1e3, 400, p), 0);
+  // Cold: no healing; damage is exactly proportional to slip.
+  assert.ok(Math.abs(law.integrityStep(0.8, 1, 400, p) - (0.8 - 1 / p.damage_slip_km)) < 1e-12);
+  assert.equal(law.integrityStep(0.1, 100, 400, p), 0);
   // Hot: 1 - phi decays as exp(-dt / tau(T)), tau = heal_time at mantle temperature.
   let phi = 0;
   for (let n = 0; n < 10; n++) phi = law.integrityStep(phi, 0, p.mantle_temp, p);
@@ -847,6 +858,13 @@ test('reference shape: radii are exact for an affinely stretched lattice; elonga
     for (const k of ['exx', 'eyy', 'exy', 'w']) assert.ok(Math.abs(f[k] - { ...e, w }[k]) < 1e-12, `${dirs.length} edges: ${k} ${f[k]}`);
   }
   assert.equal(shape.fitStrain([row(0.3)]), null);
+  // A nearly one-directional neighbourhood (a strip, edges within 8 degrees of
+  // the x axis) passes the determinant test but extrapolates noise: the
+  // trace bound (twice the largest edge normal strain) rejects it. With
+  // little noise the fit stays within the bound and is kept.
+  const strip = (amp) => [0, 0.14, Math.PI, Math.PI - 0.1].map((phi, k) => { const r = row(phi); return { ...r, en: r.en * (1 + amp * (k - 1.5)), g: r.g * (1 - amp * (k - 1.5)) }; });
+  assert.ok(shape.fitStrain(strip(0.05)) !== null);
+  assert.equal(shape.fitStrain(strip(0.2)), null);
   // Deviatoric part only, capped at the aspect ratio limit.
   const u = shape.updateShape(0, 0, e, 1, 3);
   assert.ok(Math.abs(u.p - 1.5e-3) < 1e-15 && Math.abs(u.q - 7e-4) < 1e-15);

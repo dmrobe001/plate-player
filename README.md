@@ -512,6 +512,17 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       the extrapolated multipliers, each solve is warm-started from the last step's
       edge forces, and ρ is capped by what the iteration budget can use: 32
       iterations do what 256 did (design.md §5.2).
+- [x] ~~Plates were 3.5× too weak and slabs half as heavy as they should be.~~
+      Edge caps are now a yield-strength envelope in horizontal differential
+      stress (Anderson's thrust and normal-fault strengths, ductile flow stress),
+      and slab crust turns to eclogite: old ocean holds 1.5×10¹³ N/m in tension, a
+      slab to 660 km weighs ~6×10¹³ N/m, as in textbooks (design.md §4.5, §6).
+- [x] ~~Stretched intact plates sprang back at full strength,~~ and damage had no
+      physical scale. Intact rock past its tension cap now faults permanently, and
+      integrity falls by slip over a fault-maturity distance (10 km): realistic net
+      forces never break a plate, overloads break it in geological time (§4.7, §9.2).
+- [ ] **The trench strip blows up ~0.5 Myr after its first subduction:** a hinge
+      forms against the column's own plate neighbour (design.md §9.2).
 - [x] ~~The planet could drift as a whole.~~ Each step's area-weighted net
       rotation is removed (the geodesists' no-net-rotation frame; design.md §5.3).
       In the two-plate world it was nearly all the motion: the trench is locked

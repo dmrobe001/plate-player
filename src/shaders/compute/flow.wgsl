@@ -30,6 +30,7 @@ fn columns_flow(@builtin(global_invocation_id) id: vec3<u32>) {
     let m = min(atomicLoad(&particle_deltas[idx].slot_count), MAX_SLOTS);
     var A = mat4x4f(vec4f(0.0), vec4f(0.0), vec4f(0.0), vec4f(0.0));
     var r = vec4f(0.0);
+    var seen = 0.0; // largest edge normal strain (fitStrain bound on the trace)
     for (var k = 0u; k < m; k++) {
         let e = particle_deltas[idx].slots[k];
         let j = other_end(e, idx);
@@ -43,10 +44,11 @@ fn columns_flow(@builtin(global_invocation_id) id: vec3<u32>) {
         let at = vec4f(-nx * ny, nx * ny, nx * nx - ny * ny, 1.0);
         A += mat4x4f(an * an.x, an * an.y, an * an.z, an * an.w) + mat4x4f(at * at.x, at * at.y, at * at.z, at * at.w);
         r += an * edges[e].inelastic_strain + at * edges[e].inelastic_shear;
+        seen = max(seen, abs(edges[e].inelastic_strain));
     }
     let det = determinant(A);
     let tr = A[0][0] + A[1][1] + A[2][2] + A[3][3];
-    let fitted = particles[idx].state == 1u && abs(det) > 1e-6 * tr * tr * tr * tr;
+    var fitted = particles[idx].state == 1u && abs(det) > 1e-6 * tr * tr * tr * tr;
 
     // Volumetric flow (columnFlow in flow.js): the fitted trace. Where the
     // tensor cannot be fitted (fewer than two edge directions), 2 x the mean
@@ -62,7 +64,14 @@ fn columns_flow(@builtin(global_invocation_id) id: vec3<u32>) {
         exx = determinant(mat4x4f(r, A[1], A[2], A[3])) / det;
         eyy = determinant(mat4x4f(A[0], r, A[2], A[3])) / det;
         exy = determinant(mat4x4f(A[0], A[1], r, A[3])) / det;
-        dln = exx + eyy;
+        // A trace beyond twice the largest edge strain: the directions do not
+        // determine the tensor (a nearly one-directional neighbourhood).
+        if (abs(exx + eyy) <= 2.0 * seen * (1.0 + 1e-4)) {
+            dln = exx + eyy;
+        } else {
+            fitted = false;
+            exx = 0.0; eyy = 0.0; exy = 0.0; w = 0.0;
+        }
     }
     particles[idx].area_ref *= exp(sim.volumetric_flow_factor * dln);
     particles[idx].apothem = sqrt(particles[idx].area_ref / 3.4641016);

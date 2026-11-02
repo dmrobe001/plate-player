@@ -557,7 +557,7 @@ test('edge storage stays consistent and matches the reference under random motio
   const out = await page.evaluate(async ([helperSrc, elastic]) => {
     const H = eval(helperSrc);
     const a = 0.0175, pts = H.patch(6, a), n = pts.length;
-    await plate.setParams({ ...elastic, damage_work_mpa_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, shape_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing, area or shape change
+    await plate.setParams({ ...elastic, damage_slip_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, shape_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing, area or shape change
     await plate.loadState(H.state(pts, a));
     let seed = 12345;
     const rand = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296 - 0.5; };
@@ -609,7 +609,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
     const d = (i, j) => Math.hypot(...pts[i].map((v, c) => v - pts[j][c]));
     const bonds = [];
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (d(i, j) < 2.1 * a) bonds.push([i, j, 0.3]);
-    await plate.setParams({ ...elastic, damage_work_mpa_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, shape_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing, area or shape change
+    await plate.setParams({ ...elastic, damage_slip_km: 1e30, heal_time_myr: 1e30, volumetric_flow_factor: 0, shape_flow_factor: 0, mantle_drive: 0, solver_iterations: 0 }); // storage only: no creep, damage, healing, area or shape change
     await plate.loadState(H.state(pts, a, bonds));
 
     // Distinct values in every carried field.
@@ -695,7 +695,7 @@ test('an edge keeps its state while its pair stays in range and is dropped exact
 // slices are pure springs up to their Byerlee caps (cohesion as default).
 const BRITTLE = { olivine_log10_a: -60, diabase_log10_a: -60, quartzite_log10_a: -60 };
 
-test('volumetric flow: uniform compression thickens at the predicted rate at constant volume; pure shear changes no area', { timeout: 300_000 }, async () => {
+test('volumetric flow: uniform compression thickens at the predicted rate at constant volume; pure shear changes no area where broken, faults where intact', { timeout: 300_000 }, async () => {
   // Phase D (design 9). A 19-column patch of old ocean, bonded, moved by
   // hand (no solve). (1) Uniform shortening by 0.4% per step: once every
   // slice sits at its compression cap, all further shortening is inelastic,
@@ -704,7 +704,8 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
   // volume constant; integrity falls by
   // exactly the logged plastic work / W_D (cold: no healing). (2) Pure shear
   // (x stretched, y shortened by 0.06% per step) below the compression cap:
-  // stretched edges crack, others stay elastic, and no area changes.
+  // others stay elastic; stretched edges crack where broken (no area change)
+  // and fault where intact (the area grows).
   const page = await openPage({ small: true });
   const out = await page.evaluate(async ([helperSrc, brittle]) => {
     const H = eval(helperSrc);
@@ -713,8 +714,8 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
     const bonds = [];
     for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) if (d(i, j) < 2.1 * a) bonds.push([i, j, 0]);
     const centre = pts.findIndex((p) => Math.hypot(p[0], p[1]) < 1e-9);
-    const WD = 1e5;
-    await plate.setParams({ ...brittle, damage_work_mpa_km: WD, gpe_force_factor: 0, mantle_drive: 0, solver_iterations: 0 });
+    const WD = 100; // km of slip: damage small but measurable
+    await plate.setParams({ ...brittle, damage_slip_km: WD, gpe_force_factor: 0, mantle_drive: 0, solver_iterations: 0 });
     const volume = (r) => { let v = 0; for (let i = 0; i < n; i++) v += r.P.crust_volume[i]; return v; };
 
     // (1) Uniform shortening.
@@ -730,34 +731,38 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
       H.move(pts.map((p) => [p[0] * k, p[1] * k, p[2]]));
       await plate.runSteps(1);
       r = await plate.debug.edges();
-      for (const [e, phi] of phiExpected) phiExpected.set(e, Math.max(phi - r.E.work_mpa_km[e] / WD, 0));
+      for (const [e, phi] of phiExpected) phiExpected.set(e, Math.max(phi - r.E.damage_slip_km[e] / WD, 0));
       rows.push({ s, h: r.P.thickness_km[centre], area: r.P.area_ref[centre], volume: volume(r), hv: r.P.crust_volume[centre] / r.P.cell_area[centre] });
     }
     let phiErr = 0, phiMin = 1;
     for (const [e, phi] of phiExpected) { phiErr = Math.max(phiErr, Math.abs(r.E.integrity[e] - phi)); phiMin = Math.min(phiMin, phi); }
 
-    // (2) Pure shear.
-    await plate.loadState(H.state(pts, a, bonds));
-    r = await plate.debug.edges();
-    const area0 = Array.from(r.P.area_ref.subarray(0, n));
-    const ds = 6e-4;
-    const work = new Map();
-    for (let s = 1; s <= 5; s++) {
-      H.move(pts.map((p) => [p[0] * (1 + ds) ** s, p[1] * (1 - ds) ** s, p[2]]));
-      await plate.runSteps(1);
+    // (2) Pure shear, broken (damage 1) and intact.
+    const shear = async (damage) => {
+      await plate.loadState(H.state(pts, a, bonds.map(([i, j]) => [i, j, damage])));
       r = await plate.debug.edges();
-      for (const [key, e] of r.pairs) work.set(key, (work.get(key) ?? 0) + r.E.work_mpa_km[e]);
-    }
-    let areaChange = 0;
-    for (let i = 0; i < n; i++) areaChange = Math.max(areaChange, Math.abs(Math.log(r.P.area_ref[i] / area0[i])));
-    const byAngle = { stretched: 0, other: 0, stretchedWork: Infinity, otherWork: 0 };
-    for (const [key, w] of work) {
-      const [i, j] = key.split(',').map(Number);
-      const along = Math.abs(pts[i][1] - pts[j][1]) < 1e-9; // edges along x are stretched
-      if (along) { byAngle.stretched++; byAngle.stretchedWork = Math.min(byAngle.stretchedWork, w); }
-      else { byAngle.other++; byAngle.otherWork = Math.max(byAngle.otherWork, w); }
-    }
-    return { rows, v0, phiErr, phiMin, areaChange, byAngle, delta };
+      const area0 = Array.from(r.P.area_ref.subarray(0, n));
+      const ds = 6e-4;
+      const work = new Map();
+      for (let s = 1; s <= 5; s++) {
+        H.move(pts.map((p) => [p[0] * (1 + ds) ** s, p[1] * (1 - ds) ** s, p[2]]));
+        await plate.runSteps(1);
+        r = await plate.debug.edges();
+        for (const [key, e] of r.pairs) work.set(key, (work.get(key) ?? 0) + r.E.work_mpa_km[e]);
+      }
+      let areaChange = 0;
+      for (let i = 0; i < n; i++) areaChange = Math.max(areaChange, Math.abs(Math.log(r.P.area_ref[i] / area0[i])));
+      const byAngle = { stretched: 0, other: 0, stretchedWork: Infinity, otherWork: 0 };
+      for (const [key, w] of work) {
+        const [i, j] = key.split(',').map(Number);
+        const along = Math.abs(pts[i][1] - pts[j][1]) < 1e-9; // edges along x are stretched
+        if (along) { byAngle.stretched++; byAngle.stretchedWork = Math.min(byAngle.stretchedWork, w); }
+        else { byAngle.other++; byAngle.otherWork = Math.max(byAngle.otherWork, w); }
+      }
+      return { areaChange, centreGrowth: Math.log(r.P.area_ref[centre] / area0[centre]), byAngle };
+    };
+    const broken = await shear(1), intact = await shear(0);
+    return { rows, v0, phiErr, phiMin, broken, intact, delta };
   }, [PATCH_HELPERS, BRITTLE]);
   assert.deepEqual(page.errors, []);
   await page.close();
@@ -771,11 +776,16 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
   // Thickness is volume over the tessellated area (one step behind the last move).
   for (const x of out.rows) assert.ok(Math.abs(x.h / x.hv - 1) < 1e-6);
   for (const x of out.rows) assert.ok(Math.abs(x.volume / out.v0 - 1) < 1e-5, `step ${x.s}: volume ${x.volume} vs ${out.v0}`);
-  console.log(`  integrity: worst difference from 1 - sum(work) / W_D ${out.phiErr.toExponential(1)} (lowest ${out.phiMin.toFixed(4)})`);
+  console.log(`  integrity: worst difference from 1 - sum(weighted slip) / d_D ${out.phiErr.toExponential(1)} (lowest ${out.phiMin.toFixed(4)})`);
   assert.ok(out.phiErr < 1e-4 && out.phiMin < 0.99);
-  console.log(`  pure shear: largest area change ${out.areaChange.toExponential(1)}; work on ${out.byAngle.stretched} stretched edges >= ${out.byAngle.stretchedWork.toFixed(2)}, on ${out.byAngle.other} others <= ${out.byAngle.otherWork}`);
-  assert.ok(out.areaChange < 1e-6);
-  assert.ok(out.byAngle.stretchedWork > 0 && out.byAngle.otherWork === 0);
+  // Broken: the stretched edges crack and would close again, the others stay
+  // elastic: no area change, no work. Intact: the stretched edges fault
+  // (normal faulting, permanent), the others stay elastic: the area grows.
+  const { broken: b, intact: i } = out;
+  console.log(`  pure shear, broken: largest area change ${b.areaChange.toExponential(1)}, work ${b.byAngle.stretchedWork} / ${b.byAngle.otherWork}; intact: centre area +${i.centreGrowth.toExponential(1)}, work on ${i.byAngle.stretched} stretched edges >= ${i.byAngle.stretchedWork.toFixed(2)}, on ${i.byAngle.other} others <= ${i.byAngle.otherWork}`);
+  // (The broken patch's stretched edges do ~1e-4 of the intact work: friction on their faces as the patch shears.)
+  assert.ok(b.areaChange < 1e-6 && b.byAngle.stretchedWork < 1e-3 * i.byAngle.stretchedWork && b.byAngle.otherWork === 0);
+  assert.ok(i.centreGrowth > 1e-5 && i.byAngle.stretchedWork > 0 && i.byAngle.otherWork === 0);
 });
 
 test('below yield nothing irreversible happens; the GPE push matches the reference', { timeout: 300_000 }, async () => {
@@ -1369,7 +1379,7 @@ test('tangential channel on the GPU: friction rises with compression across the 
   const out = await page.evaluate(async ([helperSrc, motionSrc, brittle, elastic]) => {
     const H = eval(helperSrc), M = eval(motionSrc);
     const a = 0.0175, L = plate.debug.law, Pr = plate.debug.profile;
-    await plate.setParams({ ...brittle, mantle_drive: 0, solver_iterations: 0, volumetric_flow_factor: 0, heal_time_myr: 1e30, damage_work_mpa_km: 1e30 });
+    await plate.setParams({ ...brittle, mantle_drive: 0, solver_iterations: 0, volumetric_flow_factor: 0, heal_time_myr: 1e30, damage_slip_km: 1e30 });
     const strains = [0, -1e-3];
     const place = (k, strain, turn) => {
       const c = 6 * a * k, h = Math.asin(a * (1 + strain));
@@ -1653,7 +1663,7 @@ test('trench hinge: slab pull bends the flap, the contact gives way, the column 
     const col = (o, c, s) => Float32Array.from(pts, (_, i) => (isC(i) ? c : i === S ? s : o));
     // A converged solve: the hinge's history branches on small differences in
     // the solve (design 5.2, Chebyshev findings), and this tests the hinge.
-    await plate.setParams({ mantle_drive: 0, solver_iterations: 256, dt_crust_myr: 0.25, damage_work_mpa_km: 1e9 });
+    await plate.setParams({ mantle_drive: 0, solver_iterations: 256, dt_crust_myr: 0.25, damage_slip_km: 1e9 });
     const ba = [], bb = [], bd = [];
     for (let k = 0; k < N - 1; k++) { ba.push(k); bb.push(k + 1); bd.push(0); }
     ba.push(lead, lead, C, S + 1, S + 2); bb.push(C, S, S + 1, S + 2, S + 3); bd.push(1, 0, 0, 0, 0);
