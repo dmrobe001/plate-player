@@ -129,6 +129,17 @@ export const Particle = defineStruct('Particle', [
   ['shape_q', 'f32'],           //   frame (body_axis, position x body_axis); aspect ratio exp(2 |(p, q)|)
   ['spin', 'f32'],              // rotation this step about the outward radial, rad, CCW (solver iterate; plain Jacobi)
   ['rotation_total', 'f32'],    // vertical-axis rotation since load, rad (diagnostic: paleomagnetic declination)
+  // Trench hinge and hanging slabs (design 6; src/columns/hinge.js):
+  ['hinge_angle', 'f32'],       // surface: bend of the flap beyond the hinge, rad (+ down); slab: its dip
+  ['hinge_plastic', 'f32'],     // plastic part of the bend, rad (state)
+  ['hinge_flap_km', 'f32'],     // flap length beyond the hinge (derived; 0 = no hinge)
+  ['hinge_underthrust_km', 'f32'], // part of the column past the trench line (derived)
+  ['hinge_partner', 'u32'],     // the column the hinge faces: overriding neighbour or hanging slab (derived), else NONE
+  ['attached_to', 'u32'],       // slab: what it hangs from (NONE = free); surface: the column behind it (derived)
+  ['slab_child', 'u32'],        // a slab hanging from this column this step (derived), else NONE
+  ['slab_extent_km', 'f32'],    // slab: depth range from its top to its bottom
+  ['child_load', 'f32'],        // load hanging from this column, N (last step)
+  ['hang_load', 'f32'],         // slab: load it passed up last step, N (under-relaxed, thermal.wgsl)
 ]);
 
 /**
@@ -222,7 +233,7 @@ export const ColumnProfile = defineStruct('ColumnProfile', [
   ['ductile_mpa', 'array<f32, 8>'], // ductile shear strength (capped at 1e6)
 ]);
 
-export const SLOTS = { wordsPerParticle: 48, countWord: 4, firstSlotWord: 8, capacity: 12 };
+export const SLOTS = { wordsPerParticle: 52, countWord: 4, firstSlotWord: 8, capacity: 12 };
 
 /** One node of the mantle grid; written from the CPU mantle model (src/mantle/). */
 export const GridNode = defineStruct('GridNode', [

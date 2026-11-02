@@ -51,6 +51,9 @@ struct DiscOut {
     @builtin(position) clip: vec4f,
     @location(0) uv: vec2f,
     @location(1) color: vec3f,
+    // Trench hinge (design 6): direction to the trench in disc coordinates (xy),
+    // hinge line position along it (z, apothems from the centre), flap tip depth (w, km).
+    @location(2) @interpolate(flat) flap: vec4f,
 }
 
 @vertex
@@ -78,13 +81,28 @@ fn vs_disc(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Di
     if (p.state == 2u) { color = vec3f(1.0); } // subducting slab: white
     let light = 0.55 + 0.45 * max(dot(n, view.light_dir.xyz), 0.0);
     out.color = color * light;
+    out.flap = vec4f(0.0, 0.0, 2.0, 0.0);
+    if (p.state == 1u && p.hinge_partner != NONE && p.hinge_flap_km > 0.0) {
+        let d = particles[p.hinge_partner].position.xyz - n;
+        let d2 = vec2f(dot(d, frame[0]), dot(d, frame[1]));
+        if (length(d2) > 0.0) {
+            let flap_apothems = p.hinge_flap_km / (p.apothem * 6371.0);
+            out.flap = vec4f(normalize(d2), 1.0 - flap_apothems, p.hinge_flap_km * sin(p.hinge_angle));
+        }
+    }
     return out;
 }
 
 @fragment
 fn fs_disc(in: DiscOut) -> @location(0) vec4f {
     if (dot(in.uv, in.uv) > 1.0) { discard; }
-    return vec4f(in.color, 1.0);
+    // The flap beyond a trench hinge, darkened with its depth (black at 50 km);
+    // a dark line marks the hinge.
+    let along = dot(in.uv, in.flap.xy);
+    var c = in.color;
+    if (along > in.flap.z) { c *= mix(0.75, 0.15, clamp(in.flap.w / 50.0, 0.0, 1.0)); }
+    if (abs(along - in.flap.z) < 0.03) { c *= 0.3; }
+    return vec4f(c, 1.0);
 }
 
 struct GlyphOut {

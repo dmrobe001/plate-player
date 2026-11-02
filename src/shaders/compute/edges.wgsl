@@ -2,7 +2,7 @@
 //
 // An edge exists between two columns exactly while they are in range: map-view
 // gap below edge_range_margin of the apothem sum, and overlapping depth
-// intervals. Edges are keyed by pair and keep their state (integrity, stored
+// intervals (and neither is a hanging slab, design 6). Edges are keyed by pair and keep their state (integrity, stored
 // stresses, anchors, timers) while the pair stays in range. Each step, on the
 // predicted positions:
 //   edges_begin          clear every particle's slot list
@@ -34,6 +34,8 @@ fn pair_overlap(i: u32, j: u32) -> f32 {
 }
 
 fn in_range(i: u32, j: u32) -> bool {
+    // A hanging slab has no edges: it hangs from the column it is attached to (hinge.wgsl).
+    if (is_hanging(i) || is_hanging(j)) { return false; }
     let contact = pair_contact(i, j);
     let depth_overlap = min(column_top(i), column_top(j)) > max(column_bottom(i), column_bottom(j));
     return pair_overlap(i, j) > -sim.edge_range_margin * contact && depth_overlap;

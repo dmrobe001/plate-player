@@ -536,11 +536,16 @@ test('irreversible: inelastic strain is zero below yield, the full increment at 
   assert.ok(Math.abs(more.inelastic / -2e-4 - 1) < 1e-6, `at yield: inelastic ${more.inelastic}`);
   const expectWork = edge.slices.reduce((a, s) => a + s.comp * 2e-4 * s.dz, 0);
   assert.ok(Math.abs(more.work / expectWork - 1) < 1e-4, `work ${more.work} vs ${expectWork}`); // r = 1 - 1e-6: a little creep is not plastic
-  // A crack opening is recoverable: no inelastic strain, but work against cohesion.
+  // A crack opening is recoverable: no inelastic strain, but work against the tension cap
+  // (frictional extension strength, Anderson's fraction of the compressive one).
   const open = law.maxwellUpdate(new Array(8).fill(0), edge, 1e-3, p);
   assert.ok(Math.abs(open.inelastic) < 1e-9);
-  assert.ok(Math.abs(open.work / (p.cohesion_mpa * 1e-3 * edge.overlap) - 1) < 1e-6);
-  void E;
+  // Only slices whose trial stress passes the cap crack (the cap grows with depth).
+  const cracked = edge.slices.filter((s) => E * 1e-3 * s.r > s.tens);
+  const crackWork = cracked.reduce((a, s) => a + s.tens * 1e-3 * s.dz, 0);
+  assert.ok(cracked.length > 0 && cracked.length < edge.slices.length, `${cracked.length} of ${edge.slices.length} slices crack`);
+  assert.ok(Math.abs(open.work / crackWork - 1) < 1e-6);
+  assert.ok(edge.slices.every((s) => Math.abs(s.tens / (s.comp / law.andersonRatio(p.friction_coefficient)) - 1) < 1e-6));
 });
 
 test('irreversible: pure shear of a hexagon of edges leaves the area unchanged; uniform compression shrinks it at twice the strain', () => {
@@ -711,31 +716,21 @@ test('melt: a stretched continent thins until it melts; mixing in melt makes it 
 import * as transitions from '../src/edges/transitions.js';
 import * as flexure from '../src/columns/flexure.js';
 
-test('transitions: the timer runs only in sustained compression; dense columns subduct, buoyant pairs weld', () => {
+test('transitions: the timer runs only in sustained compression; buoyant pairs weld, dense ones never by the timer', () => {
   const p = { ...PARAMS };
   let t = 0;
   for (let s = 0; s < 70; s++) t = transitions.timerStep(t, -2 * p.transition_stress_mpa, p);
   assert.ok(Math.abs(t - 70 * p.dt_crust_myr) < 1e-12);
   assert.equal(transitions.timerStep(t, -0.5 * p.transition_stress_mpa, p), 0);
-  const col = (index, ageMyr, rho = 3000, slabNeighbours = 0) => ({
-    index, slabNeighbours,
+  const col = (index, ageMyr, rho = 3000) => ({
+    index,
     freeboardKm: profile.columnProfile({ crustKm: rho < 2850 ? 35 : 7, compositionDensity: rho, ageMyr, elevationKm: -3 }, p).freeboardKm,
   });
-  const ripe = { timer: p.subduction_window_myr, work: 0 };
-  const early = { timer: 0.9 * p.subduction_window_myr, work: 0 };
-  // Old ocean against a continent: the ocean goes down, only once the window is past.
-  assert.equal(transitions.transition(ripe, col(0, 100), col(1, 1000, 2700), p).subduct, 0);
-  assert.equal(transitions.transition(early, col(0, 100), col(1, 1000, 2700), p).subduct, null);
-  // Old against younger ocean: the older (denser) goes down.
-  assert.equal(transitions.transition(ripe, col(0, 20), col(1, 60), p).subduct, 1);
-  // Polarity persists: the column already touching a slab goes down, on a tenth of the window.
-  const fast = { timer: p.subduction_window_myr * p.subduction_propagation_factor, work: 0 };
-  assert.equal(transitions.transition(fast, col(0, 20, 3000, 1), col(1, 60), p).subduct, 0);
-  // Two buoyant columns never subduct, however long; they weld once quiet past the suture window.
+  // A dense column never welds (it is a subduction candidate: the trench hinge's business).
+  assert.equal(transitions.transition({ timer: 100, work: 0 }, col(0, 100), col(1, 1000, 2700), p).weld, false);
+  // Two buoyant columns weld once quiet past the suture window.
   for (const [a, b] of [[col(0, 1000, 2700), col(1, 1000, 2700)], [col(0, 2), col(1, 1000, 2700)]]) {
-    const long = { timer: 100, work: 0 };
-    assert.equal(transitions.transition(long, a, b, p).subduct, null);
-    assert.equal(transitions.transition(long, a, b, p).weld, true);
+    assert.equal(transitions.transition({ timer: 100, work: 0 }, a, b, p).weld, true);
     assert.equal(transitions.transition({ timer: 100, work: 1 }, a, b, p).weld, false);
     assert.equal(transitions.transition({ timer: 0.9 * p.suture_window_myr, work: 0 }, a, b, p).weld, false);
   }
@@ -743,13 +738,13 @@ test('transitions: the timer runs only in sustained compression; dense columns s
   console.log(`  freeboard: ${fb(2).toFixed(2)} km at 2 Myr, ${fb(10).toFixed(2)} at 10, ${fb(60).toFixed(2)} at 60; continent ${col(0, 1000, 2700).freeboardKm.toFixed(2)}`);
 });
 
-test('slabs: sinking rate from negative buoyancy (Stokes-like), zero when buoyant', () => {
+test('slabs: sinking rate from negative buoyancy (Stokes-like, size = thickness), zero when buoyant', () => {
   const p = PARAMS;
-  const w = transitions.slabSinkRate(-1.27, 0.0175, p);
-  const expected = (p.mantle_density * 1.27e3 * 9.81 * 2 * 0.0175 * 6.371e6) / (4 * p.isostatic_viscosity_pa_s) * 3.15576e13 / 1e3;
+  const w = transitions.slabSinkRate(-1.27, 100, p);
+  const expected = (p.mantle_density * 1.27e3 * 9.81 * 100e3) / (4 * p.isostatic_viscosity_pa_s) * 3.15576e13 / 1e3;
   assert.ok(Math.abs(w / expected - 1) < 1e-12);
-  console.log(`  old ocean slab (freeboard -1.27 km) sinks at ${w.toFixed(0)} km/Myr = ${(w / 10).toFixed(1)} cm/yr`);
-  assert.equal(transitions.slabSinkRate(0.3, 0.0175, p), 0);
+  console.log(`  old ocean slab (freeboard -1.27 km, 100 km thick) sinks at ${w.toFixed(0)} km/Myr = ${(w / 10).toFixed(1)} cm/yr`);
+  assert.equal(transitions.slabSinkRate(0.3, 100, p), 0);
 });
 
 test('bending: a line load on a strip of columns gives the thin-plate flexure profile', () => {
@@ -1027,4 +1022,90 @@ test('kinematic mantle: rigid rotation of A, B at rest, upwelling on the ridge h
     const exact = kinematicFlow(x, o).divergence;
     assert.ok(Math.sign(exact) === sign && Math.abs(numeric / exact - 1) < 0.02, `${numeric} vs ${exact}`);
   }
+});
+
+import * as hinge from '../src/columns/hinge.js';
+
+// Semi-infinite plate on a Winkler foundation, finite differences: minimise
+// sum D/2 w''^2 h + K/2 w^2 h - V w_0 - M0 w'(0). Returns w and the moment D w''.
+function endLoadedBeam({ D, K, V, M0, length, n }) {
+  const h = length / (n - 1);
+  const A = Array.from({ length: n }, () => new Float64Array(n)), b = new Float64Array(n);
+  for (let i = 1; i < n - 1; i++) {
+    const g = [[i - 1, 1], [i, -2], [i + 1, 1]];
+    for (const [r, cr] of g) for (const [c, cc] of g) A[r][c] += (D / h ** 3) * cr * cc;
+  }
+  for (let i = 0; i < n; i++) A[i][i] += K * h * (i === 0 || i === n - 1 ? 0.5 : 1);
+  b[0] += V - M0 / h; b[1] += M0 / h;
+  for (let c = 0; c < n; c++) { // Gaussian elimination (banded, no pivoting needed: SPD)
+    for (let r = c + 1; r < Math.min(n, c + 3); r++) {
+      const f = A[r][c] / A[c][c];
+      if (f === 0) continue;
+      for (let k = c; k < Math.min(n, c + 3); k++) A[r][k] -= f * A[c][k];
+      b[r] -= f * b[c];
+    }
+  }
+  const w = new Float64Array(n);
+  for (let r = n - 1; r >= 0; r--) { let s = b[r]; for (let k = r + 1; k < Math.min(n, r + 3); k++) s -= A[r][k] * w[k]; w[r] = s / A[r][r]; }
+  const M = Array.from({ length: n }, (_, i) => (i === 0 || i === n - 1 ? 0 : (D * (w[i - 1] - 2 * w[i] + w[i + 1])) / h ** 2));
+  return { w, M, h };
+}
+
+test('hinge: setback pi l / 4 and stiffness D / l match a finite-difference plate on a foundation', () => {
+  const D = 1.7e23, K = 3300 * 9.81, ell = hinge.flexuralLength(D, K);
+  const { M, h } = endLoadedBeam({ D, K, V: 1e12, M0: 0, length: 12 * ell, n: 1201 });
+  let peak = 0;
+  for (let i = 1; i < M.length; i++) if (Math.abs(M[i]) > Math.abs(M[peak])) peak = i;
+  assert.ok(Math.abs(peak * h - hinge.hingeSetback(ell)) < 2 * h, `peak ${peak * h} vs ${hinge.hingeSetback(ell)}`);
+  const m = endLoadedBeam({ D, K, V: 0, M0: 1e17, length: 12 * ell, n: 2401 });
+  const theta = (m.w[1] - m.w[0]) / m.h;
+  assert.ok(Math.abs(1e17 / theta / hinge.hingeStiffness(D, ell) - 1) < 0.02, `stiffness ${1e17 / theta} vs ${D / ell}`);
+  console.log(`  l = ${(ell / 1e3).toFixed(0)} km, setback ${(hinge.hingeSetback(ell) / 1e3).toFixed(0)} km, stiffness ${hinge.hingeStiffness(D, ell).toExponential(2)} N m/m/rad`);
+});
+
+test('hinge: elastic, plastic and runaway branches of the torque balance', () => {
+  const kh = 1e18, My = 1e16, stiffness = 1e17;
+  const e = hinge.solveHinge({ drive: 1e15, stiffness, kh, My });
+  assert.equal(e.branch, 'elastic');
+  assert.ok(Math.abs(e.beta - 1e15 / (stiffness + kh)) < 1e-12);
+  const p = hinge.solveHinge({ drive: 1e17, stiffness, kh, My });
+  assert.equal(p.branch, 'plastic');
+  assert.ok(Math.abs(p.beta - (1e17 - My) / stiffness) < 1e-9 && Math.abs(kh * (p.beta - p.betaPlastic) - My) < 1e3);
+  // Partial unloading from the plastic state springs back elastically about the plastic rotation
+  // (unloading to zero would yield in reverse: the spring-back exceeds My).
+  const u = hinge.solveHinge({ drive: 0.95e17, stiffness, kh, My, betaPlastic: p.betaPlastic });
+  assert.equal(u.branch, 'elastic');
+  assert.ok(u.beta > 0 && u.beta < p.beta);
+  // Compression beyond the foundation's stiffness (net stiffness < 0), past yield: runaway.
+  const r = hinge.solveHinge({ drive: 1e17, stiffness: -1e16, kh, My, betaMax: 1 });
+  assert.equal(r.branch, 'runaway');
+  assert.equal(r.beta, 1);
+  // Torques: compression lowers the stiffness in proportion to the flap length.
+  const t = hinge.hingeTorques({ slabLoad: 1e12, underthrustWeight: 4e7, K: 3e4, compression: 1e12, setback: 5e4, flap: 1e5 });
+  assert.ok(Math.abs(t.drive - (1e12 * 1e5 + 4e7 * (1e10 - 2.5e9) / 2)) < 1);
+  assert.ok(Math.abs(t.stiffness - (3e4 * 1.25e14 / 3 - 1e17)) < 1);
+  // The trench contact gives way from the face strength to the interface at the optimal thrust dip (~29 deg at mu 0.6).
+  assert.equal(hinge.contactWeakening(0, 0.6, 0.1), 1);
+  assert.ok(Math.abs(hinge.contactWeakening(0.5 * Math.atan(1 / 0.6), 0.6, 0.1) - 0.1) < 1e-12);
+  assert.ok(Math.abs(hinge.contactWeakening(1, 0.6, 0.1) - 0.1) < 1e-12);
+  assert.equal(hinge.becomesSlab(1.5e6, 5e4, 1.55e6), true);
+  assert.equal(hinge.becomesSlab(1.4e6, 5e4, 1.55e6), false);
+  // A hanging slab passes up its weight less viscous support, capped at the attachment's strength;
+  // the excess necks it, and necked through its thickness it breaks off.
+  const held = hinge.hangSlab({ weight: 10, childLoad: 3, descent: 1, freeRate: 4, cap: 100, dt: 1, thicknessKm: 100 });
+  assert.deepEqual(held, { load: 10 * 0.75 + 3, neck: 0, broken: false });
+  const heavy = hinge.hangSlab({ weight: 40, childLoad: 0, descent: 0, freeRate: 30, cap: 10, neck: 90, dt: 0.5, thicknessKm: 100 });
+  assert.equal(heavy.load, 10);
+  assert.ok(Math.abs(heavy.neck - (90 + 30 * 0.75 * 0.5)) < 1e-12 && heavy.broken);
+});
+
+test('hinge: column strength in bending and in tension from its slices', () => {
+  const p = { friction_coefficient: 0.6, pore_fluid_factor: 0.4, cohesion_mpa: 20 };
+  // Two equal slices: the neutral plane is between them, M = s dz (dz / 2) x 2.
+  const s = hinge.columnStrength([{ depthKm: 5, thicknessKm: 10, pressureMpa: 1e9, ductileMpa: 100 }, { depthKm: 15, thicknessKm: 10, pressureMpa: 1e9, ductileMpa: 100 }], p);
+  assert.ok(Math.abs(s.neutralKm - 10) < 1e-9);
+  assert.ok(Math.abs(s.plasticMoment - 2 * 100 * 10 * 5 * 1e12) < 1);
+  assert.ok(Math.abs(s.tensileStrength - 2 * 100 * 10 * 1e9) < 1); // ductile slices: their ductile strength
+  const b = hinge.columnStrength([{ depthKm: 5, thicknessKm: 10, pressureMpa: 100, ductileMpa: 1e6 }], p);
+  assert.ok(Math.abs(b.tensileStrength / ((20 + 0.6 * 0.6 * 100) / 3.1196 * 10 * 1e9) - 1) < 1e-4); // brittle: / Anderson's ratio, as the edge law
 });

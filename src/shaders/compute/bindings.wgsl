@@ -30,6 +30,9 @@ struct ParticleDelta {
     // Position corrections from tangential rows (phase G), kept apart: they
     // are not extrapolated by Chebyshev (crust_chebyshev_combine, solver.wgsl).
     tdx: atomic<i32>, tdy: atomic<i32>, tdz: atomic<i32>, pad4: u32,
+    // Load of the slabs hanging from this column, N, as f32 bits (atomic_add_f32);
+    // copied to Particle.child_load and cleared at the end of the step.
+    child_load: atomic<u32>, pad5: u32, pad6: u32, pad7: u32,
 }
 
 @group(0) @binding(0) var<storage, read_write> grid: array<GridNode>;
@@ -51,7 +54,7 @@ struct ParticleDelta {
 struct SolverState {
     iteration: u32, edge_pool_empty: atomic<u32>, slot_overflow: atomic<u32>, clipped_cells: atomic<u32>,
     budget: array<atomic<u32>, 4>,   // source lo, hi; sink lo, hi
-    breakups: atomic<u32>, pad9: u32, pad10: u32, pad11: u32,
+    breakups: atomic<u32>, slabs_lost: atomic<u32>, pad10: u32, pad11: u32,
     omega: array<f32>,
 }
 const BUDGET_SOURCE: u32 = 0u;
@@ -60,6 +63,16 @@ const VOLUME_FIXED: f32 = 1e12;
 @group(0) @binding(8) var<storage, read_write> solver: SolverState;
 // Per-column vertical profiles (design 4.0), recomputed every step by column_profile (profile.wgsl).
 @group(0) @binding(9) var<storage, read_write> profiles: array<ColumnProfile>;
+
+// Float add on an atomic word holding f32 bits (compare-and-swap loop).
+fn atomic_add_f32(p: ptr<storage, atomic<u32>, read_write>, v: f32) {
+    var old = atomicLoad(p);
+    loop {
+        let r = atomicCompareExchangeWeak(p, old, bitcast<u32>(bitcast<f32>(old) + v));
+        if (r.exchanged) { break; }
+        old = r.old_value;
+    }
+}
 
 // Add a (non-negative) crust volume to a budget sum: 64-bit fixed point,
 // split into words, with the carry from the low word.

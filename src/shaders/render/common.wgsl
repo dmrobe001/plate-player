@@ -1,5 +1,7 @@
 // Bindings and helpers shared by all render entry points.
 
+const NONE: u32 = 0xffffffffu; // "null index" sentinel (layout.js)
+
 struct View {
     view_proj: mat4x4f,
     light_dir: vec4f,

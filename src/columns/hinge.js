@@ -1,0 +1,140 @@
+// The trench hinge (design 6): a bend inside a surface column, where a plate
+// goes down at a trench. CPU reference for columns_hinge (hinge.wgsl) and the
+// slab attachment in thermal.wgsl.
+//
+// A plate on a buoyant (Winkler) foundation, loaded at its end, bends within
+// the flexural length l = (4 D / K)^(1/4) of the end (D the flexural rigidity,
+// K = drho g). With a vertical end load, the moment peaks at x* = pi l / 4
+// behind the end (Hetenyi 1946): that is where the hinge sits, behind the
+// trench line. A column much wider than l bends there as a hinge; the
+// rotational stiffness of such an end is D / l. Up to the plastic moment M_y
+// (the column's integrated strength) the hinge is elastic; beyond it, plastic.
+//
+// The flap is the part of the column beyond the hinge: x* outboard of the
+// trench, plus u, the part already past the trench line (under the overriding
+// plate, or past the hanging slab). Its length L_f = x* + u, its tip depth
+// L_f sin(beta). Torques about the hinge per unit hinge length (N m / m), for
+// a small bend beta:
+//   drive  = F_s L_f + w_u (L_f^2 - x*^2) / 2
+//            (F_s: weight of the slabs hanging from the tip, per unit length;
+//             w_u: negative buoyancy per area of the underthrust part, which
+//             is immersed in mantle rather than floating)
+//   resist = (K x*^3 / 3 - P L_f) beta + M(beta)
+//            (the foundation under the outboard part; in-plane compression P
+//             destabilises once the flap dips; M the hinge moment, elastic
+//             D / l (beta - beta_p) up to M_y)
+// Quasi-static each step (the hinge relaxes on the isostatic time scale,
+// ~30 kyr). Where the net stiffness is negative the bend runs away to
+// beta_max: that is the instability that initiates subduction.
+
+import { andersonRatio } from '../edges/law.js';
+
+export const EARTH_RADIUS_M = 6.371e6;
+
+/** Flexural length (m) from rigidity D (N m) and foundation stiffness K (N/m^3). */
+export const flexuralLength = (D, K) => (4 * D / K) ** 0.25;
+
+/** Distance (m) of the hinge behind the trench line: where the end-loaded plate's moment peaks. */
+export const hingeSetback = (ell) => (Math.PI * ell) / 4;
+
+/** Rotational stiffness of the hinge, N m / m per radian. */
+export const hingeStiffness = (D, ell) => (ell > 0 ? D / ell : 0);
+
+/**
+ * Plastic moment (N m / m) and tensile strength (N / m) of a column from its
+ * slices [{depthKm, thicknessKm, pressureMpa, ductileMpa}]. A slice's strength
+ * in bending is min(brittle, ductile), brittle = c + mu (1 - lambda) P (the
+ * edge law's compression cap at full integrity); the moment is taken about
+ * the strength-weighted median depth (equal strength above and below, the
+ * neutral plane of a fully plastic section). Tensile strength (what holds a
+ * hanging slab, and the most slab pull the column can pass to its plate): the
+ * edge law's tension cap at full integrity (brittle / q where the slice is
+ * brittle, src/edges/law.js; else its ductile strength), so what a column
+ * transmits and what its edges hold agree.
+ */
+export function columnStrength(slices, p) {
+  const s = slices.map((k) => Math.min(p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * k.pressureMpa, k.ductileMpa));
+  const total = s.reduce((a, v, i) => a + v * slices[i].thicknessKm, 0);
+  let acc = 0, zc = slices.length ? slices[slices.length - 1].depthKm : 0;
+  for (let i = 0; i < slices.length; i++) {
+    const w = s[i] * slices[i].thicknessKm;
+    if (acc + w >= total / 2) { zc = slices[i].depthKm - slices[i].thicknessKm / 2 + (w > 0 ? ((total / 2 - acc) / w) * slices[i].thicknessKm : 0); break; }
+    acc += w;
+  }
+  let moment = 0, tension = 0;
+  slices.forEach((k, i) => {
+    moment += s[i] * k.thicknessKm * Math.abs(k.depthKm - zc);
+    const brittle = p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * k.pressureMpa;
+    tension += (brittle < k.ductileMpa ? brittle / andersonRatio(p.friction_coefficient) : k.ductileMpa) * k.thicknessKm;
+  });
+  return { plasticMoment: moment * 1e12, tensileStrength: tension * 1e9, neutralKm: zc };
+}
+
+/** Drive (N m / m) and net linear stiffness (N m / m / rad) of the flap. */
+export function hingeTorques({ slabLoad, underthrustWeight, K, compression, setback, flap }) {
+  return {
+    drive: slabLoad * flap + underthrustWeight * (flap * flap - setback * setback) / 2,
+    stiffness: (K * setback ** 3) / 3 - compression * flap,
+  };
+}
+
+/**
+ * Quasi-static bend: drive = stiffness beta + M(beta), M = kh (beta - betaPlastic)
+ * capped at +-My. Returns {beta, betaPlastic, branch: 'elastic' | 'plastic' | 'runaway'},
+ * beta in [0, betaMax].
+ */
+export function solveHinge({ drive, stiffness, kh, My, betaPlastic = 0, betaMax = 1 }) {
+  const clamp = (b) => Math.min(Math.max(b, 0), betaMax);
+  const den = stiffness + kh;
+  if (den > 0) {
+    const beta = (drive + kh * betaPlastic) / den;
+    const M = kh * (beta - betaPlastic);
+    if (Math.abs(M) <= My) return { beta: clamp(beta), betaPlastic, branch: 'elastic' };
+  }
+  // Yielding: the hinge carries +-My, the rest is stiffness beta.
+  const sign = den > 0 && drive + kh * betaPlastic < 0 ? -1 : 1;
+  if (stiffness > 0) {
+    const beta = clamp((drive - sign * My) / stiffness);
+    return { beta, betaPlastic: kh > 0 ? beta - sign * My / kh : betaPlastic, branch: 'plastic' };
+  }
+  return { beta: betaMax, betaPlastic: kh > 0 ? Math.max(betaPlastic, betaMax - My / kh) : betaPlastic, branch: 'runaway' };
+}
+
+/**
+ * Compression cap factor of the trench contact, a fault dipping at the flap's
+ * bend beta: a vertical face (beta = 0) cannot slip under horizontal push, so
+ * it keeps the full face strength (1); Coulomb resistance is least at the
+ * optimal thrust dip theta* = atan(1 / mu) / 2, where the contact is the
+ * lubricated interface (`weakening`). Linear in between.
+ */
+export function contactWeakening(beta, mu, weakening) {
+  const opt = 0.5 * Math.atan(1 / mu);
+  return 1 + (weakening - 1) * Math.min(Math.max(beta / opt, 0), 1);
+}
+
+/** A column becomes a slab when its hinge has passed its back face: the flap covers it. */
+export const becomesSlab = (underthrust, setback, width) => underthrust + setback >= width;
+
+/**
+ * A hanging slab (slab_hang in thermal.wgsl), one step. The load it passes up
+ * is its weight (the part above the cutoff), less the viscous support of its
+ * descent (Stokes drag at descent rate v against its free sinking rate w_free:
+ * weight (1 - v / w_free)), plus what hangs from it; at most the attachment's
+ * tensile strength `cap`. Any excess makes it neck: its top falls behind the
+ * hang point at w_free (1 - cap / load). Necked through its thickness, it
+ * breaks off. With `previous` (last step's load) the load is under-relaxed,
+ * half the change per step: support, descent and bend depend on each other
+ * one step apart, and unrelaxed the lagged fixed point flips. Returns
+ * {load, neck, broken}.
+ */
+export function hangSlab({ weight, childLoad, descent, freeRate, cap, neck = 0, dt, thicknessKm, previous = null }) {
+  const support = freeRate > 0 ? Math.min(Math.max(descent / freeRate, 0), 1) : 0;
+  let load = weight * (1 - support) + childLoad;
+  // Under-relaxed against last step's load (the bend that sets the descent lags a step).
+  if (previous !== null) load = 0.5 * (previous + load);
+  if (load > cap) {
+    neck += freeRate * (1 - cap / load) * dt;
+    load = cap;
+  }
+  return { load, neck, broken: neck >= thicknessKm };
+}

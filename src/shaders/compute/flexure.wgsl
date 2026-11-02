@@ -113,6 +113,8 @@ fn slabs_arc_count(@builtin(global_invocation_id) id: vec3<u32>) {
         let j = other_end(e, idx);
         if (particles[j].state == 1u) { t += edges[e].integrity * (particles[j].position.xyz - p); }
     }
+    // A hanging slab has no edges: the plate behind it is what it hangs from.
+    if (particles[idx].attached_to != NONE) { t = particles[particles[idx].attached_to].position.xyz - p; }
     if (length(t) > 0.0) { particles[idx].slab_trailing = vec4f(normalize(t), 1.0); }
     let home = hash_cell(p);
     let dim = i32(sim.hash_grid_dim);

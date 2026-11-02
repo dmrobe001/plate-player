@@ -156,6 +156,10 @@ export function generateTwoPlateState(options = {}) {
     // MPa of spurious compression, which set off subduction in plate interiors).
     dt_crust_myr: 0.25,
     solver_iterations: 256,
+    // Chebyshev with the derived spectral radius (~0.99999 here) diverges once a
+    // trench hinge concentrates slab pull on a column and its contact caps
+    // change step to step (design 9.2, hinge findings); 0.999 stays stable.
+    chebyshev_rho: 0.999,
   };
 
   return {

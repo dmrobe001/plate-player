@@ -11,16 +11,22 @@
 // yield-strength envelope (design 4.0). A slice is brittle where friction is
 // the weaker (mu (1 - lambda_pore) P + phi c < ductile strength), else ductile:
 //   compression cap: min(friction + phi c, ductile)
-//   tension cap:     phi c if brittle; the ductile flow stress if ductile
-//                    (sign-blind: hot rock resists separation), reduced by
-//                    lost integrity if ductile_damage_weakening > 0
+//   tension cap:     if brittle, phi (c + friction) / q, q = ((1 + mu^2)^(1/2) + mu)^2:
+//                    slice stresses are deviatoric (from the lithostatic
+//                    state), and a brittle slice in deviatoric extension fails
+//                    by normal faulting at Anderson's fraction 1 / q of its
+//                    compressive strength, not at cohesion (that is a crack
+//                    in absolute tension, near the surface only). So intact
+//                    plates can transmit slab pull (design 6); broken edges
+//                    (phi = 0) still carry none. If ductile: the ductile flow
+//                    stress (sign-blind: hot rock resists separation), reduced
+//                    by lost integrity if ductile_damage_weakening > 0
 //
 // What happens above a cap:
 //   - ductile slices flow, and brittle compression slips: the stored stress
 //     is the capped stress (the slice's stress-free length moves; the pair's
 //     rest length does not; the isotropic part goes to area_ref in phase D);
-//   - brittle tension cracks: the slice carries its cap (phi c, so nothing at
-//     phi = 0) and stays referenced to the rest length: its stored stress is
+//   - brittle tension cracks: the slice carries its cap (nothing at phi = 0) and stays referenced to the rest length: its stored stress is
 //     the elastic trial stress, less only the creep driven by the stress it
 //     actually carries. So a crack closes, and a contact re-engages, exactly
 //     at touching.
@@ -62,6 +68,10 @@ import { geotherm, ductile, flowLaw, columnProfile, GRAVITY, SECONDS_PER_MYR } f
 
 export const EDGE_SLICES = 8;
 const LN_STRENGTH_CAP = Math.log(1e6);
+
+
+/** Anderson's ratio of frictional strength in compression to that in extension, ((1 + mu^2)^(1/2) + mu)^2. */
+export const andersonRatio = (mu) => (Math.sqrt(1 + mu * mu) + mu) ** 2;
 
 /** The column's depth extent below its top, km: crust and lithosphere (edges.wgsl, column_bottom). */
 export const columnDepthKm = (col, p) => Math.max(geotherm(col, p).L, col.crustKm);
@@ -117,7 +127,7 @@ export function edgeSlices(a, b, phi, p, normalStress = null) {
       z, dz, T,
       r: 1 / (1 + edtOverEta),
       comp: Math.min(brittleComp, ductileCap) * iface,
-      tens: brittle ? phi * p.cohesion_mpa : ductileCap * (1 - p.ductile_damage_weakening * (1 - phi)),
+      tens: brittle ? (phi * (p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * pressure)) / andersonRatio(p.friction_coefficient) : ductileCap * (1 - p.ductile_damage_weakening * (1 - phi)),
       cracks: brittle,
       shear: Math.min(brittleShear, ductileCap),
       slips: brittleShear < ductileCap,

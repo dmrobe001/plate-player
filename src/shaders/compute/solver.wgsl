@@ -233,7 +233,7 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     // Overdamped: velocity is not state, only a record of this step's motion.
-    particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, 0.0);
+    particles[idx].velocity = vec4f((particles[idx].predicted_pos.xyz - particles[idx].position.xyz) / sim.dt_crust_myr, particles[idx].velocity.w); // (w: a slab's descent rate, thermal.wgsl)
     let x = particles[idx].predicted_pos.xyz;
     particles[idx].position = vec4f(x, 1.0);
     // Body axis: carried to the new tangent plane and turned by the spin
@@ -251,6 +251,21 @@ fn crust_integrate(@builtin(global_invocation_id) id: vec3<u32>) {
         particles[idx].state = 2u;
         particles[idx].geometry_reset = 1u;
         add_budget(BUDGET_SINK, particles[idx].crust_volume); // leaves the surface: a volume sink (design 4.8)
+        // Its trench hinge passed its back face (hinge.wgsl): the whole column is
+        // flap, dipping at its bend. It hangs from the column behind it (found by
+        // the hinge; attached_to) from the next step, its top at that column's flap tip.
+        let dip = max(particles[idx].hinge_angle, 0.2);
+        particles[idx].hinge_angle = dip;
+        particles[idx].hinge_plastic = 0.0; // a slab's neck (thermal.wgsl, slab_hang)
+        particles[idx].slab_extent_km = 2.0 * particles[idx].apothem * EARTH_RADIUS_KM * sin(dip);
+        particles[idx].hinge_partner = NONE;
+        particles[idx].hinge_flap_km = 0.0;
+        particles[idx].hinge_underthrust_km = 0.0;
+        if (sim.slab_attach_factor <= 0.0) { particles[idx].attached_to = NONE; }
     }
     particles[idx].next_state = particles[idx].state;
+    // What hung from this column this step loads its hinge (or the slab above) next step.
+    particles[idx].child_load = bitcast<f32>(atomicLoad(&particle_deltas[idx].child_load));
+    atomicStore(&particle_deltas[idx].child_load, 0u);
+    particles[idx].slab_child = NONE;
 }

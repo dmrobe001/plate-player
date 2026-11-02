@@ -19,6 +19,7 @@ import lawWGSL from '../shaders/compute/law.wgsl';
 import flowWGSL from '../shaders/compute/flow.wgsl';
 import areaWGSL from '../shaders/compute/area.wgsl';
 import flexureWGSL from '../shaders/compute/flexure.wgsl';
+import hingeWGSL from '../shaders/compute/hinge.wgsl';
 
 export const CAPACITY = {
   maxParticles: 25000,
@@ -36,7 +37,7 @@ const MAX_SOLVER_ITERATIONS = 1024; // size of the Chebyshev weight table
  * bindings.wgsl): counters since load. Volume sums are 64-bit fixed point.
  */
 export const SOLVER_HEADER = {
-  words: 12, edgePoolEmpty: 1, slotOverflow: 2, clippedCells: 3, source: 4, sink: 6, breakups: 8, volumeFixed: 1e12,
+  words: 12, edgePoolEmpty: 1, slotOverflow: 2, clippedCells: 3, source: 4, sink: 6, breakups: 8, slabsLost: 9, volumeFixed: 1e12,
 };
 const WORKGROUP = 64;
 // Solver iterations per GPU submission. Long stretches of GPU work can exceed
@@ -127,7 +128,7 @@ export class Simulation {
 
   #createPipelines(onError) {
     const { device, buffers } = this;
-    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL, flowWGSL, areaWGSL, splitWGSL, flexureWGSL].join('\n');
+    const code = [structsWGSL(), bindingsWGSL, locateWGSL, thermalWGSL, solverWGSL, edgesWGSL, profileWGSL, lawWGSL, flowWGSL, areaWGSL, splitWGSL, flexureWGSL, hingeWGSL].join('\n');
     const module = createShaderModule(device, 'compute', code, onError);
 
     const order = ['grid', 'adjacency', 'particles', 'edges', 'particlePool', 'edgePool', 'hashGrid', 'deltas', 'solver', 'profiles'];
@@ -161,6 +162,7 @@ export class Simulation {
       'slabs_arc_count', 'columns_arc', 'columns_flexure_begin', 'columns_moment', 'columns_flexure',
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
       'edges_begin', 'edges_prune', 'edges_note_listed', 'edges_create', 'edges_finish', 'edges_law', 'edges_maxwell',
+      'columns_hinge',
       'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine',
       'crust_clear_deltas', 'crust_solve_edges', 'crust_apply_deltas',
       'crust_integrate',
@@ -184,6 +186,17 @@ export class Simulation {
     if (mantle.mesh !== this.mantleMesh) throw new Error('mantle must use the simulation\'s mantle mesh');
     this.mantle = mantle;
     this.uploadMantle();
+
+    // Slabs hang from an intact bonded surface partner (the first found).
+    const hangFrom = {};
+    if (P.state) {
+      for (let k = 0; k < B.count; k++) {
+        const i = B.a[k], j = B.b[k];
+        if (B.damage[k] >= 0.5) continue;
+        if (P.state[i] === 2 && P.state[j] !== 2 && hangFrom[i] === undefined) hangFrom[i] = j;
+        if (P.state[j] === 2 && P.state[i] !== 2 && hangFrom[j] === undefined) hangFrom[j] = i;
+      }
+    }
 
     // Particles
     const pbuf = new ArrayBuffer(maxParticles * Particle.byteSize);
@@ -216,6 +229,15 @@ export class Simulation {
       pf.set([...b, 0], base + po.body_axis);
       pf[base + po.shape_p] = P.shapeP ? P.shapeP[i] : 0;
       pf[base + po.shape_q] = P.shapeQ ? P.shapeQ[i] : 0;
+      // Trench hinge (design 6): none yet. A loaded slab hangs from the given
+      // column, else from its first intact bonded surface partner, at a dip of 0.5 rad.
+      pu[base + po.hinge_partner] = NONE;
+      pu[base + po.slab_child] = NONE;
+      pu[base + po.attached_to] = pu[base + po.state] === 2 ? (P.attachedTo ? P.attachedTo[i] : (hangFrom[i] ?? NONE)) : NONE;
+      if (pu[base + po.state] === 2) {
+        pf[base + po.hinge_angle] = 0.5;
+        pf[base + po.slab_extent_km] = 2 * P.apothem[i] * 6371 * Math.sin(0.5);
+      }
     }
     device.queue.writeBuffer(buffers.particles, 0, pbuf);
 
@@ -363,6 +385,7 @@ export class Simulation {
     run('edges_create', crust);      // new pairs in range
     run('edges_finish', crust);      // edge counts, angle-sorted slots, solver iterates
     run('columns_gpe_force', crust); // GPE push into the predicted positions (design 4.6)
+    run('columns_hinge', crust);     // trench hinges: bend, subduction, slab pull (design 6)
     run('edges_law', edges);         // this step's linear force law and caps (design 4.5)
     for (let i = 0; i < this.params.solver_iterations; i++) {
       if (i > 0 && i % ITERATIONS_PER_SUBMIT === 0) {
@@ -401,6 +424,7 @@ export class Simulation {
     const sum = (k) => (h[k + 1] * 4294967296 + h[k]) / SOLVER_HEADER.volumeFixed;
     return {
       volumeSource: sum(SOLVER_HEADER.source), volumeSink: sum(SOLVER_HEADER.sink), breakups: h[SOLVER_HEADER.breakups],
+      slabsLost: h[SOLVER_HEADER.slabsLost], // slabs broken off or removed while hanging from a surface column (design 9.2)
       clippedCells: h[SOLVER_HEADER.clippedCells], edgePoolEmpty: h[SOLVER_HEADER.edgePoolEmpty], slotOverflow: h[SOLVER_HEADER.slotOverflow],
     };
   }

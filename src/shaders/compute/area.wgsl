@@ -157,7 +157,10 @@ fn columns_volume(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     particles[idx].volume_added = 0.0;
-    if (particles[idx].state != 1u) {
+    // Slabs, and columns partly under an overriding plate at a trench hinge
+    // (their cell shrinks as they go under, which is not compaction): over the
+    // reference area.
+    if (particles[idx].state != 1u || particles[idx].hinge_underthrust_km > 0.0) {
         particles[idx].thickness_km = particles[idx].crust_volume / particles[idx].area_ref;
         return;
     }

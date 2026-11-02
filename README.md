@@ -47,7 +47,7 @@ URL options: `?world=random|two-plate`, `?seed=42`, `?paused`.
 
 | Glyph | Meaning |
 |---|---|
-| Disc / ellipse | One crust particle (column), drawn as its reference shape: mean radius = the apothem, elongated by distributed flow (its finite strain, up to aspect 3). Colour = elevation relative to sea level (blues below, greens/browns/white above). **White** discs are subducting slabs. |
+| Disc / ellipse | One crust particle (column), drawn as its reference shape: mean radius = the apothem, elongated by distributed flow (its finite strain, up to aspect 3). Colour = elevation relative to sea level (blues below, greens/browns/white above). **White** discs are subducting slabs. A darkened segment with a dark line is the **flap** beyond a trench hinge, darker the deeper its tip (black at 50 km). |
 | White arrows pointing out (←·→) | A principal axis of the column's stress in **tension**. Length ∝ that principal stress |
 | Black arrows pointing in (→·←) | A principal axis in **compression**. Each column shows both axes, at right angles |
 | Cyan arrow | **Mantle flow** beneath the column (one apothem = 5 cm/yr) |
@@ -218,17 +218,24 @@ whose cell exceeds twice the base hexagon without a preferred direction also spl
 volume budget closes. This replaced the old spreading stand-in (area growth over
 diverging mantle).
 
-**Subduction, suturing and arcs** (`law.wgsl`, `thermal.wgsl`, `flexure.wgsl`;
-reference `src/edges/transitions.js`). Each edge has a timer that runs while it is
-compressed beyond 50 MPa. If either column is denser than the mantle (negative
-freeboard: ocean older than ~8 Myr), the denser one becomes a **slab** once the timer
-passes 1 Myr (a tenth of that if it already touches a slab, so trenches propagate and
-keep their polarity). If both are buoyant, nothing subducts; after 5 quiet Myr the edge
-**welds** (suturing). A slab stays where it was and sinks at a Stokes rate set by its
-negative buoyancy (~7 cm/yr for old ocean), warming and slowing; it is removed at
-660 km. Its edges are measured in 3D, so as it sinks it stretches them and pulls the
-plate behind it; its interface with the other plate is weak in compression. Crossing
-80–160 km depth, a slab feeds an **arc**: surface columns within ~320 km gain 20% of
+**Subduction: the trench hinge; suturing and arcs** (`hinge.wgsl`, `thermal.wgsl`,
+`law.wgsl`, `flexure.wgsl`; references `src/columns/hinge.js`,
+`src/edges/transitions.js`; design 6). A column denser than the mantle (negative
+freeboard: ocean older than ~8 Myr) facing a more buoyant neighbour across a broken
+edge has a **trench hinge**: a bend inside the column, a flexural length's
+fraction (πℓ/4, ~50 km) behind the trench line. Its bend is a torque balance: what
+hangs from the flap and the weight of the part already under the other plate, against
+the buoyant foundation and the hinge's own stiffness (elastic, then plastic), with
+trench compression destabilising. As the flap dips toward the optimal thrust angle
+(~29°), the contact gives way to the weak interface and the column slides under; when
+the hinge has passed its back face it becomes a **slab**. Compression alone does not
+do it (that would take ~10¹⁴ N/m). A slab **hangs** from the column behind it (and
+slabs from slabs), at the trench, loading that column's hinge and pulling its plate;
+beyond the plate's tensile strength it necks, and necked through it breaks off and
+sinks freely (~3 cm/yr for old ocean, a Stokes rate set by its thickness). Slabs are
+removed at 660 km. If both columns of a compressed pair are buoyant, nothing
+subducts; after 5 quiet Myr the edge **welds** (suturing). Crossing 80–160 km depth,
+a slab feeds an **arc** on the far side: surface columns within ~320 km gain 20% of
 its crust volume (at continental density, 2750) and their lithosphere is reset hot.
 
 ### Initial conditions (`src/init/initial-state.js`)
@@ -274,25 +281,29 @@ plate-player/
 │   │   └── vec.js             vector / matrix helpers
 │   ├── init/
 │   │   ├── initial-state.js   the initial-condition recipe above
+│   │   ├── two-plate.js       the two-plate test planet (162 columns)
 │   │   ├── noise.js           seeded Perlin noise, fBm, quantiles
 │   │   ├── cell-list.js       CPU neighbour search
 │   │   └── random.js          seeded RNG, uniform points on the sphere
 │   ├── edges/
 │   │   ├── topology.js        CPU reference for edge existence, slot order, storage checks
 │   │   ├── law.js             CPU reference for the edge law: slices, Maxwell stresses, caps, integrity
-│   │   └── transitions.js     CPU reference for subduction initiation, suturing, slab sinking
+│   │   └── transitions.js     CPU reference for suturing and free slab sinking
 │   ├── columns/
 │   │   ├── profile.js         CPU reference for column profiles: geotherm, Airy, GPE, strength
 │   │   ├── flow.js            CPU reference for volumetric flow and the GPE push
 │   │   ├── area.js            CPU reference for the tessellated area (weighted Voronoi cells)
 │   │   ├── volume.js          CPU reference for crust volume, thinning, melt, breakup and splits
 │   │   ├── shape.js           CPU reference for column rotation and reference shapes (strain fit, split by aspect, lattice moduli)
-│   │   └── flexure.js         CPU reference for bending of the free radius (thin plate on a Winkler foundation)
+│   │   ├── flexure.js         CPU reference for bending of the free radius (thin plate on a Winkler foundation)
+│   │   ├── hinge.js           CPU reference for the trench hinge and hanging slabs
+│   │   └── stress.js          CPU reference for the drawn column stress tensor and net force
 │   ├── sim/
 │   │   ├── params.js          every simulation parameter, with units
 │   │   └── simulation.js      GPU buffers, compute pipelines, per-frame schedule
 │   ├── mantle/
 │   │   ├── mantle.js          lava-lamp mantle: buoyancy, screened poloidal flow, plumes, spin-up
+│   │   ├── kinematic.js       prescribed two-plate mantle flow (the test planet)
 │   │   └── sphere-mesh.js     cotangent Laplacian, CG Poisson solver, gradients, interpolation
 │   ├── plates/
 │   │   ├── plates.js          plate labelling (union-find), persistent ids, Euler-pole fit

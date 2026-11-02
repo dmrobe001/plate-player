@@ -163,16 +163,20 @@ export const SIM_PARAMS = [
   // 1e21 Pa s is the upper-mantle viscosity from post-glacial rebound; tau is
   // then ~30 kyr at the base particle size, so columns track Airy closely.
   ['isostatic_viscosity_pa_s', 'f32', 1e21],
-  // --- subduction, suturing, slabs, arcs (design 6; phase F; src/edges/transitions.js) ---
+  // --- suturing, subduction, slabs, arcs (design 6; src/edges/transitions.js, src/columns/hinge.js) ---
   // One timer per edge: it accumulates while the edge's depth-averaged normal
   // stress is more compressive than transition_stress_mpa, and resets
-  // otherwise. Past subduction_window_myr, if a column is negatively buoyant
-  // (freeboard < 0), the denser one becomes a slab; past suture_window_myr
-  // with both buoyant and no plastic work that step, the edge welds (integrity 1).
+  // otherwise. Past suture_window_myr, with both columns buoyant and no
+  // plastic work that step, the edge welds (integrity 1).
   ['transition_stress_mpa', 'f32', 50.0],
-  ['subduction_window_myr', 'f32', 1.0],
-  ['subduction_propagation_factor', 'f32', 0.1], // window x this when the down column already touches a slab
   ['suture_window_myr', 'f32', 5.0],
+  // Subduction is not a timer: a column goes down when the hinge of its trench
+  // has passed its back face (design 6, the trench hinge; src/columns/hinge.js).
+  ['hinge_max_angle', 'f32', 1.0],        // rad: the bend's limit (the runaway branch goes here)
+  // A slab hangs from the column behind it until its load exceeds the tensile
+  // strength of the weaker of the two (x this factor); then it breaks off and
+  // sinks freely. 0 = slabs never hang (each sinks freely from the start).
+  ['slab_attach_factor', 'f32', 1.0],
   // The subduction interface is lubricated: compression caps of edges with
   // exactly one slab end are scaled by this.
   ['slab_interface_weakening', 'f32', 0.1],

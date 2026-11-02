@@ -167,7 +167,7 @@ contact or a ridge is a matter of the edge's state and the two columns' profiles
 | `length`, `direction_x/y/z` | the pair's distance and separation vector at the last update. Strain and sliding are measured from them, so a change of rest length or shape adds no stress |
 | `slice_stress_mpa`, `slice_shear_mpa` | the normal and tangential Maxwell stress of each of 8 depth slices of the shared interval: the memory that makes the edge history-dependent (4.5) |
 | `moment` | the face moment against relative rotation of the two columns (4.5) |
-| `timer` | sustained-compression accumulator for subduction and suturing (section 6) |
+| `timer` | sustained-compression accumulator for suturing (section 6) |
 | `born_myr` | creation time |
 | `rest`, `lever_a`, `face_length`, stiffnesses, reference offsets, multiplier bounds | derived each step by `edges_law` for the solve (4.5) |
 | `lambda`, `lambda_prev`, `lambda_t`, `lambda_r` | XPBD multipliers (normal, tangential, rolling); Chebyshev needs the previous normal one |
@@ -476,9 +476,15 @@ contact point at the lever fraction rᵢ/rest from i. Normal strain increments a
 | Direction | Brittle slices | Ductile slices |
 |---|---|---|
 | compression | μ(1 − λ_pore)P + φc | flow stress |
-| tension | φc | flow stress (sign-blind: hot rock resists separation), × (1 − `ductile_damage_weakening`(1 − φ)) |
+| tension | φ(c + μ(1 − λ_pore)P)/q | flow stress (sign-blind: hot rock resists separation), × (1 − `ductile_damage_weakening`(1 − φ)) |
 
-A slice is brittle where friction is weaker than creep. Above a cap: ductile slices
+A slice is brittle where friction is weaker than creep. Slice stresses are deviatoric
+(measured from the lithostatic state), so a brittle slice in extension fails by
+normal faulting, at Anderson's fraction 1/q of its frictional strength,
+q = ((1 + μ²)^½ + μ)² (3.12 at μ = 0.6): about 6 MPa at the surface, growing with
+depth. (Until the trench hinge, the cap was cohesion alone, φc: a crack in absolute
+tension. A plate could then transmit at most ~2×10¹² N/m, too little to be pulled by
+a slab against any trench contact; section 6.) Above a cap: ductile slices
 flow and brittle slices slip in compression (the stored stress is the capped
 stress). Brittle slices *crack* in tension: they store their elastic trial stress,
 less only the creep their capped stress drives, so they stay referenced to the rest
@@ -528,13 +534,14 @@ under its cap while one slice is over its own, and the next step corrects it.
 
 **Limits of the continuum, by state, not by kind.** φ = 0 between cold, shallow
 columns: tensile cap ≈ 0, a contact. High φ: a weld. Low φ under shear: a fault or
-transform. Hot, thin, stretching columns: low caps everywhere, a ridge. A shrinking
-depth overlap: a subduction interface (section 6).
+transform. Hot, thin, stretching columns: low caps everywhere, a ridge. A broken edge
+with a bending flap on one side: a subduction interface (section 6).
 
 **What the law gives** (CPU reference, default parameters): an old-ocean pair (100
-Myr, 100 km shared) has compression cap 10 600 MPa·km and tension cap 2430 MPa·km at
-φ = 1, of which cohesion is 750. At φ = 0 its tension cap is 1680 MPa·km, the ductile
-base's flow stress, about 80% of ridge push (~2100 MPa·km at 50 Myr): a broken
+Myr, 100 km shared) has compression cap 11 400 MPa·km and tension cap 4790 MPa·km at
+φ = 1, of which the brittle slices' frictional extension strength is 3110. At φ = 0
+its tension cap is 1680 MPa·km, the ductile base's flow stress, about 80% of ridge
+push (~2100 MPa·km at 50 Myr): a broken
 boundary between old plates resists opening nearly as hard as an intact one unless
 `ductile_damage_weakening` is raised (section 10). A fully cold pair at φ = 0 has
 tension cap exactly 0.
@@ -614,8 +621,8 @@ means solver residuals below yield (~MPa) change nothing permanent.
   τ_heal decide whether damage localises into narrow boundaries (section 10).
 - **Thermal:** thermal age advances (capped by composition); stretching scales it
   (4.8); arcs reset it (section 6).
-- **State transitions on edges:** subduction initiation and suturing via the edge
-  timer (section 6).
+- **State transitions:** suturing via the edge timer; subduction when a trench hinge
+  passes a column's back face (section 6).
 
 **Checked:** uniform shortening at the caps thickens a 19-column patch at the
 predicted rate (ln 0.0479 over steps 6–12 against 0.0481) with volume held to 10⁻⁵;
@@ -716,16 +723,18 @@ writes named buffers only, so any one can be run alone on dumped or synthetic in
  2. splits          by shape or area, on last step's cells; commit slots; re-attach edges (4.8)
  3. predict         x̃ = x + v_mantle·dt; spin = 0; hash grid of predicted positions
  4. columns         tessellated area; dilatation: thinning, melt, volume, thickness (4.8);
-                    profiles (4.0); ages; slabs warm, sink, supply arcs, are removed (6);
+                    profiles (4.0); ages; slabs warm, hang or sink, neck, supply arcs, are
+                    removed (6);
                     arc growth (6)
  5. bending         elevations: Winkler isostasy with plate bending, Jacobi sweeps (4.3)
  6. edges           prune pairs out of range, create pairs in range, sort slot lists (3.2);
-                    GPE push into the predicted positions (4.6); each edge's linear law,
-                    caps, rest length, lever, face (4.5)
+                    GPE push into the predicted positions (4.6); trench hinges: bend,
+                    subduction, slab pull (6); each edge's linear law, caps, rest length,
+                    lever, face (4.5)
  7. solve           solver_iterations (32) sweeps: all edges' normal, tangential and rolling
                     rows (Jacobi), Chebyshev extrapolation of the normal part (5.2)
  8. irreversible    slice stresses, inelastic strain, slip, plastic work, integrity, moment,
-                    edge timers and state transitions (4.7, 6); area and shape (4.7)
+                    edge timers and suturing (4.7, 6); area and shape (4.7)
  9. integrate       position = solved position; velocity (diagnostic); body axis carried and
                     turned; columns marked for subduction become slabs (6)
 CPU, between steps: mantle advanced and uploaded every stepMyr; plate labelling every
@@ -795,9 +804,9 @@ costly at fine resolution, are in section 9.3.
 ## 6. Boundaries, subduction and spreading
 
 Under the pair law boundaries are not built; they are where edge state and column
-profiles have become weak. Kernels: the edge timer and transitions at the end of
-`edges_maxwell` (reference `src/edges/transitions.js`); slabs in `thermal.wgsl`;
-arcs in `flexure.wgsl`.
+profiles have become weak. Kernels: the trench hinge in `hinge.wgsl` (reference
+`src/columns/hinge.js`); the edge timer and suturing at the end of `edges_maxwell`
+(`src/edges/transitions.js`); slabs in `thermal.wgsl`; arcs in `flexure.wgsl`.
 
 **Rifting and spreading.** Where columns are pulled apart, tension is resisted by the
 ductile slices whatever the integrity, so separation is taken up by stretching:
@@ -816,40 +825,83 @@ ductile rock it flows and elongates the columns' shapes, and past the aspect cap
 pairs leave range and others enter (neighbour exchange). Low-integrity edges under
 sustained shear are transforms and strike-slip faults.
 
-**Subduction initiation.** One timer per edge: + dt while the depth-averaged normal
-stress is more compressive than `transition_stress_mpa` (50 MPa), reset to 0
-otherwise. When it passes `subduction_window_myr` (1 Myr) and at least one column is
-**negatively buoyant (freeboard < 0**: the whole column is denser than the mantle),
-the down column becomes a slab:
-- **Polarity:** the column touching a slab, if only one can sink and does; else the
-  lower freeboard; ties to the lower index.
-- **Propagation:** the window × `subduction_propagation_factor` (0.1) when the down
-  column already touches a slab, so the trench propagates along the plate and keeps
-  its polarity.
-- Freeboard < 0 makes ocean older than ~8 Myr subductable (freeboard +0.30 km at
-  2 Myr, −0.14 at 10, −1.27 at 60; a continent +3.41): basaltic crust's compositional
-  buoyancy is small at 3000 kg/m³ (section 10). Buoyant columns never go down;
-  continent–continent convergence thickens instead.
+**Subduction: the trench hinge.** A plate goes down at a bend inside a tile, not by a
+stress threshold. Kernel `columns_hinge` (`hinge.wgsl`), after the edges are listed
+and before the edge law; reference `src/columns/hinge.js`.
+- **Trench partner.** A surface column that can sink (freeboard < 0) faces the more
+  buoyant surface neighbour across a broken edge (integrity < 0.5) that it is furthest
+  under; equal columns have no polarity. Failing that, a slab hanging from it.
+  Freeboard < 0 makes ocean older than ~8 Myr subductable (+0.30 km at 2 Myr, −0.14 at
+  10, −1.27 at 60; a continent +3.41): basaltic crust's compositional buoyancy is
+  small at 3000 kg/m³ (section 10). Buoyant columns never go down.
+- **Where the hinge is.** A plate on a buoyant foundation loaded at its end bends
+  within its flexural length ℓ = (4D/K)^¼ of the end, and its moment peaks at
+  x* = πℓ/4 behind it (Hetényi): there is the hinge, behind the trench line. The
+  trench line is the overriding partner's front face, so u, the part of the column
+  already past it, is the pair's map-view overlap. Flap length L_f = x* + u, tip
+  depth L_f sin β. Rotational stiffness of the hinge D/ℓ. For 30 km of elastic
+  thickness ℓ ≈ 68 km, x* ≈ 53 km, D/ℓ ≈ 2.5×10¹⁸ N·m/m per rad.
+- **Bend β, quasi-static each step** (it relaxes on the isostatic time, ~30 kyr),
+  per unit hinge length: drive = F_s L_f + w_u(L_f² − x*²)/2 (F_s what hangs from the
+  tip, w_u the negative buoyancy per area of the underthrust part, which is immersed
+  in mantle, less the viscous support of its descent); resistance = (K x*³/3 − P L_f)β
+  + M(β) (the foundation under the outboard part; trench compression P destabilises a
+  dipping flap; M the hinge moment, elastic up to the plastic moment M_y, the
+  column's integrated slice strength about its strength-weighted median depth). Where
+  the net stiffness is negative the bend runs away to `hinge_max_angle` (1 rad). With
+  no slab and no underthrust, nothing bends: compression alone buckles a plate only
+  above ~K ℓ²/2 ≈ 10¹⁴ N/m, a hundred times what drag supplies. Spontaneous
+  initiation is hard, as in nature (McKenzie 1977; Mueller & Phillips 1991).
+- **Contact.** The trench pair's compression cap goes from the face strength to the
+  lubricated interface (`slab_interface_weakening`) as β reaches the optimal thrust
+  dip θ* = ½ atan(1/μ) (29° at μ = 0.6): a vertical face cannot slip under horizontal
+  push, and Coulomb resistance is least at θ*. Underthrust is not compaction: the pair
+  feeds no volumetric flow, and an underthrusting column's thickness is over its
+  reference area, not its shrinking cell.
+- **Becoming a slab:** when the hinge passes the column's back face, u + x* ≥ 2a
+  (the whole column is flap). There is no timer and no propagation rule: a trench
+  propagates where neighbours have partners and are pulled.
+- **Slab pull** reaches the plate as a body force on the hinge column toward the
+  trench (into its drag target, like the GPE push): the down-dip part, sin β, of what
+  hangs from the flap plus the underthrust part's weight. At most what the column can
+  transmit (its tensile strength across its width) and what the plate behind can hold
+  (the tension caps of its edges behind, projected on the pull, × 0.9); more would
+  tear the plate behind the hinge.
 
-**Slabs.** A column that subducts keeps its place and elevation, and its volume
-leaves the surface budget. Then:
-- **Sinking:** w = B g (2a)/4η, B = −ρ_m × freeboard (kg/m²), η the upper-mantle
-  viscosity (`isostatic_viscosity_pa_s`), a the apothem: ~7 cm/yr for old ocean.
-- **Warming:** thermal age × exp(−`slab_heating_rate`·dt) (0.05/Myr), so it slows.
-- **Removal:** at `slab_cutoff_km` (660) or at neutral buoyancy.
-- **Slab pull through edges:** an edge with a slab end is measured in 3D (radius
-  1 + elevation/R), so a sinking slab stretches it and pulls the plate behind it. Its
-  edges restart their length and direction when it subducts (no stress jump). The
-  edge exists while the depth intervals overlap: a slab ~100 km down detaches.
-- **Weak interface:** compression caps on edges with exactly one slab end × 0.1
-  (`slab_interface_weakening`). A slab's overburden in its profile is mantle rock, not
-  water. The slab is the memory: polarity persistence and the slab-pull–speed
-  feedback come from the geometry, not from bookkeeping.
+**Slabs hang.** A new slab hangs from the intact surface column behind it (found by
+the hinge), at its bend as dip; a slab can hang from a slab (a chain). Kernel
+`slab_hang` in `thermal.wgsl`; reference `hangSlab`.
+- **Where:** in map view at the trench (its parent's front face toward the parent's
+  trench partner, or under its parent slab); its top at the parent's flap tip, or
+  the parent slab's bottom (top − extent, extent = 2a sin dip). It has no edges.
+- **Load:** its weight above the cutoff (B g A, B = −ρ_m × freeboard), less the
+  viscous support of its descent (descent rate = the parent's speed toward its
+  trench × sin β, over the free sinking rate), plus what hangs from it; under-relaxed
+  (half the change per step: support, descent and bend depend on each other a step
+  apart, and unrelaxed the lagged fixed point flips). Loads accumulate upward by
+  atomic float adds and reach the parent next step.
+- **Necking and break-off:** at most the tensile strength of the weaker column × the
+  narrower width passes up (`slab_attach_factor` 1; 0 = slabs never hang). The excess
+  necks the slab: its top falls behind the hang point at w_free(1 − cap/load). Necked
+  through its thickness, it breaks off and sinks freely.
+- **Free sinking:** w = B g h/4η, h the slab's thickness (its column extent): a sheet
+  sinks edge-first, whatever its width in map view (~3 cm/yr for old ocean). (It was
+  B g (2a)/4η, which made a 1,900 km column sink at 50 cm/yr.)
+- **Free slabs** keep their 3D-measured edges and the old rules: an edge with a slab
+  end is measured in 3D, so a sinking slab stretches it and pulls the plate behind
+  it, until the depth intervals stop overlapping (~100 km down).
+- **Warming** (thermal age × exp(−0.05 dt)) and **removal** at `slab_cutoff_km` (660)
+  or neutral buoyancy, as before. A slab lost (broken off or removed) while hanging
+  from a surface column is counted (`slabsLost`): the heuristic *a slab does not
+  disappear before the tile it drags has started to subduct* as a number.
+- **Weak interface:** compression caps on edges with exactly one slab end × 0.1. A
+  slab's overburden in its profile is mantle rock, not water.
 
-**Arcs.** A slab whose top crosses the arc window (80–160 km) supplies `arc_efficiency`
-(0.2) × its volume over the passage, shared equally among surface columns within
-`arc_reach` (0.05, ~320 km) on the far side from the plate behind the slab (the
-integrity-weighted direction to its surface edge partners). It is mixed in at
+**Arcs.** A slab crossing the arc window (80–160 km; a free slab's top, a hanging
+slab's bottom) supplies `arc_efficiency` (0.2) × its volume over the passage, shared
+equally among surface columns within `arc_reach` (0.05, ~320 km) on the far side from
+the plate behind the slab (what it hangs from; for a free slab the integrity-weighted
+direction to its surface edge partners). It is mixed in at
 `arc_density` 2750 (so arcs build continental crust) and logged as a source; the
 receiving columns' thermal age resets to 0 (hot, weak arc lithosphere). Arcs feed
 only the far side: feeding the slab's own plate reset its lithosphere hot, which ended
@@ -860,12 +912,17 @@ volumetric flow (4.7), bounded by GPE spreading. If both columns are buoyant, th
 timer passes `suture_window_myr` (5 Myr) and the edge did no plastic work that step,
 the edge welds (integrity 1); the plate labelling records the merge.
 
-**Checked:** on the GPU, old ocean held against a continent at 0.2% compression
-subducts at the window step, two buoyant pairs weld at theirs, a pair in tension keeps
-its timer at 0. A slab at the end of a row of five old-ocean columns sinks 1.16 km per
-step (the reference to 6×10⁻⁷); at 55 km its edge carries 1.8 MPa of tension and the far
-end of the plate has moved 8.9 km toward it; it is removed at the cutoff; the arc gets
-exactly 20% of its volume, all on the far side.
+**Checked:** the hinge's setback and stiffness against a finite-difference plate on a
+foundation (peak moment within one grid step of πℓ/4; end stiffness within 2% of
+D/ℓ); the elastic, plastic and runaway branches and partial unloading. On the GPU,
+compression alone (old ocean held against a continent at 0.2%) subducts nothing, and
+two buoyant pairs weld at their window. A strip (eight old-ocean columns against a
+four-column continent, a slab hanging from the leading column, no mantle, damage off,
+dt 0.25 Myr): the flap bends 3.6° in the second step, the leading column goes up to
+145 km under the continent and subducts at 5.25 Myr, its slab still hanging from it;
+no slab lost, no continent subducted, its volume logged as the sink. A free slab sinks
+0.52 km per step (3.2 cm/yr, the reference to 5×10⁻⁷), pulls the plate behind it and
+is removed at the cutoff; the arc gets exactly 20% of its volume, all on the far side.
 
 **Coarse resolution (~220 km).** Slabs are one column, bending is aliased, and arcs
 are one column wide. The same rules run; slab pull is lumpier. Deviation from Earth
@@ -1012,8 +1069,8 @@ result once:
   damage localised into narrow boundaries.
 - **Handles:** basal drag (η_a), the GPE force (on), W_D and τ_heal, the edge
   interaction parameters (`ductile_damage_weakening`, cohesion, the tangential ratio,
-  the aspect cap), and the subduction thresholds (50 MPa, 1 Myr window, interface
-  weakening, buoyancy criterion).
+  the aspect cap), and subduction's (interface weakening, the buoyancy criterion,
+  `slab_attach_factor`).
 - **Measure before changing the solver,** at spacings of 220, 110 and 50 km (≈10k,
   40k, 240k particles): iterations per step needed to hold the residual stress below a
   few MPa; plate rigidity under the mantle forcing (rms non-rigid speed of plate
@@ -1028,7 +1085,8 @@ result once:
 Already measured on a generated planet with the assembled model (short runs): cells
 sum to 4π − 0.08%, the deficit in ~2% clipped cells at voids of the initial state
 wider than the hash reach (their neighbours take the void's area and thin, as
-intended); no slab forms in 20 steps (the window is 1 Myr); a 10× time step (1.6 Myr
+intended); no slab forms in 20 steps (then under the stress timer, since replaced by
+the trench hinge); a 10× time step (1.6 Myr
 per step) stays bounded (p99 speed 5.9 cm/yr, max 24); a record resumed in a fresh
 page continues the run.
 
@@ -1264,14 +1322,19 @@ benchmarks; several already exist as mechanism tests):
   ductile shear zones at 50 km?
 - **GPE force vs basal drag:** the force is physical but, against today's drag,
   metres per year at margins. Calibrate drag, edge tension and this force together.
-- **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity, tolerated so far.
-  Do dense yielding zones slow or break convergence?
+- **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity. It breaks
+  convergence under concentrated forces (below).
 - **Tangential rows outside Chebyshev:** plain Jacobi converges them in a few sweeps
   on a patch; does that hold at plate scale, where spins couple through the positions
   over many columns?
 - **Subduction calibration:** freeboard < 0 makes ocean older than ~8 Myr subductable
-  (intent: 30–40 Myr); the 50 MPa threshold, 1 Myr window and interface weakening are
-  guesses. Set them with plate speeds.
+  (intent: 30–40 Myr); interface weakening and the attachment strength are guesses.
+  Set them with plate speeds.
+- **Caps inside Chebyshev, measured:** with the derived spectral radius (0.99999 at
+  dt 0.05) a strip under concentrated slab pull diverged in one step (columns jumped
+  ~1,000 km); plain Jacobi and ρ = 0.999 or 0.99 are stable. The two-plate world uses
+  0.999. Decide a general rule (a safety on the derived ρ, or restarts when a cap
+  changes).
 - **Breakup criterion:** volume-mixed composition crosses into oceanic only at
   β ≈ 10 (a continent stretched 1% per step starts melting at β = 2.15 and crosses at
   10.6, with 6.6 km of crust); real margins break at β ≈ 3–5. Key breakup on the melt's
