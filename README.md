@@ -9,8 +9,8 @@ The build produces a single self-contained file, `dist/plate-player.html`. Open 
 in a WebGPU-capable browser (recent Chrome or Edge; Firefox and Safari have partial
 support). It works straight from disk, with no server needed.
 
-**Where this is going:** [`docs/design.md`](docs/design.md) is the plan for the next
-version: one pair-interaction law (no bonds vs. contacts; graded, history-dependent
+**How it works and where it is going:** [`docs/design.md`](docs/design.md) describes
+the model and collects planned extensions (its section 9): one pair-interaction law (no bonds vs. contacts; graded, history-dependent
 integrity), exact area and volume budgets, explicit slabs, and the record/forcing contracts for nesting finer models below
 this one. The to-do list at the end of this README is the problem inventory that plan
 answers.
@@ -61,7 +61,7 @@ over ~100 Myr, like a lava lamp. The flow from an anomaly is screened over the m
 depth (2900 km). The velocity scale is set so the long-run rms speed is ~4 cm/yr,
 about Earth's rms plate speed. The mantle runs alone for 400 Myr before the crust
 starts. It does not yet feel the crust (no blanketing under continents, no slabs as
-cold sinks). Details and grounding: `docs/design.md`, "Mantle and basal drag".
+cold sinks). Details and grounding: `docs/design.md`, §3.4 (mantle) and §4.1 (basal drag).
 
 **Basal drag** (`inverse_drag` in `solver.wgsl`). Each particle feels Couette shear
 across the asthenosphere: traction per area = η·(v_mantle − v_plate)/h. Here η is the
@@ -168,7 +168,7 @@ range are found once per step with a uniform hash grid. Yield and integrity loss
 applied once per step, after the solve. With the default physical
 values a single edge relaxes in ~40 years, so every step (16 kyr) is effectively
 quasi-static: what limits rigidity at plate scale is solver convergence, not E (see
-design.md, phase 2).
+design.md §5.2).
 
 **Plates** (`src/plates/`). A plate is a connected component of edges with
 integrity > 0.5 between surface particles, found exactly on the CPU every 0.25 Myr from a
@@ -237,7 +237,7 @@ plate-player/
 ├── build.mjs                  bundle + inline → dist/plate-player.html
 ├── package.json               npm scripts; esbuild is the only dependency
 ├── docs/
-│   └── design.md              design plan for the next version
+│   └── design.md              the model as built, and planned extensions (§9)
 ├── src/
 │   ├── index.html             page template (build inlines CSS + JS where the markers are)
 │   ├── styles.css
@@ -357,8 +357,8 @@ invariants (every slot free or active exactly once), small analytic cases (two
 particles relaxing on a known time scale), file formats. Don't accumulate regression
 tests on high-level results (plate speeds, land fraction, how a 100 Myr run looks).
 They need lots of compute and pin down behaviour that is supposed to keep changing.
-Measure those once when a phase lands, write the number in `docs/design.md`, and
-move on.
+Measure those once when a change lands, write the number in `docs/design.md` (next to
+the part of the model it concerns), and move on.
 
 ## Debugging: treat causes as hypotheses
 
@@ -367,8 +367,9 @@ relaxation, a mantle solve, drag laws, a constraint solver with acceleration,
 damage, thermal relaxation, sampling onto meshes. The distribution of intermediate
 values at runtime is hard to predict, and intuition about it can be arbitrarily
 wrong, whether from a bug, a subtlety of the math, or the particulars of a state.
-Several findings in `docs/design.md` overturned the obvious explanation (for
-example, more solver iterations made plates *weaker*, because a better-converged
+Several findings during development (in the git history of `docs/design.md`)
+overturned the obvious explanation (for example, more solver iterations made plates
+*weaker*, because a better-converged
 solve enforced a conflict that a sloppy one ignored).
 
 So when something looks wrong:
@@ -389,8 +390,9 @@ So when something looks wrong:
    from a run; a GPU stage can be driven by `plate.loadState` with a small
    hand-built state (as the two-particle and chain tests do) or by a snapshot with
    one parameter changed.
-5. **Write down what was measured,** including refuted hypotheses, in the findings
-   sections of `docs/design.md`.
+5. **Write down what was measured,** including refuted hypotheses: in
+   `docs/design.md` where it shapes the model, and in the commit message. (The
+   step-by-step findings of earlier development are in the git history of that file.)
 
 ## Recording
 
@@ -467,8 +469,7 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       are physical, and the two-particle relaxation matches τ = γ/2k (tested).
 - [x] ~~Plate-scale stress didn't converge with plain Jacobi~~ (median 56 MPa of
       solver residual at 70 GPa, spurious yield). Chebyshev acceleration with 32
-      iterations brings it to ~3 MPa with no spurious yield (design.md, Chebyshev
-      findings). The plate level (design phase 5) is next.
+      iterations brings it to ~3 MPa with no spurious yield (design.md §5.2).
 - [x] ~~Long steps tripped the browser's GPU watchdog.~~ Steps are submitted in
       pieces of 16 solver iterations, waiting for each.
 - [x] ~~Growth recreated bond/contact conflicts~~ (a growing particle's bonds
@@ -477,8 +478,7 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       derived rather than stored, so bonds and contacts agree on the touching
       distance whatever changes a particle's area. The initial state fits positions
       and apothems together so every bond starts at that length (strain < 10⁻⁵).
-      To check: whether growth and splitting still tear plates (design.md,
-      driven-plate measurements).
+      (Growth inside plates is gone: new crust comes from stretching and melt.)
 - [x] ~~A compressed bonded pair was also a contact.~~ Phase 3: bonds and contacts
       are one edge array, and contacts skip bonded pairs.
 - [x] ~~Fully damaged bonds never died.~~ They are retired (phase 3) and the pair
@@ -489,7 +489,7 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [x] ~~**Cold plates never weld.**~~ Phase F: buoyant pairs in sustained, quiet
       compression weld (suturing).
 - [ ] **No ridge push yet.** The GPE push exists but is off until basal drag is
-      calibrated against it (design, phase D findings).
+      calibrated against it (design.md §4.6).
 - [x] ~~**Subduction rarely starts.**~~ Phase F: initiation is a timer on compressed
       edges with a dense side, not an overlap.
 - [ ] **No trench or outer rise:** the slab pulls the plate in-plane only; its
@@ -518,7 +518,7 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       comes from stretching (tessellated area at fixed volume) plus decompression melt
       where the lithosphere is thin.
 - [ ] **No young ridges in the initial state:** its oceans are all 60 Myr old, so
-      nothing melts until stretched by β > 1.4 (design.md, phase E findings).
+      nothing melts until stretched by β > 1.4 (design.md §9.2).
 - [ ] **Breakup needs β ≈ 10** with melt mixed by volume; real margins break at
       β ≈ 3–5. Decide the criterion at integration.
 - [ ] **Residual non-rigidity** of plate interiors (~1 mm/yr against ~0.1 mm/yr for
