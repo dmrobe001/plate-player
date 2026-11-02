@@ -475,16 +475,22 @@ contact point at the lever fraction rᵢ/rest from i. Normal strain increments a
 
 | Direction | Brittle slices | Ductile slices |
 |---|---|---|
-| compression | μ(1 − λ_pore)P + φc | flow stress |
-| tension | φ(c + μ(1 − λ_pore)P)/q | flow stress (sign-blind: hot rock resists separation), × (1 − `ductile_damage_weakening`(1 − φ)) |
+| compression | φC₀ + (q − 1)P′ (thrust faults) | flow stress σ_d |
+| tension | φ(C₀/q + (1 − 1/q)P′) (normal faults) | σ_d (sign-blind: hot rock resists separation), × (1 − `ductile_damage_weakening`(1 − φ)) |
 
-A slice is brittle where friction is weaker than creep. Slice stresses are deviatoric
-(measured from the lithostatic state), so a brittle slice in extension fails by
-normal faulting, at Anderson's fraction 1/q of its frictional strength,
-q = ((1 + μ²)^½ + μ)² (3.12 at μ = 0.6): about 6 MPa at the surface, growing with
-depth. (Until the trench hinge, the cap was cohesion alone, φc: a crack in absolute
-tension. A plate could then transmit at most ~2×10¹² N/m, too little to be pulled by
-a slab against any trench contact; section 6.) Above a cap: ductile slices
+The normal channel carries horizontal force, so its caps are horizontal
+*differential* stresses at failure (σ_xx − σ_zz, slice stresses being measured from
+the lithostatic state): the yield-strength envelope of Brace & Kohlstedt (1980).
+Brittle: Anderson's theory of faulting, σ₁′ = C₀ + qσ₃′ in effective stresses,
+q = ((1 + μ²)^½ + μ)² (3.12 at μ = 0.6), C₀ = 2c q^½ (71 MPa at c = 20), P′ = (1 −
+λ_pore)P; thrust faults in compression (2.12P′), normal faults in extension
+(0.68P′). Ductile: the laboratory flow stress σ_d = 2× the shear strength the
+profile stores. A slice is brittle where the intact brittle tension strength is
+below σ_d. (Until the calibration of section 9.2 the caps were Coulomb shear
+strengths, μP′ + φc, and that over q in tension, with σ_d/2 for ductile slices:
+3.5× too weak brittle, 2× ductile. Before the trench hinge the tension cap was
+cohesion alone.) The tangential channel keeps Coulomb's rule: there slip is on the
+vertical face itself. Above a cap: ductile slices
 flow and brittle slices slip in compression (the stored stress is the capped
 stress). Brittle slices *crack* in tension: they store their elastic trial stress,
 less only the creep their capped stress drives, so they stay referenced to the rest
@@ -538,13 +544,13 @@ transform. Hot, thin, stretching columns: low caps everywhere, a ridge. A broken
 with a bending flap on one side: a subduction interface (section 6).
 
 **What the law gives** (CPU reference, default parameters): an old-ocean pair (100
-Myr, 100 km shared) has compression cap 11 400 MPa·km and tension cap 4790 MPa·km at
-φ = 1, of which the brittle slices' frictional extension strength is 3110. At φ = 0
-its tension cap is 1680 MPa·km, the ductile base's flow stress, about 80% of ridge
-push (~2100 MPa·km at 50 Myr): a broken
-boundary between old plates resists opening nearly as hard as an intact one unless
-`ductile_damage_weakening` is raised (section 10). A fully cold pair at φ = 0 has
-tension cap exactly 0.
+Myr, 100 km shared) has compression cap 38 600 MPa·km (3.9×10¹³ N/m) and tension cap
+14 700 MPa·km at φ = 1, of which the brittle lid (top 37 km, BDT at 880 K) carries
+11 300 and the ductile base 3 400. Published strengths of old oceanic lithosphere
+are of order 10¹³ N/m. At φ = 0 its tension cap is the ductile base's 3 400 MPa·km,
+more than ridge push (~2 100 MPa·km at 50 Myr): a broken boundary between old plates
+resists opening unless `ductile_damage_weakening` is raised (section 10). A fully
+cold pair at φ = 0 has tension cap exactly 0.
 
 **Checked:** under constant separation rate the stress follows the implicit-Euler
 Maxwell sequence to 10⁻¹² (CPU) and 4 digits (GPU); a cold pair holds its stress, a
@@ -804,7 +810,7 @@ stiff edges, κ·dt ≈ 250 here, which amplified whatever a short solve left: a
 sweeps edge forces grew to 100× the drag within 2 Myr.)
 
 **Choosing ρ (`chebyshev_rho` < 0, `chebyshevRho`).** ρ = min(derived, 1 −
-½(4/N)², 0.999), N the accelerated sweeps. Two findings:
+½(4/N)², 0.99), N the accelerated sweeps. Two findings:
 - *A budget can only use the ρ it can finish.* After N sweeps Chebyshev bounds every
   mode in [−ρ, ρ] by 1/T_N(1/ρ) ≈ 1/cosh(N√(2(1−ρ))). With the derived 0.99999 and
   N = 29 that is 0.99 for *every* mode, fast ones included, which plain Jacobi
@@ -812,7 +818,10 @@ sweeps edge forces grew to 100× the drag within 2 Myr.)
   N√(2(1−ρ)) = 4 (bound 4%); slower modes are left to the warm start.
 - *Overestimating ρ is harmless for a linear solve, not with caps.* A strip under
   concentrated slab pull, 256 sweeps: exact at ρ = 0.999, a column torn ~280 km at
-  0.99987. Hence the ceiling. (Measuring ρ each step instead, from the contraction of
+  0.99987. Hence the ceiling, first 0.999; with the Anderson caps (4.5, 3.5× higher)
+  the same strip diverged at 0.999 (columns thrown thousands of km in a step) and
+  matched 1,024 sweeps to ~1 km at 0.99, now the ceiling. The default 32 sweeps sit
+  at the budget cap, 0.9905, below it. (Measuring ρ each step instead, from the contraction of
   the last plain sweeps, gave ~0.8: it sees the fast modes and underestimates, and
   tripled the velocity error on the two-plate planet.)
 
@@ -846,7 +855,8 @@ the trench developing, in both); 64 sweeps are no better than 32.
   test: from t = 0.5 Myr, solves that differ by little (ρ 0.999 or 0.9992 at 256
   sweeps) land, 2 steps later, on one of two self-consistent states (strip speed 31
   or 48 cm/yr), each reproduced by several settings. Its test pins a converged
-  solve (256 sweeps, ρ 0.999).
+  solve (256 sweeps, ρ at its 0.99 ceiling; matches 1,024 sweeps to ~1 km through
+  the subduction).
 
 **No coarse plate-level solve.** Positions always satisfy x − x̃ = W Bᵀλ, so every
 plate's drag-weighted net motion is already exact at every iteration; what converges
@@ -968,6 +978,23 @@ and before the edge law; reference `src/columns/hinge.js`.
   transmit (its tensile strength across its width) and what the plate behind can hold
   (the tension caps of its edges behind, projected on the pull, × 0.9); more would
   tear the plate behind the hinge.
+
+**The force budget, from the textbook** (Turcotte & Schubert; CPU reference,
+default parameters). A slab's excess mass per area is B = −ρ_m × freeboard. For 100
+Myr ocean the profile gives 4.2×10⁶ kg/m² with buoyant basaltic crust and 7.8×10⁶
+with eclogite, against 8.2×10⁶ for half-space cooling, ρα ΔT (4κt/π)^½. A slab
+reaching 660 km at 60° (760 km down dip) then weighs ~5.9×10¹³ N per metre of trench
+before it warms (textbook gross slab pull: 3–4×10¹³ N/m). It sinks freely at w = B g
+h/4η = 6 cm/yr at η = 10²¹ Pa·s. A plate pulled by it against basal drag alone
+(10¹⁹ Pa·s over its asthenosphere) moves at ~99% of w, ~6 cm/yr, and only ~1% of
+the weight reaches the plate; the mantle holds the rest. (Plates with attached slabs
+move 6–9 cm/yr, those without 1–3: Forsyth & Uyeda 1975.) The plate's edges hold
+1.5×10¹³ N/m in tension (4.5): more than the net pull, less than the gross weight.
+- **Eclogite** (`eclogite_depth_km` 60, `eclogite_density` 3500; Hacker et al. 2003):
+  a slab's oceanic crust turns from basalt to eclogite at ~1.5–2 GPa, linearly over
+  ±10 km about that depth of its top (`crustDensity` in `profile.js`; `column_of` in
+  `profile.wgsl`). Continental crust stays buoyant. Without it the crust counted as
+  buoyant all the way down and slabs weighed half what they should.
 
 **Slabs hang.** A new slab hangs from the intact surface column behind it (found by
 the hinge), at its bend as dip; a slab can hang from a slab (a chain). Kernel
@@ -1284,7 +1311,8 @@ counter (`slabsLost`). Measured:
   slices store crack trial stresses several times their caps (137 MPa against 37),
   which pull back at the cap once the load goes. Not resolved.
 - **The damage law under sustained tension** (CPU reference, one 100 Myr ocean edge
-  at a constant fraction of its intact tension cap, 4,880 MPa·km; dt 0.25 Myr).
+  at a constant fraction of its intact tension cap, 4,880 MPa·km; dt 0.25 Myr;
+  measured with the Coulomb caps that preceded the Anderson ones, 4.5).
   The ductile base creeps and hands its load to the brittle lid, so the long-term
   strength without damage is the lid's, ~65% of the cap (90% creeps without bound).
   Damage removes integrity, and the brittle tension cap scales with integrity
@@ -1445,7 +1473,7 @@ benchmarks; several already exist as mechanism tests):
   metres per year at margins. Calibrate drag, edge tension and this force together.
 - **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity. With the
   positions following the multipliers it no longer parts them, but overestimating ρ
-  still derails clamped rows; the 0.999 ceiling is one measurement (5.2).
+  still derails clamped rows; the 0.99 ceiling rests on one strip (5.2).
 - **Tangential rows outside Chebyshev:** plain Jacobi converges them in a few sweeps
   on a patch; does that hold at plate scale, where spins couple through the positions
   over many columns?
@@ -1453,7 +1481,7 @@ benchmarks; several already exist as mechanism tests):
   (intent: 30–40 Myr); interface weakening and the attachment strength are guesses.
   Set them with plate speeds.
 - **Chebyshev ρ, settled (5.2):** derived, capped by the iteration budget and at
-  0.999, with a warm start. Open: the ceiling is one strip; a solve for the slow modes
+  0.99, with a warm start. Open: the ceiling is one strip; a solve for the slow modes
   (a coarse level, 9.3) would make the budget cap unnecessary.
 - **Breakup criterion:** volume-mixed composition crosses into oceanic only at
   β ≈ 10 (a continent stretched 1% per step starts melting at β = 2.15 and crosses at

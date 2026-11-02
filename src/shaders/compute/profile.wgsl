@@ -48,6 +48,11 @@ fn column_of(i: u32) -> Column {
     c.continental = c.rho_crust < 2850.0;  // CONTINENTAL_DENSITY_MAX
     c.elevation = particles[i].elevation;
     c.slab = particles[i].state == 2u;
+    // A slab's oceanic crust turns to eclogite (crustDensity in profile.js).
+    if (c.slab && !c.continental) {
+        let f = clamp((-c.elevation - (sim.eclogite_depth_km - 10.0)) / 20.0, 0.0, 1.0);
+        c.rho_crust = mix(c.rho_crust, sim.eclogite_density, f);
+    }
     c.lith_km = lithosphere_thickness_km(i);
     let ts = sim.ambient_ocean_temp;
     let tm = sim.mantle_temp;
@@ -137,13 +142,27 @@ fn ln_ductile(c: Column, z_km: f32, t: f32) -> f32 {
     return ln_sigma + log(0.5);
 }
 
-fn brittle_strength(p_mpa: f32, phi: f32) -> f32 {
-    return phi * sim.cohesion_mpa + sim.friction_coefficient * (1.0 - sim.pore_fluid_factor) * p_mpa;
+// Anderson's theory of faulting (brittleCompression, brittleTension in
+// src/columns/profile.js): horizontal differential stress at failure under
+// the vertical effective stress, thrust and normal faults; integrity scales
+// the cohesion in compression and the whole strength in tension (design 4.5).
+fn anderson_q() -> f32 {
+    let r = sqrt(1.0 + sim.friction_coefficient * sim.friction_coefficient) + sim.friction_coefficient;
+    return r * r;
+}
+fn brittle_compression(p_mpa: f32, phi: f32) -> f32 {
+    let q = anderson_q();
+    return phi * 2.0 * sim.cohesion_mpa * sqrt(q) + (q - 1.0) * (1.0 - sim.pore_fluid_factor) * p_mpa;
+}
+fn brittle_tension(p_mpa: f32, phi: f32) -> f32 {
+    let q = anderson_q();
+    return phi * (2.0 * sim.cohesion_mpa / sqrt(q) + (1.0 - 1.0 / q) * (1.0 - sim.pore_fluid_factor) * p_mpa);
 }
 
+// Envelope in horizontal differential stress: ductile flow stress = 2 x shear strength.
 fn is_ductile(c: Column, z_km: f32) -> bool {
-    let d = exp(min(ln_ductile(c, z_km, temp_at(c, z_km)), LN_STRENGTH_CAP));
-    return d < brittle_strength(pressure_at(c, z_km), 1.0);
+    let d = 2.0 * exp(min(ln_ductile(c, z_km, temp_at(c, z_km)), LN_STRENGTH_CAP));
+    return d < brittle_compression(pressure_at(c, z_km), 1.0);
 }
 
 @compute @workgroup_size(64)
@@ -205,7 +224,7 @@ fn column_profile(@builtin(global_invocation_id) id: vec3<u32>) {
         p.log10_viscosity[k] = (ln_d + log(1e6) - log(2.0 * sim.reference_strain_rate_s)) / LN10;
         p.ductile_mpa[k] = ductile;
         if (bdt < 0.0) {
-            if (ductile < brittle_strength(pressure, 1.0)) {
+            if (2.0 * ductile < brittle_compression(pressure, 1.0)) {
                 var hi = z;
                 for (var it = 0; it < 30; it++) {
                     let mid = 0.5 * (lo + hi);

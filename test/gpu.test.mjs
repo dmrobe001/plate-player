@@ -703,7 +703,7 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
   // (volume / tessellated area, phase E) thickens inversely, with total crust
   // volume constant; integrity falls by
   // exactly the logged plastic work / W_D (cold: no healing). (2) Pure shear
-  // (x stretched, y shortened by 0.02% per step) below the compression cap:
+  // (x stretched, y shortened by 0.06% per step) below the compression cap:
   // stretched edges crack, others stay elastic, and no area changes.
   const page = await openPage({ small: true });
   const out = await page.evaluate(async ([helperSrc, brittle]) => {
@@ -740,7 +740,7 @@ test('volumetric flow: uniform compression thickens at the predicted rate at con
     await plate.loadState(H.state(pts, a, bonds));
     r = await plate.debug.edges();
     const area0 = Array.from(r.P.area_ref.subarray(0, n));
-    const ds = 2e-4;
+    const ds = 6e-4;
     const work = new Map();
     for (let s = 1; s <= 5; s++) {
       H.move(pts.map((p) => [p[0] * (1 + ds) ** s, p[1] * (1 - ds) ** s, p[2]]));
@@ -1653,7 +1653,7 @@ test('trench hinge: slab pull bends the flap, the contact gives way, the column 
     const col = (o, c, s) => Float32Array.from(pts, (_, i) => (isC(i) ? c : i === S ? s : o));
     // A converged solve: the hinge's history branches on small differences in
     // the solve (design 5.2, Chebyshev findings), and this tests the hinge.
-    await plate.setParams({ mantle_drive: 0, solver_iterations: 256, chebyshev_rho: 0.999, dt_crust_myr: 0.25, damage_work_mpa_km: 1e9 });
+    await plate.setParams({ mantle_drive: 0, solver_iterations: 256, dt_crust_myr: 0.25, damage_work_mpa_km: 1e9 });
     const ba = [], bb = [], bd = [];
     for (let k = 0; k < N - 1; k++) { ba.push(k); bb.push(k + 1); bd.push(0); }
     ba.push(lead, lead, C, S + 1, S + 2); bb.push(C, S, S + 1, S + 2, S + 3); bd.push(1, 0, 0, 0, 0);

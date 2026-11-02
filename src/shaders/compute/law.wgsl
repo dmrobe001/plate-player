@@ -74,14 +74,16 @@ fn edge_slices(a: u32, b: u32, phi: f32, sn: array<f32, 8>) -> EdgeSlices {
         let edt_over_eta = 0.5 * (exp(ln_edt - ln_a - ln_eta_shift) + exp(ln_edt - ln_b - ln_eta_shift));
         let ductile_cap = 1.0 / (0.5 * (exp(-min(ln_a, LN_STRENGTH_CAP)) + exp(-min(ln_b, LN_STRENGTH_CAP))));
         let pressure = 0.5 * (slice_pressure(a, da) + slice_pressure(b, db));
-        let brittle_comp = phi * sim.cohesion_mpa + sim.friction_coefficient * (1.0 - sim.pore_fluid_factor) * pressure;
-        let brittle = brittle_comp < ductile_cap;
+        // Normal channel in horizontal differential stress: twice the shear
+        // strength when ductile, Anderson's thrust / normal-fault strength
+        // when brittle (profile.wgsl; law.js).
+        let ductile_n = 2.0 * ductile_cap;
+        let brittle_comp = brittle_compression(pressure, phi);
+        let brittle_tens = brittle_tension(pressure, phi);
+        let brittle = brittle_tension(pressure, 1.0) < ductile_n; // the mechanism, from intact rock
         s.r[k] = 1.0 / (1.0 + edt_over_eta);
-        s.comp[k] = min(brittle_comp, ductile_cap) * lubricated;
-        // Brittle: Anderson's fraction of the frictional strength (deviatoric extension; law.js).
-        let q = (sqrt(1.0 + sim.friction_coefficient * sim.friction_coefficient) + sim.friction_coefficient);
-        let brittle_tens = phi * (sim.cohesion_mpa + sim.friction_coefficient * (1.0 - sim.pore_fluid_factor) * pressure) / (q * q);
-        s.tens[k] = select(ductile_cap * (1.0 - sim.ductile_damage_weakening * (1.0 - phi)), brittle_tens, brittle);
+        s.comp[k] = min(brittle_comp, ductile_n) * lubricated;
+        s.tens[k] = select(ductile_n * (1.0 - sim.ductile_damage_weakening * (1.0 - phi)), brittle_tens, brittle);
         s.cracks[k] = select(0u, 1u, brittle);
         s.temp[k] = 0.5 * (temp_at(ca, da) + temp_at(cb, db));
         let brittle_shear = phi * sim.cohesion_mpa + sim.friction_coefficient * max((1.0 - sim.pore_fluid_factor) * pressure - sn[k], 0.0);

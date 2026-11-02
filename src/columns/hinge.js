@@ -27,7 +27,7 @@
 // ~30 kyr). Where the net stiffness is negative the bend runs away to
 // beta_max: that is the instability that initiates subduction.
 
-import { andersonRatio } from '../edges/law.js';
+import { brittleCompression, brittleTension } from './profile.js';
 
 export const EARTH_RADIUS_M = 6.371e6;
 
@@ -42,30 +42,39 @@ export const hingeStiffness = (D, ell) => (ell > 0 ? D / ell : 0);
 
 /**
  * Plastic moment (N m / m) and tensile strength (N / m) of a column from its
- * slices [{depthKm, thicknessKm, pressureMpa, ductileMpa}]. A slice's strength
- * in bending is min(brittle, ductile), brittle = c + mu (1 - lambda) P (the
- * edge law's compression cap at full integrity); the moment is taken about
- * the strength-weighted median depth (equal strength above and below, the
- * neutral plane of a fully plastic section). Tensile strength (what holds a
- * hanging slab, and the most slab pull the column can pass to its plate): the
- * edge law's tension cap at full integrity (brittle / q where the slice is
- * brittle, src/edges/law.js; else its ductile strength), so what a column
- * transmits and what its edges hold agree.
+ * slices [{depthKm, thicknessKm, pressureMpa, ductileMpa}], from its
+ * yield-strength envelope in horizontal differential stress, as the edge
+ * law's normal channel at full integrity (src/edges/law.js): per slice the
+ * weaker of Anderson's brittle strength and the ductile flow stress (2 x
+ * ductileMpa, a shear strength). A plate bending down at a trench is in
+ * extension above its neutral plane and in compression below it; fully
+ * plastic, the neutral plane is where the two forces balance, and the moment
+ * is taken about it. Tensile strength (what holds a hanging slab, and the
+ * most slab pull the column can pass to its plate): the tension envelope over
+ * the whole column, so what a column transmits and what its edges hold agree.
  */
 export function columnStrength(slices, p) {
-  const s = slices.map((k) => Math.min(p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * k.pressureMpa, k.ductileMpa));
-  const total = s.reduce((a, v, i) => a + v * slices[i].thicknessKm, 0);
-  let acc = 0, zc = slices.length ? slices[slices.length - 1].depthKm : 0;
-  for (let i = 0; i < slices.length; i++) {
-    const w = s[i] * slices[i].thicknessKm;
-    if (acc + w >= total / 2) { zc = slices[i].depthKm - slices[i].thicknessKm / 2 + (w > 0 ? ((total / 2 - acc) / w) * slices[i].thicknessKm : 0); break; }
-    acc += w;
+  const st = slices.map((k) => Math.min(brittleTension(k.pressureMpa, 1, p), 2 * k.ductileMpa));
+  const sc = slices.map((k) => Math.min(brittleCompression(k.pressureMpa, 1, p), 2 * k.ductileMpa));
+  const n = slices.length;
+  // Neutral plane: tension above it = compression below it. Slice m holds it,
+  // a fraction f of the slice above it.
+  const below = new Array(n + 1).fill(0);
+  for (let i = n - 1; i >= 0; i--) below[i] = below[i + 1] + sc[i] * slices[i].thicknessKm;
+  let above = 0, m = n - 1, f = 1;
+  for (let i = 0; i < n; i++) {
+    const t = st[i] * slices[i].thicknessKm, c = sc[i] * slices[i].thicknessKm;
+    if (above + t >= below[i + 1]) { m = i; f = t + c > 0 ? Math.min(Math.max((below[i + 1] + c - above) / (t + c), 0), 1) : 0.5; break; }
+    above += t;
   }
+  const top = (i) => slices[i].depthKm - slices[i].thicknessKm / 2;
+  const zc = n ? top(m) + f * slices[m].thicknessKm : 0;
   let moment = 0, tension = 0;
   slices.forEach((k, i) => {
-    moment += s[i] * k.thicknessKm * Math.abs(k.depthKm - zc);
-    const brittle = p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * k.pressureMpa;
-    tension += (brittle < k.ductileMpa ? brittle / andersonRatio(p.friction_coefficient) : k.ductileMpa) * k.thicknessKm;
+    tension += st[i] * k.thicknessKm;
+    if (i < m) moment += st[i] * k.thicknessKm * (zc - k.depthKm);
+    else if (i > m) moment += sc[i] * k.thicknessKm * (k.depthKm - zc);
+    else { const u = f * k.thicknessKm, l = (1 - f) * k.thicknessKm; moment += (st[i] * u * u + sc[i] * l * l) / 2; }
   });
   return { plasticMoment: moment * 1e12, tensileStrength: tension * 1e9, neutralKm: zc };
 }

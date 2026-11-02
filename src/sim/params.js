@@ -34,7 +34,7 @@ export const SIM_PARAMS = [
   ['solver_iterations', 'u32', 32],     // Jacobi sweeps over all edges per step (read by simulation.js)
   // Chebyshev semi-iterative acceleration of the Jacobi sweeps (Wang 2015).
   // rho is the spectral radius of one plain sweep: negative = derive it, capped
-  // by the iteration budget and at 0.999 (simulation.js, chebyshevRho; design
+  // by the iteration budget and at 0.99 (simulation.js, chebyshevRho; design
   // 5.2), 0 = off (plain Jacobi), else as given.
   // The first `delay` iterations are plain Jacobi.
   ['chebyshev_rho', 'f32', -1],
@@ -195,6 +195,12 @@ export const SIM_PARAMS = [
   // isostatic_viscosity_pa_s (upper mantle). Removed below this depth or once
   // warmed to neutral buoyancy.
   ['slab_cutoff_km', 'f32', 660.0],
+  // Eclogite (design 6): a slab's oceanic crust turns from basalt to eclogite
+  // at ~1.5-2 GPa (50-70 km; delayed in cold slabs), denser than the mantle
+  // (Hacker et al. 2003). Linear over +-10 km about this depth of its top.
+  // Continental crust stays buoyant.
+  ['eclogite_depth_km', 'f32', 60.0],
+  ['eclogite_density', 'f32', 3500.0],
   // Arcs: surface columns within arc_reach (unit sphere) of a slab whose top
   // is between these depths gain crust volume: arc_efficiency x the slab's
   // volume over its passage through the window, shared equally; their thermal

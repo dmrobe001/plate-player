@@ -72,9 +72,19 @@ export function geotherm(col, p) {
   return { T, L, zMantle: 3.6 * s, heatFlow: (k * dT) / Math.sqrt(Math.PI * p.thermal_diffusivity_m2_s * tEff) * 1e3 };
 }
 
+/**
+ * Crust density at mantle temperature: its composition, or for a slab's
+ * oceanic crust below eclogite_depth_km (its top's depth, +-10 km) eclogite.
+ */
+export function crustDensity(col, p) {
+  if (!col.slab || isContinental(col.compositionDensity)) return col.compositionDensity;
+  const f = Math.min(Math.max((-col.elevationKm - (p.eclogite_depth_km - 10)) / 20, 0), 1);
+  return col.compositionDensity + f * (p.eclogite_density - col.compositionDensity);
+}
+
 /** Density at depth z: composition density at mantle temperature, contracted by cooling. */
 function densityAt(col, g, p, z) {
-  const rho0 = z < col.crustKm ? col.compositionDensity : p.mantle_density;
+  const rho0 = z < col.crustKm ? crustDensity(col, p) : p.mantle_density;
   return rho0 * (1 + p.thermal_expansion_coeff * (p.mantle_temp - g.T(z)));
 }
 
@@ -166,13 +176,39 @@ export function ductile(law, T, p) {
 /** Ductile strength capped at 1e6 MPa (beyond any brittle strength; keeps f32 finite). */
 export const ductileStrength = (law, T, p) => Math.exp(Math.min(ductile(law, T, p).lnStrength, Math.log(1e6)));
 
-/** Brittle (frictional) shear strength: Byerlee friction on the effective pressure, plus cohesion scaled by integrity phi. */
+/** Brittle (frictional) shear strength of a plane under the effective pressure (Coulomb: cohesion scaled by integrity phi, plus Byerlee friction). */
 export const brittleStrength = (P, phi, p) => phi * p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * P;
 
-/** Yield-strength envelope at depth z: the weaker of brittle and ductile. */
+/**
+ * Anderson's theory of faulting: what a brittle layer transmits horizontally
+ * is the principal stress difference at failure, sigma_1 = C0 + q sigma_3
+ * (effective stresses), q = ((1 + mu^2)^(1/2) + mu)^2 (3.12 at mu = 0.6), C0 =
+ * 2 c q^(1/2) the uniaxial strength from the cohesion c. Under the vertical
+ * effective stress P' = (1 - lambda) P: compression (thrust faults)
+ * sigma_xx - sigma_zz = C0 + (q - 1) P'; extension (normal faults)
+ * sigma_zz - sigma_xx = C0 / q + (1 - 1 / q) P' (Brace & Kohlstedt 1980; the
+ * brittle part of a yield-strength envelope). Integrity scales the cohesion
+ * in compression, and the whole strength in tension (a broken cold pair
+ * carries no tension: design 4.5).
+ */
+export const andersonRatio = (mu) => (Math.sqrt(1 + mu * mu) + mu) ** 2;
+export function brittleCompression(P, phi, p) {
+  const q = andersonRatio(p.friction_coefficient);
+  return phi * 2 * p.cohesion_mpa * Math.sqrt(q) + (q - 1) * (1 - p.pore_fluid_factor) * P;
+}
+export function brittleTension(P, phi, p) {
+  const q = andersonRatio(p.friction_coefficient);
+  return phi * (2 * p.cohesion_mpa / Math.sqrt(q) + (1 - 1 / q) * (1 - p.pore_fluid_factor) * P);
+}
+
+/**
+ * Yield-strength envelope at depth z, in horizontal differential stress
+ * (what the normal channel of an edge carries): the weaker of brittle
+ * compression (Anderson) and ductile flow stress (twice the shear strength).
+ */
 export function envelope(col, p, z, phi = 1, g = geotherm(col, p)) {
-  const b = brittleStrength(pressureAt(col, p, z, g), phi, p);
-  const d = ductileStrength(flowLaw(col, z, p), g.T(z), p);
+  const b = brittleCompression(pressureAt(col, p, z, g), phi, p);
+  const d = 2 * ductileStrength(flowLaw(col, z, p), g.T(z), p);
   return { brittle: b, ductile: d, strength: Math.min(b, d) };
 }
 

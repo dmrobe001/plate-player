@@ -41,34 +41,42 @@ fn hinge_pair(a: u32, b: u32) -> bool {
 }
 
 // Plastic moment (N m / m) and tensile strength (N / m) of column i from its
-// profile slices (columnStrength in hinge.js).
+// profile slices (columnStrength in hinge.js): the yield-strength envelope in
+// horizontal differential stress, tension above the neutral plane and
+// compression below it, the neutral plane where the two balance.
 struct ColumnStrength { moment: f32, tension: f32 }
 fn column_strength(i: u32) -> ColumnStrength {
-    let mu = sim.friction_coefficient;
-    var s: array<f32, 8>;
-    var total = 0.0;
+    var st: array<f32, 8>;
+    var sc: array<f32, 8>;
+    var below: array<f32, 9>;
     for (var k = 0u; k < SLICES; k++) {
-        let brittle = sim.cohesion_mpa + mu * (1.0 - sim.pore_fluid_factor) * profiles[i].pressure_mpa[k];
-        s[k] = min(brittle, profiles[i].ductile_mpa[k]);
-        total += s[k] * profiles[i].thickness_km[k];
+        let d = 2.0 * profiles[i].ductile_mpa[k];
+        st[k] = min(brittle_tension(profiles[i].pressure_mpa[k], 1.0), d);
+        sc[k] = min(brittle_compression(profiles[i].pressure_mpa[k], 1.0), d);
     }
-    var acc = 0.0;
-    var zc = profiles[i].depth_km[SLICES - 1u];
+    below[SLICES] = 0.0;
+    for (var k = SLICES; k > 0u; k--) { below[k - 1u] = below[k] + sc[k - 1u] * profiles[i].thickness_km[k - 1u]; }
+    var above = 0.0;
+    var m = SLICES - 1u;
+    var f = 1.0;
     for (var k = 0u; k < SLICES; k++) {
-        let w = s[k] * profiles[i].thickness_km[k];
-        if (acc + w >= 0.5 * total) {
-            zc = profiles[i].depth_km[k] - 0.5 * profiles[i].thickness_km[k] + select(0.0, (0.5 * total - acc) / w * profiles[i].thickness_km[k], w > 0.0);
+        let t = st[k] * profiles[i].thickness_km[k];
+        let c = sc[k] * profiles[i].thickness_km[k];
+        if (above + t >= below[k + 1u]) {
+            m = k;
+            f = select(0.5, clamp((below[k + 1u] + c - above) / (t + c), 0.0, 1.0), t + c > 0.0);
             break;
         }
-        acc += w;
+        above += t;
     }
+    let zc = profiles[i].depth_km[m] - 0.5 * profiles[i].thickness_km[m] + f * profiles[i].thickness_km[m];
     var out: ColumnStrength;
     for (var k = 0u; k < SLICES; k++) {
-        out.moment += s[k] * profiles[i].thickness_km[k] * abs(profiles[i].depth_km[k] - zc);
-        // The edge law's tension cap at full integrity: brittle / q (Anderson), else ductile.
-        let brittle = sim.cohesion_mpa + mu * (1.0 - sim.pore_fluid_factor) * profiles[i].pressure_mpa[k];
-        let q = (sqrt(1.0 + mu * mu) + mu) * (sqrt(1.0 + mu * mu) + mu);
-        out.tension += select(profiles[i].ductile_mpa[k], brittle / q, brittle < profiles[i].ductile_mpa[k]) * profiles[i].thickness_km[k];
+        let h = profiles[i].thickness_km[k];
+        out.tension += st[k] * h;
+        if (k < m) { out.moment += st[k] * h * (zc - profiles[i].depth_km[k]); }
+        else if (k > m) { out.moment += sc[k] * h * (profiles[i].depth_km[k] - zc); }
+        else { let u = f * h; let l = (1.0 - f) * h; out.moment += 0.5 * (st[k] * u * u + sc[k] * l * l); }
     }
     out.moment *= 1e12;
     out.tension *= 1e9;

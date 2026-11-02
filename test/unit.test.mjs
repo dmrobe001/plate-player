@@ -385,7 +385,7 @@ test('profile: the yield-strength envelope peaks at the brittle-ductile transiti
   const p = PARAMS;
   for (const [name, col, Tlo, Thi] of [
     ['oceanic mantle (olivine)', ocean(30, 0), 873, 1073],   // 600-800 C
-    ['continental crust (quartzite)', continent(35), 523, 723], // 250-450 C
+    ['continental crust (quartzite)', continent(35), 500, 723], // 230-450 C (Anderson thrust envelope: ~240 C)
   ]) {
     const prof = profile.columnProfile(col, p);
     const g = profile.geotherm(col, p);
@@ -525,7 +525,7 @@ import * as flow from '../src/columns/flow.js';
 
 test('irreversible: inelastic strain is zero below yield, the full increment at yield, and plastic work = cap x plastic strain', () => {
   const E0 = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
-  const p = { ...uniform(1e6 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa }; // cold: every slice brittle and elastic
+  const p = { ...uniform(1e8 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa }; // cold: every slice brittle and elastic
   const E = p.crust_youngs_modulus_gpa * 1000;
   const edge = law.edgeSlices(oldOcean(-3), oldOcean(-3), 1, p);
   const below = law.maxwellUpdate(new Array(8).fill(0), edge, -1e-4, p);
@@ -535,14 +535,14 @@ test('irreversible: inelastic strain is zero below yield, the full increment at 
   const more = law.maxwellUpdate(atCap, edge, -2e-4, p);
   assert.ok(Math.abs(more.inelastic / -2e-4 - 1) < 1e-6, `at yield: inelastic ${more.inelastic}`);
   const expectWork = edge.slices.reduce((a, s) => a + s.comp * 2e-4 * s.dz, 0);
-  assert.ok(Math.abs(more.work / expectWork - 1) < 1e-4, `work ${more.work} vs ${expectWork}`); // r = 1 - 1e-6: a little creep is not plastic
+  assert.ok(Math.abs(more.work / expectWork - 1) < 1e-4, `work ${more.work} vs ${expectWork}`); // r = 1 - 1e-8: a little creep is not plastic
   // A crack opening is recoverable: no inelastic strain, but work against the tension cap
   // (frictional extension strength, Anderson's fraction of the compressive one).
-  const open = law.maxwellUpdate(new Array(8).fill(0), edge, 1e-3, p);
+  const open = law.maxwellUpdate(new Array(8).fill(0), edge, 2.5e-3, p);
   assert.ok(Math.abs(open.inelastic) < 1e-9);
   // Only slices whose trial stress passes the cap crack (the cap grows with depth).
-  const cracked = edge.slices.filter((s) => E * 1e-3 * s.r > s.tens);
-  const crackWork = cracked.reduce((a, s) => a + s.tens * 1e-3 * s.dz, 0);
+  const cracked = edge.slices.filter((s) => E * 2.5e-3 * s.r > s.tens);
+  const crackWork = cracked.reduce((a, s) => a + s.tens * 2.5e-3 * s.dz, 0);
   assert.ok(cracked.length > 0 && cracked.length < edge.slices.length, `${cracked.length} of ${edge.slices.length} slices crack`);
   assert.ok(Math.abs(open.work / crackWork - 1) < 1e-6);
   assert.ok(edge.slices.every((s) => Math.abs(s.tens / (s.comp / law.andersonRatio(p.friction_coefficient)) - 1) < 1e-6));
@@ -556,7 +556,7 @@ test('irreversible: pure shear of a hexagon of edges leaves the area unchanged; 
   const E0 = PARAMS.crust_youngs_modulus_gpa * 1e9, dtS = PARAMS.dt_crust_myr * profile.SECONDS_PER_MYR;
   const p = { ...uniform(1e6 * E0 * dtS), cohesion_mpa: PARAMS.cohesion_mpa };
   const edge = law.edgeSlices(oldOcean(-3), oldOcean(-3), 1, p);
-  const e = 1e-3;
+  const e = 2.5e-3;
   const shear = [0, 60, 120, 180, 240, 300].map((deg) => law.maxwellUpdate(new Array(8).fill(0), edge, e * Math.cos(2 * deg * Math.PI / 180), p));
   const col = { area: 1e-3 };
   const sheared = flow.columnFlow(col, shear.map((u) => u.inelastic));
@@ -1099,15 +1099,22 @@ test('hinge: elastic, plastic and runaway branches of the torque balance', () =>
   assert.ok(Math.abs(heavy.neck - (90 + 30 * 0.75 * 0.5)) < 1e-12 && heavy.broken);
 });
 
-test('hinge: column strength in bending and in tension from its slices', () => {
+test('hinge: column strength in bending and in tension from its yield-strength envelope', () => {
   const p = { friction_coefficient: 0.6, pore_fluid_factor: 0.4, cohesion_mpa: 20 };
-  // Two equal slices: the neutral plane is between them, M = s dz (dz / 2) x 2.
+  // Two equal ductile slices (flow stress 2 x 100): the neutral plane is between them, M = s dz (dz / 2) x 2.
   const s = hinge.columnStrength([{ depthKm: 5, thicknessKm: 10, pressureMpa: 1e9, ductileMpa: 100 }, { depthKm: 15, thicknessKm: 10, pressureMpa: 1e9, ductileMpa: 100 }], p);
   assert.ok(Math.abs(s.neutralKm - 10) < 1e-9);
-  assert.ok(Math.abs(s.plasticMoment - 2 * 100 * 10 * 5 * 1e12) < 1);
-  assert.ok(Math.abs(s.tensileStrength - 2 * 100 * 10 * 1e9) < 1); // ductile slices: their ductile strength
-  const b = hinge.columnStrength([{ depthKm: 5, thicknessKm: 10, pressureMpa: 100, ductileMpa: 1e6 }], p);
-  assert.ok(Math.abs(b.tensileStrength / ((20 + 0.6 * 0.6 * 100) / 3.1196 * 10 * 1e9) - 1) < 1e-4); // brittle: / Anderson's ratio, as the edge law
+  assert.ok(Math.abs(s.plasticMoment - 2 * 200 * 10 * 5 * 1e12) < 1);
+  assert.ok(Math.abs(s.tensileStrength - 2 * 200 * 10 * 1e9) < 1);
+  // One brittle slice: Anderson's normal-fault strength in tension; in bending
+  // the neutral plane sits where tension above balances compression below.
+  const q = (Math.sqrt(1.36) + 0.6) ** 2, P = 100, Pe = 0.6 * P;
+  const T = 2 * 20 / Math.sqrt(q) + (1 - 1 / q) * Pe, C = 2 * 20 * Math.sqrt(q) + (q - 1) * Pe;
+  const b = hinge.columnStrength([{ depthKm: 5, thicknessKm: 10, pressureMpa: P, ductileMpa: 1e6 }], p);
+  assert.ok(Math.abs(b.tensileStrength / (T * 10 * 1e9) - 1) < 1e-4);
+  const f = C / (T + C);
+  assert.ok(Math.abs(b.neutralKm - 10 * f) < 1e-6);
+  assert.ok(Math.abs(b.plasticMoment / ((T * (10 * f) ** 2 + C * (10 * (1 - f)) ** 2) / 2 * 1e12) - 1) < 1e-6);
 });
 
 // ---------------------------------------------------------------------------
@@ -1140,4 +1147,19 @@ test('net rotation: recovers a rigid rotation; a gradient flow has none; removal
   }
   // A single column cannot define a rotation.
   assert.deepEqual(netRotation([[0, 0, 1]], [[0.01, 0, 0]], [1]), [0, 0, 0]);
+});
+
+test('eclogite: a slab\'s oceanic crust turns dense below ~60 km, its excess mass then near half-space cooling; continental crust stays buoyant', () => {
+  const p = PARAMS;
+  const slab = (e, rho = 3000) => ({ crustKm: 7, compositionDensity: rho, ageMyr: 100, elevationKm: e, slab: true });
+  assert.equal(profile.crustDensity(slab(-40), p), 3000);
+  assert.equal(profile.crustDensity(slab(-80), p), p.eclogite_density);
+  assert.ok(Math.abs(profile.crustDensity(slab(-60), p) - (3000 + p.eclogite_density) / 2) < 1e-9);
+  assert.equal(profile.crustDensity(slab(-200, 2700), p), 2700);
+  assert.equal(profile.crustDensity({ ...slab(-200), slab: false }, p), 3000);
+  // Excess mass per area of a 100 Myr slab (B = -rho_m x freeboard) against
+  // half-space cooling, rho alpha dT sqrt(4 kappa t / pi): within 10% once eclogite.
+  const B = -p.mantle_density * profile.columnProfile(slab(-100), p).freeboardKm * 1e3;
+  const halfSpace = p.mantle_density * p.thermal_expansion_coeff * (p.mantle_temp - 273) * Math.sqrt(4 * p.thermal_diffusivity_m2_s * 100 * profile.SECONDS_PER_MYR / Math.PI);
+  assert.ok(Math.abs(B / halfSpace - 1) < 0.1, `excess ${B.toExponential(2)} vs ${halfSpace.toExponential(2)}`);
 });

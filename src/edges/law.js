@@ -64,14 +64,14 @@
 // end once |M| > (compression + tension cap) x face / 6. Without it a column
 // in a slipping zone could spin like a ball bearing.
 
-import { geotherm, ductile, flowLaw, columnProfile, GRAVITY, SECONDS_PER_MYR } from '../columns/profile.js';
+import { geotherm, ductile, flowLaw, columnProfile, andersonRatio, brittleCompression, brittleTension, GRAVITY, SECONDS_PER_MYR } from '../columns/profile.js';
 
 export const EDGE_SLICES = 8;
 const LN_STRENGTH_CAP = Math.log(1e6);
 
 
 /** Anderson's ratio of frictional strength in compression to that in extension, ((1 + mu^2)^(1/2) + mu)^2. */
-export const andersonRatio = (mu) => (Math.sqrt(1 + mu * mu) + mu) ** 2;
+export { andersonRatio };
 
 /** The column's depth extent below its top, km: crust and lithosphere (edges.wgsl, column_bottom). */
 export const columnDepthKm = (col, p) => Math.max(geotherm(col, p).L, col.crustKm);
@@ -118,16 +118,21 @@ export function edgeSlices(a, b, phi, p, normalStress = null) {
       pressure += 0.5 * slicePressure(prof, d);
       T += 0.5 * g.T(d);
     }
+    // Shear strength (the tangential channel's) and, for the normal channel,
+    // horizontal differential stress: twice it when ductile, Anderson's
+    // thrust / normal-fault strength when brittle (profile.js).
     const ductileCap = 1 / invStrength;
-    const brittleComp = phi * p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * pressure;
-    const brittle = brittleComp < ductileCap;
+    const ductileN = 2 * ductileCap;
+    const brittleComp = brittleCompression(pressure, phi, p);
+    const brittleTens = brittleTension(pressure, phi, p);
+    const brittle = brittleTension(pressure, 1, p) < ductileN; // the mechanism, from intact rock
     const sigmaN = normalStress ? normalStress[k] : 0;
     const brittleShear = phi * p.cohesion_mpa + p.friction_coefficient * Math.max((1 - p.pore_fluid_factor) * pressure - sigmaN, 0);
     slices.push({
       z, dz, T,
       r: 1 / (1 + edtOverEta),
-      comp: Math.min(brittleComp, ductileCap) * iface,
-      tens: brittle ? (phi * (p.cohesion_mpa + p.friction_coefficient * (1 - p.pore_fluid_factor) * pressure)) / andersonRatio(p.friction_coefficient) : ductileCap * (1 - p.ductile_damage_weakening * (1 - phi)),
+      comp: Math.min(brittleComp, ductileN) * iface,
+      tens: brittle ? brittleTens : ductileN * (1 - p.ductile_damage_weakening * (1 - phi)),
       cracks: brittle,
       shear: Math.min(brittleShear, ductileCap),
       slips: brittleShear < ductileCap,

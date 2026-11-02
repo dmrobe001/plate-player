@@ -654,10 +654,11 @@ export function jacobiSpectralRadius(p, maxDegree = 6) {
  * are left to the warm start, which carries them from step to step.
  * Overestimating rho is harmless for a linear solve but not with caps: the
  * momentum of rows that hit a cap derails the iteration (a strip under
- * concentrated slab pull tore at 0.99987, stayed exact at 0.999).
+ * concentrated slab pull tore at 0.99987, stayed exact at 0.999; with the
+ * Anderson caps, 3.5x higher, it diverged at 0.999 and stayed exact at 0.99).
  */
 export const CHEBYSHEV_REACH = 4;
-export const CHEBYSHEV_MAX_RHO = 0.999;
+export const CHEBYSHEV_MAX_RHO = 0.99;
 export function chebyshevRho(p) {
   const n = p.solver_iterations - p.chebyshev_delay;
   if (n <= 1) return 0;
