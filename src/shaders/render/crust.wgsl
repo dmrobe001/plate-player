@@ -144,7 +144,7 @@ fn arrow_point(v: u32, len: f32, apothem: f32, inward: bool) -> vec2f {
         let end = select(len - head, len, inward);
         return vec2f(0.5 * (q.x + 1.0) * end, q.y * 0.07 * apothem);
     }
-    let w = 0.22 * apothem;
+    let w = min(0.22 * apothem, 0.6 * head);
     let base = select(len - head, len, inward);
     let tip = select(len, len - head, inward);
     if (v == 6u) { return vec2f(tip, 0.0); }
