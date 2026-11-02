@@ -93,7 +93,9 @@ button:hover { border-color: var(--accent); }
 .swatch { display: inline-block; width: 18px; height: 4px; margin-left: 6px; border: 1px solid var(--border); }
 .swatch.compression { background: #000; }
 .swatch.tension { background: #fff; }
-.swatch.shear { width: 4px; height: 12px; background: #000; }
+.key .item { white-space: nowrap; margin-right: 4px; }
+.swatch.force { background: #ffd126; }
+.swatch.slab { width: 10px; height: 10px; border-radius: 50%; background: #fff; }
 
 .record { margin: 10px 0 0; padding: 6px 8px 8px; border: 1px solid var(--border); border-radius: 6px; display: grid; gap: 6px; }
 .record legend { color: var(--muted); padding: 0 4px; }

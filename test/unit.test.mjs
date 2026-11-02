@@ -953,3 +953,29 @@ test('rolling: flat faces resist relative rotation (K face^2 / 12 rest) up to th
   assert.equal(law.linearizeRolling(0, edge, 0, rest, -100, 50, p).stiffness, 0);
   assert.equal(law.linearizeRolling(0, edge, face, rest, 100, 0, p).cap, 0);
 });
+
+import { columnStress, principalStresses } from '../src/columns/stress.js';
+
+test('column stress: a hexagon under uniform strain reads the plane-stress continuum tensor', () => {
+  // Edge stresses of a lattice under strain e: normal E n.e.n, tangential G t.e.n (G = r E).
+  const E = 7e4, r = 0.2, a = 0.01, nu = (1 - r) / (3 + r), h = 30;
+  const read = (exx, eyy, exy) => columnStress([0, 1, 2, 3, 4, 5].map((k) => {
+    const th = (k * Math.PI) / 3 + 0.1, n = [Math.cos(th), Math.sin(th)], t = [-n[1], n[0]];
+    const en = n[0] * n[0] * exx + n[1] * n[1] * eyy + 2 * n[0] * n[1] * exy;
+    const g = t[0] * (exx * n[0] + exy * n[1]) + t[1] * (exy * n[0] + eyy * n[1]);
+    return { n, t, sigmaN: E * en, tau: r * E * g, overlap: h, rest: 2 * a, lever: 0.5, dist: 2 * a };
+  }), 2 * Math.sqrt(3) * a * a, r);
+  const eps = 1e-3, close = (x, y) => assert.ok(Math.abs(x - y) < 1e-9 * E, `${x} vs ${y}`);
+  const iso = read(eps, eps, 0);
+  close(iso.sxx, (E * eps) / (1 - nu)); close(iso.syy, (E * eps) / (1 - nu)); close(iso.sxy, 0);
+  assert.ok(Math.hypot(...iso.force) < 1e-9 * E * a * h); // balanced
+  const uni = read(eps, 0, 0);
+  close(uni.sxx, (E * eps) / (1 - nu * nu)); close(uni.syy, (nu * E * eps) / (1 - nu * nu));
+  const sh = read(0, 0, eps); // pure shear: principal axes at 45 degrees, +-2 mu eps
+  const p = principalStresses(sh.sxx, sh.syy, sh.sxy);
+  close(p.s1, (E * eps) / (1 + nu)); close(p.s2, -(E * eps) / (1 + nu));
+  assert.ok(Math.abs(p.angle - Math.PI / 4) < 1e-9);
+  // One-sided pull: net force toward the pulling partner.
+  const f = columnStress([{ n: [1, 0], sigmaN: 10, tau: 0, overlap: h, rest: 2 * a, lever: 0.5, dist: 2 * a }], 1, r).force;
+  assert.ok(f[0] > 0 && f[1] === 0);
+});

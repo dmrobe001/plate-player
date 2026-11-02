@@ -1,5 +1,5 @@
 // The mantle grid, coloured by buoyancy: orange = hot (upwelling),
-// blue = cold (downwelling).
+// blue = cold (downwelling); a black sphere when the mantle is hidden.
 
 struct MantleOut {
     @builtin(position) clip: vec4f,
@@ -18,6 +18,7 @@ fn vs_mantle(@builtin(vertex_index) idx: u32) -> MantleOut {
 
 @fragment
 fn fs_mantle(in: MantleOut) -> @location(0) vec4f {
+    if ((view.flags & 8u) != 0u) { return vec4f(0.0, 0.0, 0.0, 1.0); }
     let n = cross(dpdx(in.world), dpdy(in.world)); // flat-shaded facet normal
     let normal = select(normalize(in.world), normalize(n), length(n) > 0.0001);
     let diffuse = max(dot(normal, view.light_dir.xyz), 0.2);

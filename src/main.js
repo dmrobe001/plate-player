@@ -267,8 +267,8 @@ async function main() {
       lightDir: camera.lightDirection(),
       showMantle: $('showMantle').checked,
       colorByPlate: $('colorByPlate').checked,
-      showNormal: $('showNormal').checked,
-      showShear: $('showShear').checked,
+      showForce: $('showForce').checked,
+      showStress: $('showStress').checked,
       stressRefMPa: stressRef(),
     });
     device.queue.submit([encoder.finish()]);

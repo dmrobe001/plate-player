@@ -25,9 +25,9 @@
         <label class="row"><input id="spin" type="checkbox"> Auto-spin globe</label>
         <label class="row"><input id="showMantle" type="checkbox" checked> Show mantle</label>
         <label class="row"><input id="colorByPlate" type="checkbox"> Colour by plate</label>
-        <label class="row"><input id="showNormal" type="checkbox" checked> Normal stress lines</label>
-        <label class="row" title="Bonds are central springs, so they carry no shear; a shear measure returns with the per-particle strain fit (design phase 4)"><input id="showShear" type="checkbox" checked> Shear stress ticks (phase 4)</label>
-        <label class="row" title="Stress at which a line is one apothem wide">Line scale
+        <label class="row" title="Sum of the forces the edges exert on each column (balanced by basal drag), drawn as a traction: force / (depth x column width)"><input id="showForce" type="checkbox" checked> Net force arrows</label>
+        <label class="row" title="Principal axes of each column's stress tensor: arrows out = tension, in = compression"><input id="showStress" type="checkbox" checked> Principal stress arrows</label>
+        <label class="row" title="Stress at which an arrow is one apothem long">Arrow scale
           <input id="stressRef" type="range" min="0" max="3" step="0.05" value="2.18">
           <output id="stressRefOut"></output>
         </label>
@@ -36,9 +36,10 @@
       <div class="legend">
         <div class="colorbar"></div>
         <div class="colorbar-labels"><span>&minus;6 km</span><span>sea level</span><span>+4.5 km</span></div>
-        <div class="key"><span class="swatch compression"></span>compression
-          <span class="swatch tension"></span>tension
-          <span class="swatch shear"></span>shear</div>
+        <div class="key"><span class="item"><span class="swatch compression"></span>&rarr;&larr; compression</span>
+          <span class="item"><span class="swatch tension"></span>&larr;&rarr; tension</span>
+          <span class="item"><span class="swatch force"></span>net force</span>
+          <span class="item"><span class="swatch slab"></span>slab</span></div>
       </div>
 
       <fieldset class="record">

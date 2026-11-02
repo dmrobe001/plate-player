@@ -1,7 +1,9 @@
-// Draws the mantle sphere, crust particles and bonds from the simulation buffers.
+// Draws the mantle sphere, crust particles and per-column force and stress
+// arrows from the simulation buffers.
 
 import { CAPACITY, structsWGSL } from '../sim/simulation.js';
 import { createShaderModule } from '../gpu/device.js';
+import { SLOTS } from '../gpu/layout.js';
 
 import commonWGSL from '../shaders/render/common.wgsl';
 import mantleWGSL from '../shaders/render/mantle.wgsl';
@@ -25,14 +27,14 @@ export class Renderer {
 
     const visibility = GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
     const storageLayout = device.createBindGroupLayout({
-      entries: [0, 1, 2, 3].map((binding) => ({ binding, visibility, buffer: { type: 'read-only-storage' } })),
+      entries: [0, 1, 2, 3, 4].map((binding) => ({ binding, visibility, buffer: { type: 'read-only-storage' } })),
     });
     const uniformLayout = device.createBindGroupLayout({
       entries: [0, 1].map((binding) => ({ binding, visibility, buffer: { type: 'uniform' } })),
     });
     this.storageBindGroup = device.createBindGroup({
       layout: storageLayout,
-      entries: [sim.buffers.particles, sim.buffers.edges, sim.buffers.grid, sim.buffers.plateIds]
+      entries: [sim.buffers.particles, sim.buffers.edges, sim.buffers.grid, sim.buffers.plateIds, sim.buffers.deltas]
         .map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
     this.uniformBindGroup = device.createBindGroup({
@@ -40,7 +42,9 @@ export class Renderer {
       entries: [this.viewBuffer, sim.buffers.params].map((buffer, binding) => ({ binding, resource: { buffer } })),
     });
 
-    const code = [structsWGSL(), commonWGSL, mantleWGSL, crustWGSL].join('\n');
+    const slotConsts = `const SLOT_WORDS = ${SLOTS.wordsPerParticle}u;\nconst SLOT_COUNT_WORD = ${SLOTS.countWord}u;\n`
+      + `const SLOT_FIRST_WORD = ${SLOTS.firstSlotWord}u;\nconst SLOT_CAPACITY = ${SLOTS.capacity}u;\n`;
+    const code = [structsWGSL(), slotConsts, commonWGSL, mantleWGSL, crustWGSL].join('\n');
     const module = createShaderModule(device, 'render', code, onError);
     const layout = device.createPipelineLayout({ bindGroupLayouts: [storageLayout, uniformLayout] });
     const pipeline = (vertex, fragment, topology) => device.createRenderPipeline({
@@ -54,7 +58,8 @@ export class Renderer {
     this.pipelines = {
       mantle: pipeline('vs_mantle', 'fs_mantle', 'triangle-list'),
       discs: pipeline('vs_disc', 'fs_disc', 'triangle-list'),
-      bonds: pipeline('vs_bond', 'fs_bond', 'triangle-list'),
+      force: pipeline('vs_force', 'fs_glyph', 'triangle-list'),
+      stress: pipeline('vs_stress', 'fs_glyph', 'triangle-list'),
     };
   }
 
@@ -66,7 +71,7 @@ export class Renderer {
   }
 
   /**
-   * @param view {viewProj: Float32Array(16), lightDir: [x,y,z], stressRefMPa, showMantle, showNormal, showShear}
+   * @param view {viewProj: Float32Array(16), lightDir: [x,y,z], stressRefMPa, showMantle, showForce, showStress, colorByPlate}
    */
   encodeDraw(encoder, view) {
     const colorTexture = this.context.getCurrentTexture();
@@ -77,7 +82,7 @@ export class Renderer {
     f.set(view.viewProj, 0);
     f.set([...view.lightDir, 0], 16);
     f[20] = view.stressRefMPa;
-    u[21] = (view.showNormal ? 1 : 0) | (view.showShear ? 2 : 0) | (view.colorByPlate ? 4 : 0);
+    u[21] = (view.showForce ? 1 : 0) | (view.showStress ? 2 : 0) | (view.colorByPlate ? 4 : 0) | (view.showMantle ? 0 : 8);
     this.device.queue.writeBuffer(this.viewBuffer, 0, this.viewData);
 
     const pass = encoder.beginRenderPass({
@@ -97,17 +102,22 @@ export class Renderer {
     pass.setBindGroup(0, this.storageBindGroup);
     pass.setBindGroup(1, this.uniformBindGroup);
 
-    if (view.showMantle) {
-      pass.setPipeline(this.pipelines.mantle);
-      pass.setIndexBuffer(this.indexBuffer, 'uint32');
-      pass.drawIndexed(this.indexCount);
-    }
-    // One instanced quad per particle; two quads (line + tick) per bond.
+    // The mantle sphere is always drawn (black when hidden, flag bit 3), so
+    // the far side of the globe never shows through.
+    pass.setPipeline(this.pipelines.mantle);
+    pass.setIndexBuffer(this.indexBuffer, 'uint32');
+    pass.drawIndexed(this.indexCount);
+    // One instanced quad per particle; arrows per particle (9 vertices for the
+    // force, 36 for the two principal axes).
     pass.setPipeline(this.pipelines.discs);
     pass.draw(6, CAPACITY.maxParticles);
-    if (view.showNormal || view.showShear) {
-      pass.setPipeline(this.pipelines.bonds);
-      pass.draw(12, CAPACITY.maxEdges);
+    if (view.showStress) {
+      pass.setPipeline(this.pipelines.stress);
+      pass.draw(36, CAPACITY.maxParticles);
+    }
+    if (view.showForce) {
+      pass.setPipeline(this.pipelines.force);
+      pass.draw(9, CAPACITY.maxParticles);
     }
     pass.end();
   }

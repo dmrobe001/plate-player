@@ -36,15 +36,24 @@ the seed in the URL: `plate-player.html?seed=42`.
 
 | Glyph | Meaning |
 |---|---|
-| Disc / ellipse | One crust particle (column), drawn as its reference shape: mean radius = the apothem, elongated by distributed flow (its finite strain, up to aspect 3). Colour = elevation relative to sea level (blues below, greens/browns/white above). Darkened discs are subducting slabs. |
-| Black line between centres | Edge in **compression**. Width ∝ \|normal stress\| |
-| White line between centres | Edge in **tension** (only edges with integrity > 0 carry tension). Width ∝ normal stress |
-| Black tick across an edge's midpoint | **Shear** stress on the edge (its tangential channel, either sense). Width ∝ \|shear stress\|; length = one hexagon edge (the "face" between the two particles) |
-| Background sphere | Mantle grid, coloured by flow divergence: orange = upwelling, blue = downwelling |
+| Disc / ellipse | One crust particle (column), drawn as its reference shape: mean radius = the apothem, elongated by distributed flow (its finite strain, up to aspect 3). Colour = elevation relative to sea level (blues below, greens/browns/white above). **White** discs are subducting slabs. |
+| White arrows pointing out (←·→) | A principal axis of the column's stress in **tension**. Length ∝ that principal stress |
+| Black arrows pointing in (→·←) | A principal axis in **compression**. Each column shows both axes, at right angles |
+| Yellow arrow from the centre | **Net force** the column's edges exert on it: the push and pull of its neighbours. In this overdamped model it is balanced by basal drag, so it points roughly along the column's motion relative to the mantle |
+| Background sphere | Mantle grid, coloured by flow divergence: orange = upwelling, blue = downwelling. With **Show mantle** off it is a plain black sphere |
 | **Colour by plate** | Each plate in its own colour; grey particles belong to no plate (fragments under 20 particles, or slabs) |
 
-Line width = mean apothem × |σ| / σ_ref, capped at one apothem. σ_ref is the
-**Line scale** slider (log scale, default ≈ the 150 MPa yield stress).
+Arrow length = apothem × |σ| / σ_ref, capped at two apothems. σ_ref is the
+**Arrow scale** slider (log scale, default ≈ the 150 MPa yield stress).
+
+How the column stress is computed (CPU reference `src/columns/stress.js`): each
+edge exerts the force the solver applies, f = c · rest · (S n + S_t t), with S and
+S_t its depth-integrated normal and shear stress and c the lattice conversion
+factor that bond stiffness uses. The column's stress is the Love–Weber average
+σ = sym(Σ r ⊗ f) / (A h), with r the contact point, A the reference area and h the
+mean depth overlap of its edges. On a hexagon under uniform strain this gives the
+plane-stress continuum tensor exactly (unit test). The net force is drawn as the
+traction |Σ f| / (h × 2 apothem).
 
 ## Model in one page
 
@@ -283,7 +292,7 @@ plate-player/
 │   │   └── camera.js          orbit camera
 │   └── shaders/
 │       ├── compute/           bindings.wgsl, locate, thermal, solver, edges, profile, law, flow, area, split, flexure
-│       └── render/            common.wgsl, mantle, crust (discs + stress glyphs)
+│       └── render/            common.wgsl, mantle, crust (discs + force and stress arrows)
 ├── test/
 │   ├── unit.test.mjs          CPU tests (Node only)
 │   └── gpu.test.mjs           acceptance tests that drive the built page in Chromium
@@ -464,7 +473,7 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 - [x] ~~Bond "shear" resisted rigid rotation~~ (it was a velocity difference, not a
       strain). Removed in phase 2: bonds are central springs. Phase G: shear is a
       tangential channel on each edge, measured against the columns' own (solved)
-      rotations, so rigid rotation stores none; the shear ticks show it.
+      rotations, so rigid rotation stores none (the principal stress arrows show it).
 - [x] ~~Young's modulus had no dynamical effect.~~ Phase 2: bond stiffness and drag
       are physical, and the two-particle relaxation matches τ = γ/2k (tested).
 - [x] ~~Plate-scale stress didn't converge with plain Jacobi~~ (median 56 MPa of
