@@ -114,6 +114,4 @@ fn columns_gpe_force(@builtin(global_invocation_id) id: vec3<u32>) {
     let s = -sim.gpe_force_factor * (1e9 / 6.371e6) * h * sim.dt_crust_myr * 3.15576e13 / sim.asthenosphere_viscosity_pa_s / 6.371e6;
     let x = vec4f(normalize(particles[idx].predicted_pos.xyz + s * grad), 1.0);
     particles[idx].predicted_pos = x;
-    particles[idx].iter_start = x;
-    particles[idx].iter_prev = x;
 }

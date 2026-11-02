@@ -37,7 +37,7 @@ export class PlateTracker {
   /** Relabel from a snapshot's buffers (see Simulation.snapshot). */
   update(snap) {
     const P = unpack(Particle, snap.buffers.particles, CAPACITY.maxParticles);
-    const C = unpack(Edge, snap.buffers.edges, CAPACITY.maxEdges);
+    const C = unpack(Edge, snap.buffers.edges, snap.counts?.edges ?? CAPACITY.maxEdges); // (edge slots in use)
     const result = labelPlates(P, C, this.state);
     // The first labelling of a run is not a sequence of splits.
     if (this.state) for (const e of result.events) this.events.push({ step: snap.step, time_myr: snap.timeMyr, ...e });

@@ -88,8 +88,6 @@ export const Particle = defineStruct('Particle', [
   ['position', 'vec4f'],        // unit-sphere direction of the column (w unused); its radius is `elevation`
   ['predicted_pos', 'vec4f'],   // position-based-dynamics predicted position
   ['velocity', 'vec4f'],        // radians / Myr, tangent to sphere
-  ['iter_start', 'vec4f'],      // solver iterate x_k at the start of the current iteration (Chebyshev)
-  ['iter_prev', 'vec4f'],       // solver iterate x_{k-1} (Chebyshev)
   ['cell_shape', 'vec4f'],      // tessellation cell (derived, design 4.8): centroid (x, y) and major-axis
                                 //   angle (z) in the gnomonic tangent basis, sqrt of the major second moment (w)
   ['slab_trailing', 'vec4f'],   // slab: unit direction to the plate behind it (integrity-weighted surface partners), w = 1 if any
@@ -159,7 +157,7 @@ export const Edge = defineStruct('Edge', [
   ['particle_b', 'u32'],
   ['is_active', 'u32'],
   ['integrity', 'f32'],         // 0..1: 0 = no cohesion (pushes only), 1 = intact
-  ['lambda', 'f32'],            // XPBD multiplier accumulated over this step's iterations
+  ['lambda', 'f32'],            // XPBD multiplier during the solve; between steps the force it applied, MPa km (warm start)
   ['lambda_prev', 'f32'],       // multiplier before the current iteration (Chebyshev acceleration)
   ['stress_normal_mpa', 'f32'], // diagnostic: depth-averaged normal stress, + tension, - compression
   ['stress_shear_mpa', 'f32'],  // diagnostic: depth-averaged tangential stress, signed (b moving +t relative to a is +)

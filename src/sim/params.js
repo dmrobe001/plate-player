@@ -33,11 +33,16 @@ export const SIM_PARAMS = [
   ['time_myr', 'f32', 0],               // current time, written by simulation.js each step
   ['solver_iterations', 'u32', 32],     // Jacobi sweeps over all edges per step (read by simulation.js)
   // Chebyshev semi-iterative acceleration of the Jacobi sweeps (Wang 2015).
-  // rho is the spectral radius of one plain sweep: negative = derive it
-  // (simulation.js, jacobiSpectralRadius), 0 = off (plain Jacobi), else as given.
-  // The first `delay` iterations are plain Jacobi. Read by simulation.js.
+  // rho is the spectral radius of one plain sweep: negative = derive it, capped
+  // by the iteration budget and at 0.999 (simulation.js, chebyshevRho; design
+  // 5.2), 0 = off (plain Jacobi), else as given.
+  // The first `delay` iterations are plain Jacobi.
   ['chebyshev_rho', 'f32', -1],
   ['chebyshev_delay', 'u32', 3],
+  // Warm start: each edge's multiplier starts at the force of its stored
+  // elastic stress (and positions move to match), so a step's solve corrects
+  // the increment instead of rebuilding the whole stress from zero (design 5.2).
+  ['solver_warm_start', 'u32', 1],
   // Lithosphere Young's modulus. With 32 Chebyshev-accelerated iterations the
   // solve converges well enough that residual stresses stay at a few MPa
   // (design.md, Chebyshev findings); plain Jacobi needed a 2 GPa stop-gap.

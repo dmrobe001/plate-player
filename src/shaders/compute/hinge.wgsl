@@ -220,7 +220,5 @@ fn columns_hinge(@builtin(global_invocation_id) id: vec3<u32>) {
         let dx = pull * sim.dt_crust_myr * 3.15576e13 / gamma / R_M;
         let x = vec4f(normalize(particles[idx].predicted_pos.xyz + dx * nh), 1.0);
         particles[idx].predicted_pos = x;
-        particles[idx].iter_start = x;
-        particles[idx].iter_prev = x;
     }
 }

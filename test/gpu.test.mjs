@@ -223,7 +223,8 @@ test('Chebyshev-accelerated sweeps converge on a stiff chain where plain Jacobi 
   const runs = await page.evaluate(async ([chain, builderSrc, K, elastic]) => {
     const build = eval(`(${builderSrc})`);
     await plate.setParams({ ...elastic, mantle_drive: 0, crust_youngs_modulus_gpa: 70, base_apothem: chain.apothem });
-    await plate.setParams({ dt_crust_myr: K / plate.sim.params.bond_rate_myr_inv, solver_iterations: 128 });
+    // (Cold start: the accelerator itself is under test, not the warm start.)
+    await plate.setParams({ dt_crust_myr: K / plate.sim.params.bond_rate_myr_inv, solver_iterations: 128, solver_warm_start: 0 });
     const out = {};
     for (const [name, rho] of [['plain', 0], ['chebyshev', 0.999]]) {
       await plate.setParams({ chebyshev_rho: rho });
@@ -1647,7 +1648,9 @@ test('trench hinge: slab pull bends the flap, the contact gives way, the column 
     const n = pts.length, lead = N - 1, C = N, S = N + 1;
     const isC = (i) => i === C || i > S;
     const col = (o, c, s) => Float32Array.from(pts, (_, i) => (isC(i) ? c : i === S ? s : o));
-    await plate.setParams({ mantle_drive: 0, solver_iterations: 256, dt_crust_myr: 0.25, chebyshev_rho: 0.999, damage_work_mpa_km: 1e9 });
+    // A converged solve: the hinge's history branches on small differences in
+    // the solve (design 5.2, Chebyshev findings), and this tests the hinge.
+    await plate.setParams({ mantle_drive: 0, solver_iterations: 256, chebyshev_rho: 0.999, dt_crust_myr: 0.25, damage_work_mpa_km: 1e9 });
     const ba = [], bb = [], bd = [];
     for (let k = 0; k < N - 1; k++) { ba.push(k); bb.push(k + 1); bd.push(0); }
     ba.push(lead, lead, C, S + 1, S + 2); bb.push(C, S, S + 1, S + 2, S + 3); bd.push(1, 0, 0, 0, 0);

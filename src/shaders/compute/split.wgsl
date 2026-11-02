@@ -50,6 +50,8 @@ fn columns_split(@builtin(global_invocation_id) id: vec3<u32>) {
     if (ticket >= min(p_count, c_count)) { return; } // out of slots; try again next step
     let child = particle_pool.indices[p_count - 1u - ticket];
     let edge = edge_pool.indices[c_count - 1u - ticket];
+    note_particle_slot(child);
+    note_edge_slot(edge);
 
     let p = particles[idx].position.xyz;
     var xp: vec4f;
@@ -150,6 +152,7 @@ fn crust_rewire_edges(@builtin(global_invocation_id) id: vec3<u32>) {
         edges[c_idx].direction_x = d.x;
         edges[c_idx].direction_y = d.y;
         edges[c_idx].direction_z = d.z;
+        edges[c_idx].lambda = 0.0; // (no warm start: the pair's geometry is new)
     }
 }
 

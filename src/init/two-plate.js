@@ -150,16 +150,11 @@ export function generateTwoPlateState(options = {}) {
     arc_reach: 0.05 * scale,
     // Hash cells at least twice the clip radius (tessellation reach, design 4.8).
     hash_grid_dim: Math.max(1, Math.floor(3 / (2 * clip))),
-    // Time step and solve (design 9.2, two-plate findings): at this column size
-    // a slab lives ~1.3 Myr, and the solve needs ~256 iterations at 0.25 Myr to
-    // hold the force residual near the basal drag (32 left 10x drag and 40-60
-    // MPa of spurious compression, which set off subduction in plate interiors).
+    // Time step (design 9.2, two-plate findings): at this column size a slab
+    // lives ~1.3 Myr. The default solve (32 warm-started sweeps, budget-capped
+    // Chebyshev rho; design 5.2) holds the velocity within ~6% of a converged
+    // one; before the warm start this world needed 256.
     dt_crust_myr: 0.25,
-    solver_iterations: 256,
-    // Chebyshev with the derived spectral radius (~0.99999 here) diverges once a
-    // trench hinge concentrates slab pull on a column and its contact caps
-    // change step to step (design 9.2, hinge findings); 0.999 stays stable.
-    chebyshev_rho: 0.999,
   };
 
   return {

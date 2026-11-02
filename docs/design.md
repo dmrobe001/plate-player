@@ -731,8 +731,9 @@ writes named buffers only, so any one can be run alone on dumped or synthetic in
                     GPE push into the predicted positions (4.6); trench hinges: bend,
                     subduction, slab pull (6); each edge's linear law, caps, rest length,
                     lever, face (4.5)
- 7. solve           solver_iterations (32) sweeps: all edges' normal, tangential and rolling
-                    rows (Jacobi), Chebyshev extrapolation of the normal part (5.2)
+ 7. solve           warm start (positions to last step's edge forces); solver_iterations
+                    (32) sweeps: all edges' normal, tangential and rolling rows (Jacobi),
+                    Chebyshev extrapolation of the normal multipliers (5.2)
  8. irreversible    slice stresses, inelastic strain, slip, plastic work, integrity, moment,
                     edge timers and suturing (4.7, 6); area and shape (4.7)
  9. integrate       position = solved position; velocity (diagnostic); body axis carried and
@@ -741,9 +742,22 @@ CPU, between steps: mantle advanced and uploaded every stepMyr; plate labelling 
 0.25 Myr (3.3); recording when due (8)
 ```
 
-Steps with many iterations are submitted in pieces (16 solver or 64 bending
-iterations), waiting for each, so the browser's GPU watchdog does not kill the
-device; `runSteps` keeps at most two steps in flight.
+**Problem size.** Buffers are allocated for `CAPACITY` (25,000 columns, 131,072 edge
+slots), but GPU work is sized to the slots in use. The free lists hand out the lowest
+free slot first, and the GPU keeps high-water marks (one past the highest particle
+and edge slot ever used; `note_particle_slot`, `note_edge_slot`). Per-particle and
+per-edge kernels are indirect dispatches over those marks (`solver_dispatch_sizes`,
+refreshed after splits and after new edges), draws are indirect over the particle
+mark, and snapshots read back only the slots in use. A load or restore rebuilds the
+marks with one full scan (`solver_find_high`). (Before, every kernel launched
+threads for every slot and every frame drew 25,000 instances: a 162-column world
+cost what a 10,000-column one did, and recording read 35 MB back every 1 Myr.)
+
+Steps with many iterations are submitted in pieces, waiting for each, so the
+browser's GPU watchdog does not kill the device: a piece holds about 10⁶ thread
+launches (from the high-water marks, read back a step late), at least 16 solver or 64
+bending iterations, the pieces that were always safe at capacity. A 162-column world
+does its whole step in one piece. `runSteps` keeps at most two steps in flight.
 
 ### 5.2 XPBD with drag in place of mass
 
@@ -764,25 +778,74 @@ has no float atomics). Graph-coloured Gauss–Seidel would gain ~2× in rate but
 its colouring maintained as splits and rewiring change topology, and does not change
 the (L/ℓ)² scaling that is the actual problem.
 
-**Chebyshev acceleration** (Wang 2015) of the normal rows: x_{k+1} = ω_k(x̂ − x_{k−1})
-+ x_{k−1}, x̂ one plain sweep, applied with the same weights to the normal
-multipliers, after 3 plain sweeps. The spectral radius is derived, not tuned: the
-sweep acts on the multipliers as I − (BWBᵀ + α̃)/(d(w_a + w_b + α̃)), B the
-edge–particle incidence; self-equilibrated force patterns (null space of Bᵀ) are
-slowest, ρ = 1 − α̃/(d(2 + α̃)), α̃ = 1/(κ·dt), d = 6. At 70 GPa and dt = 16 kyr
-ρ = 0.99993: plain Jacobi needs thousands of sweeps per 10× error reduction,
-Chebyshev ~100. On a 61-particle pre-compressed chain at κ·dt = 200, after 128 sweeps
-the error is 0.5% with Chebyshev and 76% with plain Jacobi.
+**Chebyshev acceleration** (Wang 2015) of the normal multipliers: λ_{k+1} =
+ω_k(λ̂ − λ_{k−1}) + λ_{k−1}, λ̂ one plain sweep from λ_k, clamped to the caps, after 3
+plain sweeps; each particle moves by exactly the change applied, so x − x̃ = W Bᵀλ
+holds at every iteration, clamped or not. (Until the redesign below, the positions
+were extrapolated separately with the same weights; whenever a cap clamped the
+extrapolated λ the two parted, motion without a force, which the momentum then
+amplified: the "divergence under concentrated pull" of section 9.2.) The sweep acts
+on the multipliers as I − (BWBᵀ + α̃)/(d(w_a + w_b + α̃)), B the edge–particle
+incidence; its spectrum lies in [0, 1). Self-equilibrated force patterns (null space
+of Bᵀ, the loops of a 2D lattice) are slowest, ρ = 1 − α̃/(d(2 + α̃)), α̃ = 1/(κ·dt),
+d = 6: 0.99993 at 70 GPa and dt = 16 kyr. On a 61-particle pre-compressed chain at
+κ·dt = 200, after 128 sweeps the error is 0.4% with Chebyshev and 76% with plain
+Jacobi.
+
+**Warm start.** Each edge's multiplier starts at the force it applied in the previous
+step's solve (kept in λ between steps as MPa·km, within the new caps), and the
+positions move to match, x₀ = x̃ + W Bᵀλ₀: the solve starts from last step's motion
+relative to the mantle and corrects the increment, instead of rebuilding every
+stored stress from zero, which is exactly the slow, self-equilibrated part. Edges
+that are new, or whose pair was just split or became a slab, start at zero. (Not
+from the stored stress: moving the positions by that is an explicit Euler step of the
+stiff edges, κ·dt ≈ 250 here, which amplified whatever a short solve left: at 32
+sweeps edge forces grew to 100× the drag within 2 Myr.)
+
+**Choosing ρ (`chebyshev_rho` < 0, `chebyshevRho`).** ρ = min(derived, 1 −
+½(4/N)², 0.999), N the accelerated sweeps. Two findings:
+- *A budget can only use the ρ it can finish.* After N sweeps Chebyshev bounds every
+  mode in [−ρ, ρ] by 1/T_N(1/ρ) ≈ 1/cosh(N√(2(1−ρ))). With the derived 0.99999 and
+  N = 29 that is 0.99 for *every* mode, fast ones included, which plain Jacobi
+  removes in a sweep: the accelerated solve was worse than plain Jacobi. The cap puts
+  N√(2(1−ρ)) = 4 (bound 4%); slower modes are left to the warm start.
+- *Overestimating ρ is harmless for a linear solve, not with caps.* A strip under
+  concentrated slab pull, 256 sweeps: exact at ρ = 0.999, a column torn ~280 km at
+  0.99987. Hence the ceiling. (Measuring ρ each step instead, from the contraction of
+  the last plain sweeps, gave ~0.8: it sees the fast modes and underestimates, and
+  tripled the velocity error on the two-plate planet.)
+
+Measured on the two-plate planet (one step from the same state, against a
+1,024-sweep solve; plate speeds ~2.9 cm/yr rms):
+
+| sweeps | start | ρ | velocity error | stress error (rms / max) | time (software GPU) |
+|---|---|---|---|---|---|
+| 256 | cold | 0.999 | 2.1% | 0.15 / 0.5 MPa | 1.23 s |
+| 32 | cold | 0.992 | 31% | 3.2 / 9.3 MPa | 0.30 s |
+| 32 | warm | 0.999 | 6.2% | 1.5 / 5.5 MPa | 0.29 s |
+| 32 | warm | 0.992 (rule) | 5.8% | 0.28 / 0.8 MPa | 0.29 s |
+| 32 | warm | 0 (plain) | 6.5% | 0.69 / 2.6 MPa | 0.27 s |
+| 64 | warm | 0.998 (rule) | 4.6% | 0.23 / 0.7 MPa | 0.47 s |
+| 16 | warm | 0.969 (rule) | 7.3% | 0.54 / 2.0 MPa | 0.16 s |
+
+At 32 sweeps any ρ in 0.97–0.992 does the same. Over 30 Myr the warm 32-sweep solve
+keeps the median residual force (edges + drag, which omits the GPE push and slab pull)
+at 1.4× the cold 256-sweep solve's (20/27/38 vs 13/19/28 at 10/20/30 Myr; the rise is
+the trench developing, in both); 64 sweeps are no better than 32.
 - **Linear within a step.** Anything that changes the operator inside the iteration
   (damage, stiffness switching with the sign of the stress) made accelerated runs
   diverge; such changes happen between solves. The λ clamps (caps, contacts) are the
-  remaining nonlinearity, tolerated so far (section 10).
+  remaining nonlinearity (ceiling on ρ, above).
 - **Tangential and rolling rows are plain Jacobi.** For ρ near 1 the Chebyshev
   weights converge every mode at the slowest rate, and spins, which plain Jacobi
   converges in a few sweeps, were left at ~4% of the naive shear. So their position
-  corrections go to a separate accumulator and are added after the extrapolation,
-  the previous iterate is shifted by the same amount (else the extrapolation gives
-  them momentum), and their multipliers and the spins are not extrapolated.
+  corrections go to a separate accumulator, applied with the normal rows' change but
+  not extrapolated, and their multipliers and the spins are not extrapolated.
+- **Branching histories.** The trench hinge strip (section 9.2) is not a convergence
+  test: from t = 0.5 Myr, solves that differ by little (ρ 0.999 or 0.9992 at 256
+  sweeps) land, 2 steps later, on one of two self-consistent states (strip speed 31
+  or 48 cm/yr), each reproduced by several settings. Its test pins a converged
+  solve (256 sweeps, ρ 0.999).
 
 **No coarse plate-level solve.** Positions always satisfy x − x̃ = W Bᵀλ, so every
 plate's drag-weighted net motion is already exact at every iteration; what converges
@@ -918,8 +981,9 @@ D/ℓ); the elastic, plastic and runaway branches and partial unloading. On the 
 compression alone (old ocean held against a continent at 0.2%) subducts nothing, and
 two buoyant pairs weld at their window. A strip (eight old-ocean columns against a
 four-column continent, a slab hanging from the leading column, no mantle, damage off,
-dt 0.25 Myr): the flap bends 3.6° in the second step, the leading column goes up to
-145 km under the continent and subducts at 5.25 Myr, its slab still hanging from it;
+dt 0.25 Myr, a converged solve): the flap bends 3.6° in the second step, the leading
+column goes up to 118 km under the continent and subducts at 1.5 Myr, its slab still
+hanging from it (5.25 Myr and 145 km before positions followed the multipliers, 5.2);
 no slab lost, no continent subducted, its volume logged as the sink. A free slab sinks
 0.52 km per step (3.2 cm/yr, the reference to 5×10⁻⁷), pulls the plate behind it and
 is removed at the cutoff; the arc gets exactly 20% of its volume, all on the far side.
@@ -1042,8 +1106,8 @@ repeatedly moved the problem rather than solved it. So:
 1. **Components are developed against known answers.** Each is checked against an
    analytic solution, a conservation identity, a limit case, or a reference
    implementation, not against planet behaviour.
-2. **Mechanism tests stay cheap.** Under the software GPU every dispatch and readback
-   costs in proportion to buffer capacity, and a readback takes ~0.5 s. Mechanism
+2. **Mechanism tests stay cheap.** Under the software GPU buffers, scans at load and
+   full readbacks cost in proportion to capacity, and a readback takes ~0.5 s. Mechanism
    tests run on an empty page with small buffers (`?empty&capacity=1024`), write
    inputs without readbacks, and read back as rarely as they can; the default GPU
    suite takes ~6 minutes. Tests on a generated planet run only with
@@ -1135,11 +1199,13 @@ Measured (software GPU, 162 columns):
   9.0, 512 → 2.1; dt 4: 1024 → 4.9. At equal cost (iterations per Myr), small steps
   with more iterations win. Probably the same cause as the scattered subduction
   seen on the 10k planet; not yet measured there.
-- **Time step:** 0.25 Myr with 256 iterations. Besides convergence, the slab's
+- **Time step:** 0.25 Myr; the solve, 256 iterations until the warm start (5.2), now
+  the default 32 (8× cheaper, velocities within ~6% of a converged solve). Besides convergence, the slab's
   lifetime bounds it: slabs sink at w ∝ column width (`slab_sink_rate_km_myr`), so
   1,900 km wide slabs sink ~50 cm/yr and are gone in ~1.3 Myr, and their pull needs
   several steps.
-- **With 32 iterations at dt ≤ 0.25 the trench locks:** the seeded slabs drop out
+- **With 32 cold-started iterations at dt ≤ 0.25 the trench locked** (not re-measured
+  with the warm start): the seeded slabs drop out
   within 1.5 Myr, nothing else subducts, and A pushes B through the trench, both
   turning at ~3.3 cm/yr against A's mantle at 7 (B's mantle at rest).
 
@@ -1152,8 +1218,9 @@ size = map width), their edges went at ~100 km depth, and solver residual trippe
 the timer. The trench hinge (section 6) replaces the timer; the heuristic is now a
 counter (`slabsLost`). Measured:
 - **Strip (default resolution, 220 km columns):** the heuristic holds. The leading
-  column bends, goes 145 km under a continent and subducts at 5.25 Myr with its slab
-  still hanging (GPU test, damage off).
+  column bends, goes 118 km under a continent and subducts at 1.5 Myr with its slab
+  still hanging (GPU test, damage off; the strip moves ~30–50 cm/yr under ~10¹⁸ N of
+  slab pull against the drag of eight columns).
 - **Found on the way, and fixed:** (1) the edge law's brittle tension cap was
   cohesion alone, so a plate could transmit at most ~2×10¹² N/m, less than any
   lubricated trench contact resists: now Anderson's extension strength (4.5). (2) A
@@ -1164,7 +1231,8 @@ counter (`slabsLost`). Measured:
   under-relaxed. (4) Slabs left at their mantle position fell behind the advancing
   plate, and the "far-side" arc reset the subducting plate's lithosphere, which ended
   the edge behind the hinge: slabs now hang at the trench. (5) The derived Chebyshev ρ
-  diverged under concentrated pull (columns jumped ~1,000 km in a step).
+  diverged under concentrated pull (columns jumped ~1,000 km in a step): positions
+  extrapolated apart from clamped multipliers (fixed, 5.2).
 - **Still open: the damage law tears plates under slab pull.** Shallow brittle slices
   crack under a few MPa of tension; their plastic work lowers the whole edge's
   integrity, the caps fall with it, and the edge behind the hinge fails (strip:
@@ -1312,19 +1380,18 @@ benchmarks; several already exist as mechanism tests):
   ductile shear zones at 50 km?
 - **GPE force vs basal drag:** the force is physical but, against today's drag,
   metres per year at margins. Calibrate drag, edge tension and this force together.
-- **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity. It breaks
-  convergence under concentrated forces (below).
+- **Caps inside Chebyshev:** clamping λ to caps is a nonlinearity. With the
+  positions following the multipliers it no longer parts them, but overestimating ρ
+  still derails clamped rows; the 0.999 ceiling is one measurement (5.2).
 - **Tangential rows outside Chebyshev:** plain Jacobi converges them in a few sweeps
   on a patch; does that hold at plate scale, where spins couple through the positions
   over many columns?
 - **Subduction calibration:** freeboard < 0 makes ocean older than ~8 Myr subductable
   (intent: 30–40 Myr); interface weakening and the attachment strength are guesses.
   Set them with plate speeds.
-- **Caps inside Chebyshev, measured:** with the derived spectral radius (0.99999 at
-  dt 0.05) a strip under concentrated slab pull diverged in one step (columns jumped
-  ~1,000 km); plain Jacobi and ρ = 0.999 or 0.99 are stable. The two-plate world uses
-  0.999. Decide a general rule (a safety on the derived ρ, or restarts when a cap
-  changes).
+- **Chebyshev ρ, settled (5.2):** derived, capped by the iteration budget and at
+  0.999, with a warm start. Open: the ceiling is one strip; a solve for the slow modes
+  (a coarse level, 9.3) would make the budget cap unnecessary.
 - **Breakup criterion:** volume-mixed composition crosses into oceanic only at
   β ≈ 10 (a continent stretched 1% per step starts melting at β = 2.15 and crosses at
   10.6, with 6.6 km of crust); real margins break at β ≈ 3–5. Key breakup on the melt's

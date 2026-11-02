@@ -97,6 +97,30 @@ fn crust_clear_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 }
 
+// Problem size (simulation.js): every per-particle and per-edge kernel is
+// dispatched over the slots below the high-water marks, not the capacity.
+// solver_find_high rebuilds the marks from scratch (after a load or restore,
+// dispatched over the full capacity); solver_dispatch_sizes turns them into
+// indirect dispatch arguments and the draw instance count.
+@compute @workgroup_size(64)
+fn solver_find_high(@builtin(global_invocation_id) id: vec3<u32>) {
+    if (id.x < sim.max_particles && particles[id.x].is_active != 0u) { note_particle_slot(id.x); }
+    if (id.x < sim.max_edges && edges[id.x].is_active != 0u) { note_edge_slot(id.x); }
+}
+
+@compute @workgroup_size(1)
+fn solver_dispatch_sizes() {
+    let p = atomicLoad(&solver.particle_high);
+    let e = atomicLoad(&solver.edge_high);
+    solver.dispatch[0] = max((p + 63u) / 64u, 1u);
+    solver.dispatch[1] = 1u;
+    solver.dispatch[2] = 1u;
+    solver.dispatch[3] = max((e + 63u) / 64u, 1u);
+    solver.dispatch[4] = 1u;
+    solver.dispatch[5] = 1u;
+    solver.draw_instances = p;
+}
+
 @compute @workgroup_size(1)
 fn solver_begin() {
     solver.iteration = 0u;
@@ -107,38 +131,19 @@ fn solver_next_iteration() {
     solver.iteration += 1u;
 }
 
-// Chebyshev semi-iterative acceleration (Wang 2015): with x^ the result of
-// one plain sweep from x_k,  x_{k+1} = omega_k (x^ - x_{k-1}) + x_{k-1}.
-// The multipliers get the same combination in crust_solve_edges, so
-// x - x~ stays consistent with lambda.
+
+// Warm start: positions consistent with the starting multipliers (edges_law),
+// x = x~ + W B^T lambda_0, so the solve begins from last step's forces.
 @compute @workgroup_size(64)
-fn crust_chebyshev_combine(@builtin(global_invocation_id) id: vec3<u32>) {
-    let idx = id.x;
-    if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
-    let omega = chebyshev_omega();
-    var x = particles[idx].predicted_pos;
-    if (omega != 1.0) {
-        let prev = particles[idx].iter_prev.xyz;
-        x = vec4f(normalize(omega * (x.xyz - prev) + prev), 1.0);
-        particles[idx].predicted_pos = x;
-    }
-    // Tangential rows (phase G) are plain Jacobi: their position corrections
-    // are added after the extrapolation, and spins and their multipliers are
-    // not extrapolated, so each subsystem stays consistent with its
-    // multipliers. (Extrapolating them with the normal rows' weights slows
-    // them: for rho near 1, Chebyshev converges every mode at the slow rate.)
-    // The previous iterate is shifted by the same correction, so the next
-    // extrapolation sees only the normal rows' progress (no momentum is given
-    // to the tangential corrections).
-    let td = vec3f(f32(atomicLoad(&particle_deltas[idx].tdx)), f32(atomicLoad(&particle_deltas[idx].tdy)), f32(atomicLoad(&particle_deltas[idx].tdz))) / FIXED_POINT;
-    var prev = particles[idx].iter_start;
-    if (any(td != vec3f(0.0))) {
-        x = vec4f(normalize(x.xyz + td), 1.0);
-        particles[idx].predicted_pos = x;
-        prev = vec4f(normalize(prev.xyz + td), 1.0);
-    }
-    particles[idx].iter_prev = prev;
-    particles[idx].iter_start = x;
+fn crust_warm_start(@builtin(global_invocation_id) id: vec3<u32>) {
+    let e = id.x;
+    if (e >= sim.max_edges || edges[e].is_active == 0u || edges[e].lambda == 0.0) { return; }
+    let pA = edges[e].particle_a;
+    let pB = edges[e].particle_b;
+    let dir = edge_offset(pA, pB, particles[pA].predicted_pos.xyz, particles[pB].predicted_pos.xyz);
+    let n = dir / max(length(dir), 1e-6);
+    add_delta(pA, -inverse_drag(pA) * edges[e].lambda * n, 0i);
+    add_delta(pB, inverse_drag(pB) * edges[e].lambda * n, 0i);
 }
 
 // One XPBD update per edge on its linearised law (edges_law, law.wgsl):
@@ -157,7 +162,7 @@ fn crust_chebyshev_combine(@builtin(global_invocation_id) id: vec3<u32>) {
 // gradients -t, +t on the positions and -l_a, -l_b on the spins, spins
 // weighted by the inverse spin drag; clamped to the shear caps. Then the face
 // moment: C_r = spin_b - spin_a - reference_r, clamped by the kern rule.
-// Both are plain Jacobi (not extrapolated; crust_chebyshev_combine).
+// Both are plain Jacobi (not extrapolated).
 @compute @workgroup_size(64)
 fn crust_solve_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     let c_idx = id.x;
@@ -175,15 +180,18 @@ fn crust_solve_edges(@builtin(global_invocation_id) id: vec3<u32>) {
     let wA = inverse_drag(pA);
     let wB = inverse_drag(pB);
     let degree = f32(max(max(particles[pA].edge_count, particles[pB].edge_count), 1u));
-    var dlambda = (-C - alpha * c.lambda) / (wA + wB + alpha) / degree;
+    let dlambda = (-C - alpha * c.lambda) / (wA + wB + alpha) / degree;
+    // Chebyshev extrapolation of the multiplier, clamped to the caps; the
+    // positions move by exactly the change applied, so x - x~ = W B^T lambda
+    // holds at every iteration, clamped or not (design 5.2).
     let omega = chebyshev_omega();
     let lambda = clamp(omega * (c.lambda + dlambda - c.lambda_prev) + c.lambda_prev, c.lambda_min, c.lambda_max);
-    dlambda = clamp(c.lambda + dlambda, c.lambda_min, c.lambda_max) - c.lambda;
+    let applied = lambda - c.lambda;
     edges[c_idx].lambda = lambda;
     edges[c_idx].lambda_prev = c.lambda;
 
-    add_delta(pA, -wA * dlambda * n, 0i);
-    add_delta(pB, wB * dlambda * n, 0i);
+    add_delta(pA, -wA * applied * n, 0i);
+    add_delta(pB, wB * applied * n, 0i);
 
     if (c.stiffness_t <= 0.0 && c.stiffness_r <= 0.0) { return; }
     let sA = inverse_spin_drag(pA);
@@ -220,8 +228,11 @@ fn crust_solve_edges(@builtin(global_invocation_id) id: vec3<u32>) {
 fn crust_apply_deltas(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
-    // Edge corrections arrive already scaled (dlambda / degree) and are applied in full.
-    let sum = vec3f(f32(atomicLoad(&particle_deltas[idx].dx)), f32(atomicLoad(&particle_deltas[idx].dy)), f32(atomicLoad(&particle_deltas[idx].dz)));
+    // Edge corrections arrive already scaled (dlambda / degree) and are applied
+    // in full: the normal rows' (from the Chebyshev-extrapolated multipliers)
+    // and the tangential rows' (plain Jacobi; their own accumulator).
+    let sum = vec3f(f32(atomicLoad(&particle_deltas[idx].dx)), f32(atomicLoad(&particle_deltas[idx].dy)), f32(atomicLoad(&particle_deltas[idx].dz)))
+        + vec3f(f32(atomicLoad(&particle_deltas[idx].tdx)), f32(atomicLoad(&particle_deltas[idx].tdy)), f32(atomicLoad(&particle_deltas[idx].tdz)));
     if (any(sum != vec3f(0.0))) {
         particles[idx].predicted_pos = vec4f(normalize(particles[idx].predicted_pos.xyz + sum / FIXED_POINT), 1.0);
     }

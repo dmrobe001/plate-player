@@ -28,7 +28,7 @@ struct ParticleDelta {
     cell_nbr: array<u32, 12>,
     cell_coef: array<f32, 12>,
     // Position corrections from tangential rows (phase G), kept apart: they
-    // are not extrapolated by Chebyshev (crust_chebyshev_combine, solver.wgsl).
+    // are not extrapolated by Chebyshev (crust_solve_edges, solver.wgsl).
     tdx: atomic<i32>, tdy: atomic<i32>, tdz: atomic<i32>, pad4: u32,
     // Load of the slabs hanging from this column, N, as f32 bits (atomic_add_f32);
     // copied to Particle.child_load and cleared at the end of the step.
@@ -49,12 +49,17 @@ struct ParticleDelta {
 // cells that touched their clip polygon (coverage not exact there), the crust
 // volume budget (design 4.8) as two 64-bit fixed-point sums (lo, hi words;
 // VOLUME_FIXED units per km x unit-sphere area), continental breakups; then
-// the Chebyshev weight for each iteration (written by simulation.js; see
-// chebyshevWeights).
+// slot high-water marks (one past the highest particle / edge slot ever
+// used; the free lists hand out the lowest free slot first, so these track
+// the live problem size) and the indirect dispatch sizes and draw instance
+// count made from them (solver_dispatch_sizes); then the Chebyshev weight for
+// each iteration (written by simulation.js; see chebyshevWeights).
 struct SolverState {
     iteration: u32, edge_pool_empty: atomic<u32>, slot_overflow: atomic<u32>, clipped_cells: atomic<u32>,
     budget: array<atomic<u32>, 4>,   // source lo, hi; sink lo, hi
-    breakups: atomic<u32>, slabs_lost: atomic<u32>, pad10: u32, pad11: u32,
+    breakups: atomic<u32>, slabs_lost: atomic<u32>, particle_high: atomic<u32>, edge_high: atomic<u32>,
+    dispatch: array<u32, 6>,   // workgroups x, y, z over particle slots, then over edge slots
+    draw_instances: u32, pad19: u32,
     omega: array<f32>,
 }
 const BUDGET_SOURCE: u32 = 0u;
@@ -84,6 +89,10 @@ fn add_budget(slot: u32, v: f32) {
     let carry = select(0u, 1u, old + lo < old);
     if (hi > 0.0 || carry > 0u) { atomicAdd(&solver.budget[slot + 1u], u32(hi) + carry); }
 }
+
+// A slot handed out by a free list: raise the high-water mark.
+fn note_particle_slot(i: u32) { atomicMax(&solver.particle_high, i + 1u); }
+fn note_edge_slot(e: u32) { atomicMax(&solver.edge_high, e + 1u); }
 
 fn chebyshev_omega() -> f32 {
     return solver.omega[min(solver.iteration, arrayLength(&solver.omega) - 1u)];

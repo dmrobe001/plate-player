@@ -128,6 +128,15 @@ fn edges_law(@builtin(global_invocation_id) id: vec3<u32>) {
     edges[e].reference_gap = c.length - S0 / keff * rest - rest;
     edges[e].lambda_min = -scale * stens;
     edges[e].lambda_max = scale * scomp;
+    // Warm start (design 5.2): the force this edge applied in last step's
+    // solve (edges_maxwell keeps it, MPa km), as this step's multiplier,
+    // within the caps; crust_warm_start moves the positions to match. So the
+    // solve starts from last step's motion relative to the mantle. (Not from
+    // the stored stress: positions moved by that are an explicit Euler step of
+    // the stiff edges, which amplifies whatever a short solve left unconverged.)
+    let warm = select(0.0, clamp(scale * c.lambda, -scale * stens, scale * scomp), sim.solver_warm_start != 0u);
+    edges[e].lambda = warm;
+    edges[e].lambda_prev = warm;
     edges[e].overlap_km = s.overlap;
 
     // Tangential channel and face moment (linearizeShear, linearizeRolling in
@@ -201,6 +210,10 @@ fn edges_maxwell(@builtin(global_invocation_id) id: vec3<u32>) {
         w_sum += w;
         wt_sum += w * s.temp[k];
     }
+    // The force this step's solve applied, MPa km (+ push), kept for the
+    // next step's warm start (edges_law): lambda / scale, the inverse of the
+    // caps' scaling.
+    edges[e].lambda = c.lambda * E * sim.stiffness_reference_km / (sim.bond_rate_myr_inv * sim.dt_crust_myr * rest);
     edges[e].length = len;
     edges[e].direction_x = offset.x;
     edges[e].direction_y = offset.y;

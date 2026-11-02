@@ -1,7 +1,7 @@
 // Draws the mantle sphere, crust particles and per-column force and stress
 // arrows from the simulation buffers.
 
-import { CAPACITY, structsWGSL } from '../sim/simulation.js';
+import { SOLVER_HEADER, structsWGSL } from '../sim/simulation.js';
 import { createShaderModule } from '../gpu/device.js';
 import { SLOTS } from '../gpu/layout.js';
 
@@ -20,6 +20,12 @@ export class Renderer {
     this.indexCount = sim.icosphere.indices.length;
     this.depthTexture = null;
 
+    // Instanced draws over the particle slots in use: each frame the instance
+    // count is copied from the solver header (solver_dispatch_sizes) into these
+    // indirect arguments (vertex count, instance count, first vertex, first instance).
+    this.drawVertices = { discs: 6, stress: 36, velocity: 18, force: 9 };
+    this.drawArgs = device.createBuffer({ label: 'draw arguments', size: 16 * 4, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(this.drawArgs, 0, Uint32Array.from(Object.values(this.drawVertices).flatMap((v) => [v, 0, 0, 0])));
     this.indexBuffer = device.createBuffer({ size: sim.icosphere.indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(this.indexBuffer, 0, sim.icosphere.indices);
     this.viewBuffer = device.createBuffer({ size: VIEW_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
@@ -77,6 +83,9 @@ export class Renderer {
   encodeDraw(encoder, view) {
     const colorTexture = this.context.getCurrentTexture();
     this.#ensureDepth(colorTexture.width, colorTexture.height);
+    for (let k = 0; k < Object.keys(this.drawVertices).length; k++) {
+      encoder.copyBufferToBuffer(this.sim.buffers.solver, 4 * SOLVER_HEADER.drawInstances, this.drawArgs, 16 * k + 4, 4);
+    }
 
     const f = new Float32Array(this.viewData);
     const u = new Uint32Array(this.viewData);
@@ -110,20 +119,14 @@ export class Renderer {
     pass.drawIndexed(this.indexCount);
     // One instanced quad per particle; arrows per particle (9 vertices for the
     // force, 36 for the two principal axes).
-    pass.setPipeline(this.pipelines.discs);
-    pass.draw(6, CAPACITY.maxParticles);
-    if (view.showStress) {
-      pass.setPipeline(this.pipelines.stress);
-      pass.draw(36, CAPACITY.maxParticles);
-    }
-    if (view.showVelocity) {
-      pass.setPipeline(this.pipelines.velocity);
-      pass.draw(18, CAPACITY.maxParticles);
-    }
-    if (view.showForce) {
-      pass.setPipeline(this.pipelines.force);
-      pass.draw(9, CAPACITY.maxParticles);
-    }
+    const draw = (name) => {
+      pass.setPipeline(this.pipelines[name]);
+      pass.drawIndirect(this.drawArgs, 16 * Object.keys(this.drawVertices).indexOf(name));
+    };
+    draw('discs');
+    if (view.showStress) draw('stress');
+    if (view.showVelocity) draw('velocity');
+    if (view.showForce) draw('force');
     pass.end();
   }
 }

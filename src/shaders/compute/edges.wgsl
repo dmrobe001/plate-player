@@ -57,7 +57,11 @@ fn pop_edge() -> u32 {
     loop {
         if (n == 0u) { return NONE; }
         let r = atomicCompareExchangeWeak(&edge_pool.counter, n, n - 1u);
-        if (r.exchanged) { return edge_pool.indices[n - 1u]; }
+        if (r.exchanged) {
+            let e = edge_pool.indices[n - 1u];
+            note_edge_slot(e);
+            return e;
+        }
         n = r.old_value;
     }
 }
@@ -127,8 +131,7 @@ fn edges_prune(@builtin(global_invocation_id) id: vec3<u32>) {
         release(false, e);
         return;
     }
-    edges[e].lambda = 0.0;
-    edges[e].lambda_prev = 0.0;
+    // (lambda holds last step's force for the warm start: edges_law.)
     edges[e].lambda_t = 0.0;
     edges[e].lambda_r = 0.0;
     list_edge(a, e);
@@ -230,6 +233,4 @@ fn edges_finish(@builtin(global_invocation_id) id: vec3<u32>) {
         if (particles[other_end(ids[k], idx)].state == 2u) { slabs++; }
     }
     particles[idx].slab_neighbours = slabs;
-    particles[idx].iter_start = particles[idx].predicted_pos;
-    particles[idx].iter_prev = particles[idx].predicted_pos;
 }

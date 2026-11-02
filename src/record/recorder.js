@@ -88,18 +88,18 @@ export class Recorder {
     if (!fields && !snapshot) return;
     snap ??= await this.sim.snapshot(); // one readback serves both tiers
     if (snapshot) this.snapshots.push(snap);
-    if (fields) this.samples.push({ step: snap.step, timeMyr: snap.timeMyr, fields: this.#sampleFields(snap.buffers) });
+    if (fields) this.samples.push({ step: snap.step, timeMyr: snap.timeMyr, fields: this.#sampleFields(snap.buffers, snap.counts) });
   }
 
-  #sampleFields(buffers) {
+  #sampleFields(buffers, counts) {
     const P = unpack(Particle, buffers.particles, CAPACITY.maxParticles);
-    const E = unpack(Edge, buffers.edges, CAPACITY.maxEdges);
+    const E = unpack(Edge, buffers.edges, counts?.edges ?? CAPACITY.maxEdges); // (edge slots in use)
     const params = this.sim.params;
 
     // Mean integrity of the active edges at each particle.
     const integritySum = new Float32Array(CAPACITY.maxParticles);
     const edgeCount = new Uint16Array(CAPACITY.maxParticles);
-    for (let k = 0; k < CAPACITY.maxEdges; k++) {
+    for (let k = 0; k < E.is_active.length; k++) {
       if (!E.is_active[k]) continue;
       for (const p of [E.particle_a[k], E.particle_b[k]]) { integritySum[p] += E.integrity[k]; edgeCount[p]++; }
     }

@@ -368,9 +368,9 @@ implementation of WebGPU, so results don't depend on your graphics card; set
 canvas, so the browser runs with a window; on a machine with no display (a server,
 CI), run `xvfb-run -a npm run test:gpu`.
 
-**Keep GPU tests small.** Under SwiftShader every dispatch costs in proportion to
-buffer *capacity*, not to how many particles are alive, and every readback takes
-~0.5 s. A planet page (25 000 particle slots) steps in ~0.4 s and takes a minute to
+**Keep GPU tests small.** Under SwiftShader buffers, load-time scans and full
+readbacks cost in proportion to buffer *capacity* (steps are sized to the slots in
+use), and every readback takes ~0.5 s. A planet page (25 000 particle slots) steps in ~0.4 s and takes a minute to
 open; an empty page with 1024 slots steps in ~0.2 s and opens in a few seconds. So
 mechanism tests load a hand-built state into a small empty page, write inputs
 straight into GPU buffers, and read back only when they must check something.
@@ -505,7 +505,13 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       solver residual at 70 GPa, spurious yield). Chebyshev acceleration with 32
       iterations brings it to ~3 MPa with no spurious yield (design.md §5.2).
 - [x] ~~Long steps tripped the browser's GPU watchdog.~~ Steps are submitted in
-      pieces of 16 solver iterations, waiting for each.
+      pieces of about 10⁶ thread launches (at least 16 solver iterations), waiting
+      for each; a small world does a step in one piece.
+- [x] ~~The derived Chebyshev ρ diverged under concentrated slab pull, and 32
+      iterations left the two-plate world 10× out of balance.~~ Positions now follow
+      the extrapolated multipliers, each solve is warm-started from the last step's
+      edge forces, and ρ is capped by what the iteration budget can use: 32
+      iterations do what 256 did (design.md §5.2).
 - [x] ~~Growth recreated bond/contact conflicts~~ (a growing particle's bonds
       kept their rest length while collisions pushed to the new apothem sum). A
       bond's rest length is now *always* the sum of its particles' apothems,
@@ -577,9 +583,10 @@ Ordered roughly by how much each item affects the plausibility of generated worl
 **Performance**
 - [x] ~~`nearest_node` brute force over all mantle nodes.~~ Each particle caches
       its node and updates it by a greedy walk over the icosphere (`locate.wgsl`).
-- [ ] Every dispatch covers the full capacity (25 000 particles, 131 072 edges)
-      regardless of how many are active. An indirect dispatch on the live count
-      would help.
+- [x] ~~Every dispatch covered the full capacity (25 000 particles, 131 072 edges)
+      regardless of how many were active.~~ Free lists hand out the lowest slot
+      first; dispatches, draws and snapshot readbacks are sized to the high-water
+      marks (indirect), so a 162-column world no longer costs what a 10k one does.
 - [ ] Neighbour-search hash cells (3/32 ≈ 0.094) are about 2.7× the edge range;
       cells ≈ edge range would scan about 10× fewer candidates.
 - [ ] Decouple simulation steps from display frames (fixed steps per frame, or a

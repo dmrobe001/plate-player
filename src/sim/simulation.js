@@ -37,14 +37,19 @@ const MAX_SOLVER_ITERATIONS = 1024; // size of the Chebyshev weight table
  * bindings.wgsl): counters since load. Volume sums are 64-bit fixed point.
  */
 export const SOLVER_HEADER = {
-  words: 12, edgePoolEmpty: 1, slotOverflow: 2, clippedCells: 3, source: 4, sink: 6, breakups: 8, slabsLost: 9, volumeFixed: 1e12,
+  words: 20, edgePoolEmpty: 1, slotOverflow: 2, clippedCells: 3, source: 4, sink: 6, breakups: 8, slabsLost: 9,
+  particleHigh: 10, edgeHigh: 11, dispatch: 12, drawInstances: 18, volumeFixed: 1e12,
 };
 const WORKGROUP = 64;
-// Solver iterations per GPU submission. Long stretches of GPU work can exceed
-// the browser's GPU watchdog on slow GPUs (the device is then lost), so a
-// step with many iterations is submitted in pieces, waiting for each.
-const ITERATIONS_PER_SUBMIT = 16;
-const FLEXURE_ITERATIONS_PER_SUBMIT = 64;
+// GPU submissions. Long stretches of GPU work can exceed the browser's GPU
+// watchdog on slow GPUs (the device is then lost), so a step with many solver
+// (or flexure) iterations is submitted in pieces, waiting for each. A piece
+// holds about WORK_PER_SUBMIT thread launches: at the default resolution
+// (~10k columns, ~40k edges) that is the 16 iterations that were always safe;
+// a coarse world (162 columns) does its whole step in one piece.
+const WORK_PER_SUBMIT = 1_000_000;
+const MIN_ITERATIONS_PER_SUBMIT = 16;
+const MIN_FLEXURE_ITERATIONS_PER_SUBMIT = 64;
 
 /** Buffers that together are the complete simulation state (snapshot / restore). */
 // (Slot lists in `deltas` are an index rebuilt every step, not state.)
@@ -85,7 +90,15 @@ export class Simulation {
       profiles: device.createBuffer({ label: 'column profiles (derived)', size: maxParticles * ColumnProfile.byteSize, usage: S }),
       plateIds: device.createBuffer({ label: 'plate ids (drawing only)', size: maxParticles * 4, usage: S }),
       params: device.createBuffer({ label: 'sim params', size: SIM_PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+      // Indirect dispatch sizes over the particle and edge slots in use, copied
+      // from the solver header (solver_dispatch_sizes) between passes: a buffer
+      // bound writable in a dispatch cannot also be its indirect argument.
+      dispatchArgs: device.createBuffer({ label: 'dispatch sizes', size: 6 * 4, usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST }),
     };
+    // Lagged readback of the high-water marks, for sizing submissions only.
+    this.highWater = { particles: 0, edges: 0 };
+    this.highWaterStaging = device.createBuffer({ label: 'high-water readback', size: 8, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+    this.highWaterPending = false;
 
     const adjacency = new Uint32Array(this.numNodes * adjacencyWidth).fill(NONE);
     icosphere.neighbours.forEach((list, i) => adjacency.set(list.slice(0, adjacencyWidth), i * adjacencyWidth));
@@ -120,7 +133,7 @@ export class Simulation {
     if (this.params.hash_grid_dim > CAPACITY.hashGridDim) throw new Error(`hash_grid_dim > ${CAPACITY.hashGridDim}`);
     if (this.params.solver_iterations > MAX_SOLVER_ITERATIONS) throw new Error(`solver_iterations > ${MAX_SOLVER_ITERATIONS}`);
     this.device.queue.writeBuffer(this.buffers.params, 0, packSimParams(this.params));
-    const rho = this.params.chebyshev_rho < 0 ? jacobiSpectralRadius(this.params) : this.params.chebyshev_rho;
+    const rho = this.params.chebyshev_rho < 0 ? chebyshevRho(this.params) : this.params.chebyshev_rho;
     this.chebyshevRho = rho;
     const omega = chebyshevWeights(rho, this.params.chebyshev_delay, MAX_SOLVER_ITERATIONS);
     this.device.queue.writeBuffer(this.buffers.solver, 4 * SOLVER_HEADER.words, omega);
@@ -163,7 +176,8 @@ export class Simulation {
       'crust_predict', 'crust_hash_clear', 'crust_hash_build',
       'edges_begin', 'edges_prune', 'edges_note_listed', 'edges_create', 'edges_finish', 'edges_law', 'edges_maxwell',
       'columns_hinge',
-      'solver_begin', 'solver_next_iteration', 'crust_chebyshev_combine',
+      'solver_find_high', 'solver_dispatch_sizes',
+      'solver_begin', 'solver_next_iteration', 'crust_warm_start',
       'crust_clear_deltas', 'crust_solve_edges', 'crust_apply_deltas',
       'crust_integrate',
     ];
@@ -269,7 +283,8 @@ export class Simulation {
     // Free lists hold every slot not used by the initial state.
     device.queue.writeBuffer(buffers.particlePool, 0, freeList(P.count, maxParticles));
     device.queue.writeBuffer(buffers.edgePool, 0, freeList(B.count, maxEdges));
-    device.queue.writeBuffer(buffers.solver, 0, new Uint32Array(SOLVER_HEADER.words)); // iteration and counters since load
+    device.queue.writeBuffer(buffers.solver, 0, new Uint32Array(SOLVER_HEADER.words)); // iteration and counters since load (high-water marks: refresh pass)
+    this.highWater = { particles: P.count, edges: B.count };
     this.steps = 0;
     this.timeMyr = 0;
 
@@ -294,8 +309,42 @@ export class Simulation {
     // Again, now that every elevation is set (pressures include the water load).
     pass.setPipeline(this.pipelines.column_profile);
     pass.dispatchWorkgroups(Math.ceil(maxParticles / WORKGROUP));
+    this.#encodeFindHigh(pass);
     pass.end();
+    this.#encodeCopySizes(encoder);
     device.queue.submit([encoder.finish()]);
+  }
+
+  /** Rebuild the high-water marks by scanning every slot, then the dispatch sizes. */
+  #encodeFindHigh(pass) {
+    const { maxParticles, maxEdges } = CAPACITY;
+    pass.setPipeline(this.pipelines.solver_find_high);
+    pass.dispatchWorkgroups(Math.ceil(Math.max(maxParticles, maxEdges) / WORKGROUP));
+    pass.setPipeline(this.pipelines.solver_dispatch_sizes);
+    pass.dispatchWorkgroups(1);
+  }
+
+  /** Copy the dispatch sizes from the solver header to the indirect-argument buffer (outside a pass). */
+  #encodeCopySizes(encoder) {
+    encoder.copyBufferToBuffer(this.buffers.solver, 4 * SOLVER_HEADER.dispatch, this.buffers.dispatchArgs, 0, 6 * 4);
+  }
+
+  /**
+   * Read the high-water marks back without waiting (one readback in flight).
+   * They size the submissions (watchdog), so a step or two of lag is fine.
+   */
+  #pollHighWater() {
+    if (this.highWaterPending) return;
+    this.highWaterPending = true;
+    const { device } = this;
+    const encoder = device.createCommandEncoder();
+    encoder.copyBufferToBuffer(this.buffers.solver, 4 * SOLVER_HEADER.particleHigh, this.highWaterStaging, 0, 8);
+    device.queue.submit([encoder.finish()]);
+    this.highWaterStaging.mapAsync(GPUMapMode.READ).then(() => {
+      const [particles, edges] = new Uint32Array(this.highWaterStaging.getMappedRange());
+      this.highWater = { particles, edges };
+      this.highWaterStaging.unmap();
+    }).catch(() => {}).finally(() => { this.highWaterPending = false; });
   }
 
   /** Copy the mantle's current flow into the GPU grid (positions, velocity, buoyancy, divergence). */
@@ -322,29 +371,53 @@ export class Simulation {
     if (this.mantle.advanceTo(this.timeMyr)) this.uploadMantle();
 
     const { device } = this;
-    const { maxParticles, maxEdges, hashGridDim } = CAPACITY;
     const groups = (n) => Math.ceil(n / WORKGROUP);
-    const crust = groups(maxParticles), cells = groups(hashGridDim ** 3), edges = groups(maxEdges);
+    const cells = groups(this.params.hash_grid_dim ** 3);
+    // Per-particle and per-edge kernels run over the slots in use (the
+    // high-water marks), as indirect dispatches; see resize().
+    const crust = 'particles', edges = 'edges';
     this.#writeTime();
 
+    // Submission sizes from the (lagged) problem size; 1.5x for growth since.
+    const P = 1.5 * Math.max(this.highWater.particles, 1), E = 1.5 * Math.max(this.highWater.edges, 1);
+    const iterationsPerSubmit = Math.max(MIN_ITERATIONS_PER_SUBMIT, Math.floor(WORK_PER_SUBMIT / (3 * P + E)));
+    const flexurePerSubmit = Math.max(MIN_FLEXURE_ITERATIONS_PER_SUBMIT, Math.floor(WORK_PER_SUBMIT / (2 * P)));
+
     let encoder, pass;
-    const open = () => {
-      encoder = device.createCommandEncoder();
+    const beginPass = () => {
       pass = encoder.beginComputePass({ label: 'simulation step' });
       pass.setBindGroup(0, this.memoryBindGroup);
       pass.setBindGroup(1, this.uniformBindGroup);
+    };
+    const open = () => {
+      encoder = device.createCommandEncoder();
+      beginPass();
     };
     const submit = () => {
       pass.end();
       device.queue.submit([encoder.finish()]);
     };
-    const run = (name, count) => { pass.setPipeline(this.pipelines[name]); pass.dispatchWorkgroups(count); };
+    const run = (name, count) => {
+      pass.setPipeline(this.pipelines[name]);
+      if (count === crust) pass.dispatchWorkgroupsIndirect(this.buffers.dispatchArgs, 0);
+      else if (count === edges) pass.dispatchWorkgroupsIndirect(this.buffers.dispatchArgs, 12);
+      else pass.dispatchWorkgroups(count);
+    };
+    // New dispatch sizes after slots were handed out (splits, new edges).
+    const resize = () => {
+      run('solver_dispatch_sizes', 1);
+      pass.end();
+      this.#encodeCopySizes(encoder);
+      beginPass();
+    };
     open();
+    resize();
 
     run('crust_locate', crust);
 
     // Splits (design 4.8), on last step's cells.
     run('columns_split', crust);
+    resize();
     run('crust_commit_splits', 1);
     run('crust_rewire_edges', edges);
     run('crust_clean_split', crust);
@@ -367,7 +440,7 @@ export class Simulation {
     // Surface elevations: Winkler isostasy with plate bending (design 4.3, 4.4).
     run('columns_flexure_begin', crust);
     for (let i = 0; i < this.params.flexure_iterations; i++) {
-      if (i > 0 && i % FLEXURE_ITERATIONS_PER_SUBMIT === 0) {
+      if (i > 0 && i % flexurePerSubmit === 0) {
         submit();
         await device.queue.onSubmittedWorkDone();
         open();
@@ -383,12 +456,18 @@ export class Simulation {
     run('edges_prune', edges);       // drop pairs out of range; list survivors; reset lambda
     run('edges_note_listed', crust);
     run('edges_create', crust);      // new pairs in range
+    resize();
     run('edges_finish', crust);      // edge counts, angle-sorted slots, solver iterates
     run('columns_gpe_force', crust); // GPE push into the predicted positions (design 4.6)
     run('columns_hinge', crust);     // trench hinges: bend, subduction, slab pull (design 6)
-    run('edges_law', edges);         // this step's linear force law and caps (design 4.5)
+    run('edges_law', edges);         // this step's linear force law and caps (design 4.5); warm-start multipliers
+    if (this.params.solver_iterations > 0) { // (0: no solve, positions stay predicted)
+      run('crust_clear_deltas', crust);
+      run('crust_warm_start', edges);  // positions to match the warm-start multipliers (design 5.2)
+      run('crust_apply_deltas', crust);
+    }
     for (let i = 0; i < this.params.solver_iterations; i++) {
-      if (i > 0 && i % ITERATIONS_PER_SUBMIT === 0) {
+      if (i > 0 && i % iterationsPerSubmit === 0) {
         submit();
         await device.queue.onSubmittedWorkDone();
         open();
@@ -396,7 +475,6 @@ export class Simulation {
       run('crust_clear_deltas', crust);
       run('crust_solve_edges', edges);
       run('crust_apply_deltas', crust);
-      run('crust_chebyshev_combine', crust);
       run('solver_next_iteration', 1);
     }
     run('crust_clear_deltas', crust);
@@ -404,6 +482,7 @@ export class Simulation {
     run('columns_flow', crust);      // volumetric flow at fixed crust volume (design 4.7)
     run('crust_integrate', crust);
     submit();
+    this.#pollHighWater();
     this.steps++;
     this.timeMyr += this.params.dt_crust_myr;
   }
@@ -434,34 +513,57 @@ export class Simulation {
     this.device.queue.writeBuffer(this.buffers.plateIds, 0, ids);
   }
 
-  /** Copy named GPU buffers to the CPU. Resolves to {name: ArrayBuffer}. */
-  async readBuffers(names) {
+  /**
+   * Copy named GPU buffers to the CPU. Resolves to {name: ArrayBuffer}, each
+   * the buffer's full size. `prefix` (bytes per name) copies only the start
+   * of a buffer; the rest reads as zeros.
+   */
+  async readBuffers(names, prefix = {}) {
     const { device } = this;
     const encoder = device.createCommandEncoder();
     const staging = names.map((name) => {
       const src = this.buffers[name];
-      const dst = device.createBuffer({ size: src.size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-      encoder.copyBufferToBuffer(src, 0, dst, 0, src.size);
+      const size = Math.max(4, Math.min(src.size, prefix[name] ?? src.size));
+      const dst = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+      encoder.copyBufferToBuffer(src, 0, dst, 0, size);
       return dst;
     });
     device.queue.submit([encoder.finish()]);
     await Promise.all(staging.map((b) => b.mapAsync(GPUMapMode.READ)));
     const out = {};
     names.forEach((name, i) => {
-      out[name] = staging[i].getMappedRange().slice(0);
+      const src = staging[i].getMappedRange();
+      if (src.byteLength === this.buffers[name].size) out[name] = src.slice(0);
+      else {
+        out[name] = new ArrayBuffer(this.buffers[name].size);
+        new Uint8Array(out[name]).set(new Uint8Array(src));
+      }
       staging[i].destroy();
     });
     return out;
   }
 
-  /** Complete state: raw buffers plus the CPU-side counters. Restoring it resumes exactly. */
+  /** Slots in use: one past the highest particle and edge slot ever handed out (exact; waits for the GPU). */
+  async slotsInUse() {
+    const h = new Uint32Array((await this.readBuffers(['solver'], { solver: 4 * SOLVER_HEADER.words })).solver, 0, SOLVER_HEADER.words);
+    return { particles: h[SOLVER_HEADER.particleHigh], edges: h[SOLVER_HEADER.edgeHigh] };
+  }
+
+  /**
+   * Complete state: raw buffers plus the CPU-side counters. Restoring it
+   * resumes exactly. Only the slots in use are read from the GPU (the rest
+   * are zeros); `counts` says how many, for consumers that loop over slots.
+   */
   async snapshot() {
+    const counts = await this.slotsInUse();
+    const prefix = { particles: counts.particles * Particle.byteSize, edges: counts.edges * Edge.byteSize };
     return {
       step: this.steps,
       timeMyr: this.timeMyr,
       overrides: { ...this.overrides },
       mantle: this.mantle.getState(),
-      buffers: await this.readBuffers(STATE_BUFFERS),
+      buffers: await this.readBuffers(STATE_BUFFERS, prefix),
+      counts,
     };
   }
 
@@ -472,8 +574,23 @@ export class Simulation {
       if (data.byteLength !== this.buffers[name].size) {
         throw new Error(`snapshot buffer ${name} has ${data.byteLength} bytes, expected ${this.buffers[name].size}`);
       }
-      this.device.queue.writeBuffer(this.buffers[name], 0, data);
+      // (Free lists re-sorted lowest-slot-first: records made before the order changed.)
+      this.device.queue.writeBuffer(this.buffers[name], 0, name === 'particlePool' || name === 'edgePool' ? sortFreeList(data) : data);
     }
+    // High-water marks from a scan of the restored slots.
+    this.device.queue.writeBuffer(this.buffers.solver, 4 * SOLVER_HEADER.particleHigh, new Uint32Array(2));
+    {
+      const encoder = this.device.createCommandEncoder();
+      const pass = encoder.beginComputePass({ label: 'restore: high-water marks' });
+      pass.setBindGroup(0, this.memoryBindGroup);
+      pass.setBindGroup(1, this.uniformBindGroup);
+      this.#encodeFindHigh(pass);
+      pass.end();
+      this.#encodeCopySizes(encoder);
+      this.device.queue.submit([encoder.finish()]);
+    }
+    this.highWater = { particles: CAPACITY.maxParticles, edges: CAPACITY.maxEdges }; // until the first poll
+    this.#pollHighWater();
     this.steps = snap.step;
     this.timeMyr = snap.timeMyr;
     if (snap.mantle.kind === 'kinematic' && this.mantle.kind !== 'kinematic') this.mantle = new KinematicMantle(snap.mantle.options, this.mantleMesh);
@@ -483,11 +600,22 @@ export class Simulation {
   }
 }
 
+// A free list is a stack (pops take the top, indices[counter - 1]). Stacked
+// highest first, so the lowest free slot is handed out first and the slots
+// in use stay packed below the high-water marks.
 function freeList(used, capacity) {
   const data = new Uint32Array(FREE_LIST_HEADER_WORDS + capacity);
   let n = 0;
-  for (let i = used; i < capacity; i++) data[FREE_LIST_HEADER_WORDS + n++] = i;
+  for (let i = capacity - 1; i >= used; i--) data[FREE_LIST_HEADER_WORDS + n++] = i;
   data[0] = n;
+  return data;
+}
+
+/** A free list's buffer with its stack re-sorted highest first (as freeList). */
+function sortFreeList(buffer) {
+  const data = new Uint32Array(buffer.slice(0));
+  const stack = data.subarray(FREE_LIST_HEADER_WORDS, FREE_LIST_HEADER_WORDS + data[0]);
+  stack.sort().reverse();
   return data;
 }
 
@@ -502,6 +630,28 @@ function freeList(used, capacity) {
 export function jacobiSpectralRadius(p, maxDegree = 6) {
   const a = 1 / (p.bond_rate_myr_inv * p.dt_crust_myr);
   return 1 - a / (maxDegree * (2 + a));
+}
+
+/**
+ * The spectral radius the Chebyshev weights are built for (chebyshev_rho < 0;
+ * design 5.2, Chebyshev findings): the derived one, but at most what the
+ * iteration budget can use, and at most CHEBYSHEV_MAX_RHO.
+ * After N accelerated sweeps Chebyshev bounds every mode in [-rho, rho] by
+ * 1 / T_N(1 / rho) ~ 1 / cosh(N sqrt(2 (1 - rho))). With rho near 1 and N
+ * below ~1 / sqrt(2 (1 - rho)) that bound is near 1 for every mode, fast ones
+ * included, which plain Jacobi would have removed in a sweep: so rho is capped
+ * where N sqrt(2 (1 - rho)) = CHEBYSHEV_REACH (1 / cosh 4 = 4%). Slower modes
+ * are left to the warm start, which carries them from step to step.
+ * Overestimating rho is harmless for a linear solve but not with caps: the
+ * momentum of rows that hit a cap derails the iteration (a strip under
+ * concentrated slab pull tore at 0.99987, stayed exact at 0.999).
+ */
+export const CHEBYSHEV_REACH = 4;
+export const CHEBYSHEV_MAX_RHO = 0.999;
+export function chebyshevRho(p) {
+  const n = p.solver_iterations - p.chebyshev_delay;
+  if (n <= 1) return 0;
+  return Math.min(jacobiSpectralRadius(p), 1 - 0.5 * (CHEBYSHEV_REACH / n) ** 2, CHEBYSHEV_MAX_RHO);
 }
 
 /**
