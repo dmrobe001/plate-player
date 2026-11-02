@@ -29,6 +29,19 @@ import { CAPACITY } from './sim/simulation.js';
 
 const $ = (id) => document.getElementById(id);
 
+// Collapsible panel sections remember whether they were open (per viewer; a
+// convenience only, so a blocked storage just falls back to the markup).
+for (const el of document.querySelectorAll('details[data-fold]')) {
+  const key = `plate-player.fold.${el.dataset.fold}`;
+  try {
+    const saved = localStorage.getItem(key);
+    if (saved !== null) el.open = saved === '1';
+  } catch { /* storage unavailable */ }
+  el.addEventListener('toggle', () => {
+    try { localStorage.setItem(key, el.open ? '1' : '0'); } catch { /* storage unavailable */ }
+  });
+}
+
 /**
  * Read back particles, edges, the edge free list and slot lists, and check
  * them (src/edges/topology.js). Returns the unpacked arrays, the columns as
