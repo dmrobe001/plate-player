@@ -112,22 +112,51 @@ export function generateTwoPlateState(options = {}) {
   for (let i = 1; i < n; i++) if (dot(x(i), target) > dot(x(centre), target)) centre = i;
   for (const i of [centre, ...ico.neighbours[centre]]) if (plateA[i]) kind[i] = 'micro';
 
-  // Slabs: A's leading row on the trench half.
-  const state = new Uint32Array(n).fill(1);
+  // Trench: A's leading row on the trench half stays at the surface, each
+  // column with a slab hanging from it (an extra particle, numbered after the
+  // columns), at its front face toward B, bonded to it, as the trench strip
+  // test seeds it. (The row itself was made slab: a whole 1,900 km row of
+  // slab with no overriding partner, and the columns behind took their slab
+  // as partner and went down at once, leaving chains hanging from free slabs
+  // and nothing to pull or consume; design 9.2.)
   const touchesB = (i) => ico.neighbours[i].some((j) => !plateA[j]);
-  for (let i = 0; i < n; i++) if (plateA[i] && kind[i] === 'ocean' && touchesB(i) && dot(x(i), q) < -opt.slabRowMinQ) state[i] = 2;
+  const trench = [];
+  for (let i = 0; i < n; i++) if (plateA[i] && kind[i] === 'ocean' && touchesB(i) && dot(x(i), q) < -opt.slabRowMinQ) trench.push(i);
+  const total = n + trench.length;
+  const slabOf = new Map(trench.map((i, k) => [i, n + k]));
+  const pos = new Float32Array(3 * total);
+  pos.set(position);
+  const apothem = new Float32Array(total);
+  apothem.set(fit.apothem);
+  for (const [i, s] of slabOf) {
+    // Toward its B neighbours, one apothem out: its front face.
+    const d = [0, 0, 0];
+    for (const j of ico.neighbours[i]) if (!plateA[j]) x(j).forEach((v, c) => { d[c] += v - x(i)[c]; });
+    const t = d.map((v, c) => v - dot(d, x(i)) * x(i)[c]), tl = Math.hypot(...t);
+    const y = x(i).map((v, c) => v + (fit.apothem[i] * t[c]) / tl), yl = Math.hypot(...y);
+    for (let c = 0; c < 3; c++) pos[3 * s + c] = y[c] / yl;
+    apothem[s] = fit.apothem[i];
+  }
+  const state = new Uint32Array(total).fill(1);
+  for (const s of slabOf.values()) state[s] = 2;
+  const bondsWithSlabs = {
+    count: bonds.count + trench.length,
+    a: Uint32Array.from([...bonds.a, ...trench]),
+    b: Uint32Array.from([...bonds.b, ...trench.map((i) => slabOf.get(i))]),
+    damage: Float32Array.from([...bonds.damage, ...trench.map(() => 0)]),
+  };
 
   const particles = {
-    count: n,
-    position,
-    apothem: fit.apothem,
+    count: total,
+    position: pos,
+    apothem,
     state,
-    thickness: new Float32Array(n),
-    compositionDensity: new Float32Array(n),
-    temperature: new Float32Array(n),
-    age: new Float32Array(n),
+    thickness: new Float32Array(total),
+    compositionDensity: new Float32Array(total),
+    temperature: new Float32Array(total),
+    age: new Float32Array(total),
   };
-  const counts = { A: 0, B: 0, continent: 0, micro: 0, slab: 0 };
+  const counts = { A: 0, B: 0, continent: 0, micro: 0, slab: trench.length };
   for (let i = 0; i < n; i++) {
     const crust = kind[i] === 'ocean' ? CRUST.oceanic : CRUST.continental;
     particles.thickness[i] = kind[i] === 'ocean' ? crust.thickness[0] : opt.continentThicknessKm;
@@ -136,12 +165,17 @@ export function generateTwoPlateState(options = {}) {
     particles.age[i] = kind[i] === 'ocean' ? Math.min((2 * Math.abs(phi[i])) / omega, opt.oceanAgeCapMyr) : crust.age;
     counts[plateA[i] ? 'A' : 'B']++;
     if (kind[i] !== 'ocean') counts[kind[i]]++;
-    if (state[i] === 2) counts.slab++;
+  }
+  for (const [i, s] of slabOf) {
+    particles.thickness[s] = particles.thickness[i];
+    particles.compositionDensity[s] = particles.compositionDensity[i];
+    particles.temperature[s] = particles.temperature[i];
+    particles.age[s] = particles.age[i];
   }
 
   // Unit-sphere lengths scaled with the column size (defaults are for BASE_APOTHEM).
   let meanApothem = 0;
-  for (let i = 0; i < n; i++) meanApothem += fit.apothem[i] / n;
+  for (let i = 0; i < n; i++) meanApothem += fit.apothem[i] / n; // (the columns)
   const scale = meanApothem / BASE_APOTHEM;
   const clip = 0.04 * scale;
   const params = {
@@ -159,13 +193,14 @@ export function generateTwoPlateState(options = {}) {
 
   return {
     particles,
-    bonds,
+    bonds: bondsWithSlabs,
     params,
     mantle: { pole: P, normal: m, omegaRadMyr: omega, widthRad: opt.transitionWidthRad },
-    frame: { pole: P, normal: m, q, phi, plateA, kind },
+    frame: { pole: P, normal: m, q, phi, plateA, kind, trench, slabOf },
     stats: {
       world: 'two-plate',
-      particles: n,
+      particles: total,
+      columns: n,
       bonds: bonds.count,
       bondsPerParticle: (2 * bonds.count) / n,
       continentalFraction: (counts.continent + counts.micro) / n,

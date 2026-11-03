@@ -35,6 +35,17 @@ fn contact_weakening(beta: f32) -> f32 {
     return mix(1.0, sim.slab_interface_weakening, clamp(beta / opt, 0.0, 1.0));
 }
 
+// Dip of the subducting sheet at trench column i's contact: its bend, or the
+// dip of the slab hanging from it, whichever is steeper (with consumption the
+// column passes straight into the slab, and the flap stays short; trenchDip in
+// hinge.js). (The bend alone: a consumed column's short flap barely bent, the
+// contact stayed a vertical face and pushed the overriding plate away.)
+fn trench_dip(i: u32) -> f32 {
+    let s = particles[i].slab_child;
+    let slab_dip = select(0.0, particles[s].hinge_angle, s != NONE && particles[s].state == 2u && particles[s].attached_to == i);
+    return max(particles[i].hinge_angle, slab_dip);
+}
+
 // The hinge pair: i's flap goes under j.
 fn hinge_pair(a: u32, b: u32) -> bool {
     return (particles[a].state == 1u && particles[a].hinge_partner == b) || (particles[b].state == 1u && particles[b].hinge_partner == a);
@@ -129,9 +140,12 @@ fn columns_hinge(@builtin(global_invocation_id) id: vec3<u32>) {
             let xj = particles[j].position.xyz;
             u_unit = max(contact_length(idx, j, xi, xj) - distance(xi, xj), 0.0);
         } else {
+            // No overriding column known (a seeded slab): the slab gives the
+            // trench's direction only; its overlap with the column it hangs
+            // from (it hangs at the front face) is not underthrust. (Taken as
+            // underthrust, the column subducted in its first step.)
             partner = child;
-            let xs = particles[partner].position.xyz;
-            u_unit = max(contact_length(idx, partner, xi, xs) - distance(xi, xs), 0.0);
+            u_unit = 0.0;
         }
     }
     particles[idx].hinge_partner = partner;
@@ -244,22 +258,84 @@ fn columns_hinge(@builtin(global_invocation_id) id: vec3<u32>) {
     // (its tensile strength across its width) and what the plate behind it
     // can hold (its edges' tension caps): more would tear the plate behind.
     // What it transmits is the slabs' tension at the trench, the down-dip
-    // weight less their drag at the column's speed toward the trench, so
-    // those caps bound that: pull <= cap + drag x speed. (They bounded the
-    // gross down-dip weight: a plate could not outrun the cap, its slab never
-    // reached its free speed, was never held by the mantle, and necked;
-    // design 9.2.)
+    // weight less their drag at the column's speed: gamma v. So the speed is
+    // v = min(W_d / (gamma + drag), cap / gamma), exactly (hingePull in
+    // hinge.js). (They bounded the gross down-dip weight: a plate could not
+    // outrun the cap, its slab never reached its free speed, was never held
+    // by the mantle, and necked. Then pull <= cap + drag x last step's speed:
+    // with drag >> gamma that relaxed by a factor drag / (gamma + drag) per
+    // step, ~0.9997 on the two-plate planet, and its slabs necked off; 9.2.)
     let h = max(sim.asthenosphere_base_km - lithosphere_thickness_km(idx), sim.min_channel_km) * 1000.0;
     let gamma = particles[idx].area_ref * R_M * R_M * sim.asthenosphere_viscosity_pa_s / h;
     let flap_weight = wu0 * u * width;
     let flap_rate = free_rate * 1000.0 / 3.15576e13;
     let drag = particles[idx].child_drag + select(0.0, flap_weight / flap_rate, flap_rate > 0.0);
     particles[idx].slab_drag_ratio = drag / gamma;
-    let speed = select(0.0, max(dot(particles[idx].velocity.xyz, nh), 0.0) * R_M / 3.15576e13, nl > 0.0); // m/s toward the trench, last step
-    let pull = min(particles[idx].child_pull + flap_weight * sin(beta), min(column_strength(idx).tension * width, 0.9 * hold) + drag * speed);
-    if (pull > 0.0 && nl > 0.0) {
-        let dx = pull * sim.dt_crust_myr * 3.15576e13 / (gamma + drag) / R_M;
+    let down_dip = particles[idx].child_pull + flap_weight * sin(beta);
+    let cap = min(column_strength(idx).tension * width, 0.9 * hold);
+    let v = min(down_dip / (gamma + drag), cap / gamma); // m/s
+    if (v > 0.0 && nl > 0.0) {
+        let dx = v * sim.dt_crust_myr * 3.15576e13 / R_M;
         let x = vec4f(normalize(particles[idx].predicted_pos.xyz + dx * nh), 1.0);
         particles[idx].predicted_pos = x;
     }
+}
+
+// Continuous consumption through the hinge (design 6; consumeStep and
+// feedSlab in hinge.js). After the solve, before positions are committed: a
+// trench column whose front has gone past touching its overriding partner,
+// with a slab hanging from it, hands that strip (c, at most half the column
+// per step) to the slab: the fraction c / 2a of its area and crust volume,
+// which leaves the surface budget. It stays round with the smaller area and
+// moves away from the trench by a - a', its back face fixed, position and
+// predicted position alike (its velocity is unchanged); geometry_reset makes
+// its edges take the new geometry as their memory next step, so the jump
+// stores no stress. Once shorter than its setback the hinge makes the remnant
+// a slab (becomesSlab), and the next column's material feeds it. (A column
+// had to go its whole width under first: at 1,900 km, longer than its slab
+// stayed heavy; design 9.2.)
+@compute @workgroup_size(64)
+fn columns_consume(@builtin(global_invocation_id) id: vec3<u32>) {
+    let idx = id.x;
+    if (idx >= sim.max_particles || particles[idx].is_active == 0u || particles[idx].state != 1u || particles[idx].next_state == 2u) { return; }
+    let j = particles[idx].hinge_partner;
+    let s = particles[idx].slab_child;
+    if (j == NONE || s == NONE) { return; }
+    if (particles[j].is_active == 0u || particles[j].state != 1u || particles[s].state != 2u || particles[s].attached_to != idx) { return; }
+    let xi = particles[idx].predicted_pos.xyz;
+    let xj = particles[j].predicted_pos.xyz;
+    let over = contact_length(idx, j, xi, xj) - distance(xi, xj);
+    if (!(over > 0.0)) { return; }
+    let a = particles[idx].apothem;
+    let c = min(over, a);
+    let f = c / (2.0 * a);
+    let A = particles[idx].area_ref;
+    let V = particles[idx].crust_volume;
+    let dA = f * A;
+    let dV = f * V;
+    let A2 = A - dA;
+    let a2 = sqrt(A2 / 3.4641016);
+    // Away from the trench, in the tangent plane.
+    var nh = xj - xi;
+    nh = nh - dot(nh, xi) * xi;
+    let nl = length(nh);
+    if (!(nl > 0.0)) { return; }
+    nh /= nl;
+    let shift = a - a2;
+    particles[idx].predicted_pos = vec4f(normalize(xi - shift * nh), particles[idx].predicted_pos.w);
+    let x0 = particles[idx].position.xyz;
+    particles[idx].position = vec4f(normalize(x0 - shift * nh), particles[idx].position.w);
+    particles[idx].area_ref = A2;
+    particles[idx].apothem = a2;
+    particles[idx].crust_volume = V - dV;
+    particles[idx].geometry_reset = 1u;
+    add_budget(BUDGET_SINK, dV);
+    // The slab gains it: volume-weighted composition, area-weighted thermal age.
+    let Vs = particles[s].crust_volume;
+    let As = particles[s].area_ref;
+    particles[s].composition_density = (particles[s].composition_density * Vs + particles[idx].composition_density * dV) / max(Vs + dV, 1e-30);
+    particles[s].thermal_age_myr = (particles[s].thermal_age_myr * As + particles[idx].thermal_age_myr * dA) / max(As + dA, 1e-30);
+    particles[s].crust_volume = Vs + dV;
+    particles[s].area_ref = As + dA;
+    particles[s].apothem = sqrt((As + dA) / 3.4641016);
 }

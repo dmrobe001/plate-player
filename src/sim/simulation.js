@@ -179,7 +179,7 @@ export class Simulation {
       'solver_find_high', 'solver_dispatch_sizes',
       'solver_begin', 'solver_next_iteration', 'crust_warm_start',
       'crust_clear_deltas', 'crust_solve_edges', 'crust_apply_deltas',
-      'crust_net_rotation_sum', 'crust_net_rotation_solve', 'crust_remove_net_rotation',
+      'crust_net_rotation_sum', 'crust_net_rotation_solve', 'crust_remove_net_rotation', 'columns_consume',
       'crust_integrate',
     ];
     this.pipelines = Object.fromEntries(entryPoints.map((entryPoint) => [
@@ -488,6 +488,7 @@ export class Simulation {
     run('crust_clear_deltas', crust);
     run('edges_maxwell', edges);     // slice stresses, inelastic strain, plastic work, integrity (design 4.5, 4.7)
     run('columns_flow', crust);      // volumetric flow at fixed crust volume (design 4.7)
+    run('columns_consume', crust);   // trench columns hand their underthrust strip to their slabs (design 6)
     run('crust_integrate', crust);
     submit();
     this.#pollHighWater();

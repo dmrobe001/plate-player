@@ -985,15 +985,36 @@ and before the edge law; reference `src/columns/hinge.js`.
   push, and Coulomb resistance is least at θ*. Underthrust is not compaction: the pair
   feeds no volumetric flow, and an underthrusting column's thickness is over its
   reference area, not its shrinking cell.
+- **Continuous consumption** (`columns_consume`; `consumeStep`, `feedSlab`). After
+  the solve, a trench column with an overriding surface partner and a slab hanging
+  from it hands its underthrust strip to the slab: c = its overlap past touching
+  the partner (at most half the column per step), the fraction c/2a of its area and
+  crust volume, which leaves the surface budget as it goes. The slab mixes
+  composition by volume and thermal age by area. The column stays round with the
+  smaller area and moves away from the trench by a − a′, its back face fixed (the
+  plate behind is undisturbed), position and predicted position alike (its velocity
+  is unchanged); `geometry_reset` makes its edges take the new geometry as their
+  memory, so the jump stores no stress. Its underthrust stays a few km. (A column
+  had to go its whole width under first: at 1,900 km, longer than its slab stays
+  heavy.)
 - **Becoming a slab:** when the hinge passes the column's back face, u + x* ≥ 2a
-  (the whole column is flap). There is no timer and no propagation rule: a trench
+  (the whole column is flap). With consumption, that is when the column has shrunk
+  below its bending setback; the remnant becomes the top of the chain, and the next
+  column's material feeds it, so each slab holds about one column. There is no timer and no propagation rule: a trench
   propagates where neighbours have partners and are pulled. The slab keeps its
   hinge partner, the overriding column it went under.
 - **The trench lives on.** A column with no buoyant broken neighbour but a slab
   hanging from it (the column in front has subducted) inherits that slab's
   overriding column as its partner; its underthrust is measured against it, a gap at
-  first that closes as the plate converges. (It took its own slab as partner, at
-  full overlap, subducted at once, and the trench died.)
+  first that closes as the plate converges. With no overriding column known (a
+  seeded slab) the slab gives only the direction, and the underthrust is zero.
+  (Measured against its own slab, which hangs at its front face, it read a full
+  column of overlap: it subducted at once, and the trench died.)
+- **Contact dip.** The trench pair's compression cap falls to the interface value as
+  the dip of the subducting sheet at the contact reaches θ*: the column's bend or
+  its hanging slab's dip, whichever is steeper (`trench_dip`). (With consumption the
+  flap stays short and barely bends; by the bend alone the contact stayed a vertical
+  face and pushed the overriding plate away.)
 - **Slab pull** reaches the plate as a body force on the hinge column toward the
   trench (into its drag target, like the GPE push): the down-dip weight of what
   hangs from the flap, each slab at its own dip, Σ W sin δ (`child_pull`), plus the
@@ -1006,11 +1027,15 @@ and before the edge law; reference `src/columns/hinge.js`.
   the vertical support a slab gets (below) is the vertical part of the same drag.
   (Without it, only vertical support resisted a plate: at a small bend almost
   nothing did, and the strip ran at 73 cm/yr, a column width per step.)
-- **What the plate transmits is the slabs' tension at the trench,** pull − drag ×
-  speed, and that is what the column's tensile strength and the plate behind (its
-  edges' tension caps, projected on the pull, × 0.9) bound: pull ≤ cap + drag ×
-  speed. (They bounded the gross down-dip weight: the plate could not outrun the cap,
-  its slab never reached its free speed, was never held by the mantle, and necked.)
+- **What the plate transmits is the slabs' tension at the trench,** γ v (the
+  down-dip weight less the slabs' drag), and that is what the column's tensile
+  strength and the plate behind (its edges' tension caps, projected on the pull,
+  × 0.9) bound. So the column's speed is, exactly, v = min(W_d/(γ + C), cap/γ)
+  (`hingeSpeed`; W_d the down-dip weight, C the slabs' drag coefficient). (The caps
+  bounded the gross down-dip weight: the plate could not outrun the cap, its slab
+  never reached its free speed, was never held by the mantle, and necked. Then
+  pull ≤ cap + C × last step's speed: with C ≫ γ that relaxed by C/(γ + C) per
+  step, ~0.9997 on the two-plate planet, and its slabs necked off.)
 
 **The force budget, from the textbook** (Turcotte & Schubert; CPU reference,
 default parameters). A slab's excess mass per area is B = −ρ_m × freeboard. For 100
@@ -1400,12 +1425,32 @@ counter (`slabsLost`). Measured:
   follow, one every ~6 Myr, each inheriting the continent as partner; the plate
   moves 3–5.6 cm/yr (median 3.6); the slab chain hangs to 690 km, dips steepen
   36° → 80°, no slab is lost in 30 Myr.
-- **Two-plate planet, with the refined rules (30 Myr):** still locked. 15–17
-  hinges, no new subduction (sink volume constant after 2 Myr), the seeded slabs
-  warm and are gone by 16 Myr (one counted lost), the plates move 0.1–0.4 cm/yr
-  relative to each other. Its 1,900 km columns need ~1,850 km of underthrust to
-  subduct: tens of Myr at slab-driven speeds, longer than its slabs stay heavy.
-  Continuous consumption through the hinge (below) is the remedy.
+- **Continuous consumption (strip, 223 km columns, converged solve).** The leading
+  column is consumed to ~10% of its area with at most ~10 km of underthrust and
+  becomes a slab at 4.75–5.5 Myr; the next two follow at ~10–11.5 and ~19.5 Myr; the
+  plate moves 4–4.6 cm/yr; the chain hangs to ~680 km and no slab is lost in 30 Myr;
+  volume handed over is conserved to 10⁻³. Then the trench stalls: the free
+  16-column continent is pushed along at the plate's speed. Found on the way: a
+  clipped tessellation cell's area defined the loaded crust volume (in a one-row
+  strip ~2.5× the reference area: 17 km of buoyant basalt in its slabs); a clipped
+  column's volume and thickness are now over its reference area, with no
+  dilatation or melt (4.8).
+- **Two-plate planet with consumption (30 Myr).** Its seeding was redone: the
+  boundary row was made slab, a whole 1,900 km row with no overriding partner, and
+  the columns behind subducted at once on their own slabs; now the row stays at the
+  surface and a slab particle hangs at each trench column's front face (171
+  particles). Consumption runs: subducted volume 0.17 by 6 Myr (0.04 before), plates
+  at 1.4–2 cm/yr. But both plates move together (B as fast as A), so convergence is
+  slow, the 1,900 km slabs (down-dip weight ~9×10¹³ N/m against a plate strength of
+  1.5×10¹³) are not fed fast enough, neck off by 10 Myr, and the planet stops.
+- **Open: the overriding plate is carried, not overridden.** The lubricated trench
+  contact holds 0.1 × the face's thrust strength, ~3.9×10¹² N/m for old ocean
+  (since the Anderson caps; ~1×10¹² before). An overriding plate held only by basal
+  drag (η_a = 10¹⁹ Pa·s over its channel) resists ~7×10¹¹ N/m at 3 cm/yr, so the
+  contact pushes it along instead of yielding, in the strip and on the planet. Two
+  literature-bounded handles decide it: the megathrust's strength (effective friction
+  ~0.03–0.1 with high pore pressure; textbook interface forces ~10¹² N/m) and the
+  asthenosphere's viscosity (10¹⁹–10²¹ Pa·s). Not decided.
 - **Two-plate planet (162 columns, 40 Myr; before the calibration):** all 9 seeded slabs hang at first, the
   hinges bend 4–23° and yield plastically; the slabs (1,600 km long, ~5× heavier than
   the plate can hold) neck, and five trench columns subduct within 8 Myr, but as free

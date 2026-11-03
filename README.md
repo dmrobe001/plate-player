@@ -526,9 +526,12 @@ Ordered roughly by how much each item affects the plausibility of generated worl
       overriding side, hand the trench on to the column behind, and bound the
       slab's tension rather than its weight: the strip subducts column after
       column at 3–5 cm/yr (design.md §6, §9.2).
-- [ ] **The two-plate planet's trench is still locked:** its 1,900 km columns must
-      go ~1,850 km under to subduct. Next: continuous consumption through the
-      hinge (design.md §9.2).
+- [x] ~~Columns had to go their whole width under before subducting.~~ Trench
+      columns are consumed continuously into their hanging slabs (design.md §6).
+- [ ] **Overriding plates are pushed instead of overridden:** the lubricated
+      trench contact (~4×10¹² N/m) outweighs an overriding plate's basal drag, so
+      convergence stalls and big slabs neck off. Decide the megathrust strength
+      and asthenosphere viscosity (design.md §9.2).
 - [x] ~~The planet could drift as a whole.~~ Each step's area-weighted net
       rotation is removed (the geodesists' no-net-rotation frame; design.md §5.3).
       In the two-plate world it was nearly all the motion: the trench is locked

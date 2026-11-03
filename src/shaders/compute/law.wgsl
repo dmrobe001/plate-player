@@ -61,8 +61,8 @@ fn edge_slices(a: u32, b: u32, phi: f32, sn: array<f32, 8>) -> EdgeSlices {
     // to the lubricated interface as the dip reaches the optimal thrust angle
     // (design 6; contactWeakening in hinge.js).
     var lubricated = select(1.0, sim.slab_interface_weakening, (particles[a].state == 2u) != (particles[b].state == 2u));
-    if (particles[a].state == 1u && particles[a].hinge_partner == b) { lubricated = min(lubricated, contact_weakening(particles[a].hinge_angle)); }
-    if (particles[b].state == 1u && particles[b].hinge_partner == a) { lubricated = min(lubricated, contact_weakening(particles[b].hinge_angle)); }
+    if (particles[a].state == 1u && particles[a].hinge_partner == b) { lubricated = min(lubricated, contact_weakening(trench_dip(a))); }
+    if (particles[b].state == 1u && particles[b].hinge_partner == a) { lubricated = min(lubricated, contact_weakening(trench_dip(b))); }
     let ln_eta_shift = log(1e6) - log(2.0 * sim.reference_strain_rate_s);
     for (var k = 0u; k < EDGE_SLICES; k++) {
         let z = top - (f32(k) + 0.5) * s.dz;

@@ -1635,7 +1635,7 @@ test('two-plate planet: loads with its own scaled parameters and steps without N
   });
   console.log(`  ${JSON.stringify(out)}`);
   assert.equal(out.mantle, 'kinematic');
-  assert.equal(out.before.n, 162);
+  assert.equal(out.before.n, 162 + out.before.slabs, '162 columns and a slab hanging at each trench column');
   assert.ok(out.before.slabs > 0);
   assert.ok(out.params.hash_grid_dim < 32 && out.params.base_apothem > 0.1, 'coarse world: scaled parameters');
   assert.equal(out.after.nan, 0);
@@ -1646,7 +1646,7 @@ test('two-plate planet: loads with its own scaled parameters and steps without N
 
 // --- The trench hinge (design 6; src/columns/hinge.js) -----------------------
 
-test('trench hinge: slab pull bends the flap, the column goes under and subducts while its slab hangs; the column behind inherits the trench and follows, at a slab-driven speed', { timeout: 900_000 }, async () => {
+test('trench hinge: slab pull bends the flap; the column is consumed into its slab and subducts while the slab hangs; the column behind inherits the trench and follows, at a slab-driven speed', { timeout: 900_000 }, async () => {
   // A row along the equator: eight bonded old-ocean columns, the last across a
   // broken edge from a sixteen-column continental plate (large enough not to
   // be pushed away: overriding plates are large); a slab at the first
@@ -1680,6 +1680,8 @@ test('trench hinge: slab pull bends the flap, the column goes under and subducts
     const L = plate.layout.Particle, o = L.offsets, W = L.words;
     const rows = [];
     const next = lead - 1;
+    const f0 = new Float32Array((await plate.readBuffers(['particles'])).particles);
+    const start = { lead: f0[lead * W + o.crust_volume], slab: f0[S * W + o.crust_volume], sink: (await plate.debug.counters()).volumeSink };
     for (let s = 1; s <= 64; s++) {
       const V = await plate.debug.counters();
       await plate.runSteps(1);
@@ -1690,16 +1692,17 @@ test('trench hinge: slab pull bends the flap, the column goes under and subducts
         slabHangs: u[S * W + o.attached_to], slabActive: u[S * W + o.is_active],
         leadHangs: u[lead * W + o.attached_to], nextState: u[next * W + o.state], nextPartner: u[next * W + o.hinge_partner],
         speed: Math.hypot(f[o.velocity], f[o.velocity + 1], f[o.velocity + 2]) * 637.1, // the trailing column, cm/yr
+        leadArea: f[lead * W + o.area_ref], width: 2 * f[lead * W + o.apothem] * 6371, slabVolume: f[S * W + o.crust_volume], sink: c.volumeSink,
         continents: Array.from({ length: NC }, (_, k) => u[(k === 0 ? C : S + k) * W + o.state]), lost: c.slabsLost,
         sinkStep: c.volumeSink - V.volumeSink, leadVolume: f[lead * W + o.crust_volume],
       });
       if (u[next * W + o.state] === 2) break;
     }
-    return { rows, lead, next, C };
+    return { rows, lead, next, C, start };
   });
   assert.deepEqual(page.errors, []);
   await page.close();
-  const { rows, lead, next, C } = out;
+  const { rows, lead, next, C, start } = out;
   const bent = rows.find((r) => r.leadState === 1 && r.beta > 0.05);
   const down = rows.find((r) => r.leadState === 2);
   const maxUnder = Math.max(...rows.filter((r) => r.leadState === 1).map((r) => r.under));
@@ -1707,13 +1710,19 @@ test('trench hinge: slab pull bends the flap, the column goes under and subducts
   const second = rows.find((r) => r.nextState === 2);
   const speeds = rows.filter((r) => r.s > 4).map((r) => r.speed).sort((x, y) => x - y);
   const median = speeds[Math.floor(speeds.length / 2)];
-  console.log(`  flap bent ${bent ? (bent.beta * 57.3).toFixed(1) : '-'} deg by step ${bent?.s}; underthrust up to ${maxUnder.toFixed(0)} km; leading column subducted at ${down ? down.s * 0.25 : '-'} Myr, its slab hanging from ${down?.slabHangs} (the leading column is ${lead}); the column behind took the trench (partner ${after[1]?.nextPartner}, the continent's front is ${C}) and subducted at ${second ? second.s * 0.25 : '-'} Myr, the first hanging from it (${second?.leadHangs}); plate speed median ${median.toFixed(1)} cm/yr; slabs lost ${rows.at(-1).lost}`);
+  console.log(`  flap bent ${bent ? (bent.beta * 57.3).toFixed(1) : '-'} deg by step ${bent?.s}; underthrust up to ${maxUnder.toFixed(0)} km; leading column consumed to ${down ? (100 * rows.find((r) => r.s === down.s - 1).leadArea / rows[0].leadArea).toFixed(0) : '-'}% of its area and subducted at ${down ? down.s * 0.25 : '-'} Myr, its slab hanging from ${down?.slabHangs} (the leading column is ${lead}); the column behind took the trench (partner ${after[1]?.nextPartner}, the continent's front is ${C}) and subducted at ${second ? second.s * 0.25 : '-'} Myr, the first hanging from it (${second?.leadHangs}); plate speed median ${median.toFixed(1)} cm/yr; slabs lost ${rows.at(-1).lost}`);
   assert.ok(bent, 'slab pull bends the flap');
-  assert.ok(maxUnder > 50, 'the column goes under the overriding plate');
   assert.ok(down, 'the leading column subducts');
   assert.equal(down.slabHangs, lead, 'the slab it dragged still hangs from it (the heuristic)');
   assert.equal(down.slabActive, 1);
-  assert.ok(Math.abs(down.sinkStep / down.leadVolume - 1) < 1e-4, 'its volume leaves the surface budget');
+  // Consumed continuously: it shrinks into its slab while it goes under, its
+  // underthrust a fraction of its width; all its volume left the surface
+  // budget, and what it lost the slab gained.
+  const surf = rows.filter((r) => r.leadState === 1);
+  assert.ok(surf.at(-1).leadArea < 0.5 * surf[0].leadArea, 'the leading column shrinks as it goes under');
+  assert.ok(maxUnder < 0.25 * surf[0].width, `underthrust ${maxUnder} km stays a fraction of the width`);
+  assert.ok(Math.abs((down.sink - start.sink) / start.lead - 1) < 1e-3, 'its whole volume leaves the surface budget');
+  assert.ok(Math.abs((down.slabVolume - start.slab) / (start.lead - down.leadVolume) - 1) < 1e-3, 'the slab gains what it lost');
   // The trench lives on: the column behind inherits the overriding partner
   // (not its own slab), goes under in turn, and the first slab hangs from it.
   assert.ok(after.length > 1 && after.slice(1).every((r) => r.nextState === 2 || r.nextPartner === C), 'the column behind takes the trench');

@@ -157,10 +157,11 @@ fn columns_volume(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
     particles[idx].volume_added = 0.0;
-    // Slabs, and columns partly under an overriding plate at a trench hinge
-    // (their cell shrinks as they go under, which is not compaction): over the
-    // reference area.
-    if (particles[idx].state != 1u || particles[idx].hinge_underthrust_km > 0.0) {
+    // Slabs, columns partly under an overriding plate at a trench hinge (their
+    // cell shrinks as they go under, which is not compaction), and columns
+    // whose cell touched its clip polygon (its area is not real: no
+    // dilatation, no melt): over the reference area.
+    if (particles[idx].state != 1u || particles[idx].hinge_underthrust_km > 0.0 || particles[idx].cell_clipped != 0u) {
         particles[idx].thickness_km = particles[idx].crust_volume / particles[idx].area_ref;
         return;
     }
@@ -200,7 +201,11 @@ fn columns_volume(@builtin(global_invocation_id) id: vec3<u32>) {
 fn columns_init_volume(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = id.x;
     if (idx >= sim.max_particles || particles[idx].is_active == 0u) { return; }
-    particles[idx].crust_volume = particles[idx].thickness_km * particles[idx].cell_area;
+    // (A clipped cell's area is not real, design 4.8: over the reference area.
+    // In a one-row strip every cell is clipped, ~2.5x its reference area, and
+    // its crust had 2.5x the volume: 17 km of buoyant basalt in its slabs.)
+    let A = select(particles[idx].cell_area, particles[idx].area_ref, particles[idx].cell_clipped != 0u);
+    particles[idx].crust_volume = particles[idx].thickness_km * A;
     particles[idx].cell_area_prev = particles[idx].cell_area;
     particles[idx].thermal_age_myr = min(particles[idx].thermal_age_myr, thermal_age_cap_myr(particles[idx].composition_density));
 }

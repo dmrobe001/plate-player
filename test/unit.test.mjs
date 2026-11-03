@@ -996,24 +996,36 @@ test('column stress: a hexagon under uniform strain reads the plane-stress conti
 import { generateTwoPlateState } from '../src/init/two-plate.js';
 import { kinematicFlow } from '../src/mantle/kinematic.js';
 
-test('two-plate planet: 162 bonded columns at rest, broken boundary, continents, slabs on the trench half', () => {
+test('two-plate planet: 162 bonded columns at rest, broken boundary, continents; a slab hanging at each trench column on the trench half', () => {
   const s = generateTwoPlateState();
-  const { pole: P, normal: m, q, plateA, kind } = s.frame;
+  const { pole: P, normal: m, q, plateA, kind, trench, slabOf } = s.frame;
   const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-  assert.equal(s.particles.count, 162);
+  const n = 162;
+  assert.equal(s.particles.count, n + trench.length);
   assert.ok(Math.abs(dot(P, m)) < 1e-9 && Math.abs(Math.hypot(...P) - 1) < 1e-9);
   assert.ok(s.stats.maxBondStrain < 1e-5, 'bonds start at their rest length');
   assert.ok(s.stats.coverage > 0.98);
-  assert.ok(s.stats.continent >= 7 && s.stats.microcontinent === 7 && s.stats.slabs >= 5);
+  assert.ok(s.stats.continent >= 7 && s.stats.microcontinent === 7 && trench.length >= 5);
   const x = (i) => [0, 1, 2].map((c) => s.particles.position[3 * i + c]);
+  const bonded = new Map();
   for (let k = 0; k < s.bonds.count; k++) {
     const i = s.bonds.a[k], j = s.bonds.b[k];
+    if (j >= n) { bonded.set(j, i); assert.equal(s.bonds.damage[k], 0); continue; }
     assert.equal(s.bonds.damage[k], plateA[i] !== plateA[j] ? 1 : 0, 'only boundary bonds are broken');
   }
-  for (let i = 0; i < 162; i++) {
-    if (s.particles.state[i] === 2) assert.ok(plateA[i] && dot(x(i), q) < 0, 'slabs: plate A, trench half');
+  for (let i = 0; i < n; i++) {
+    assert.equal(s.particles.state[i], 1, 'every column at the surface');
     if (kind[i] === 'continent') assert.ok(!plateA[i] && dot(x(i), q) < 0, 'continent: plate B, trench half');
     if (kind[i] === 'micro') assert.ok(plateA[i]);
+  }
+  for (const i of trench) {
+    const sl = slabOf.get(i);
+    assert.ok(plateA[i] && dot(x(i), q) < 0, 'trench columns: plate A, trench half');
+    assert.equal(s.particles.state[sl], 2);
+    assert.equal(bonded.get(sl), i, 'each slab bonded to its trench column (it hangs from it)');
+    const d = Math.acos(Math.min(dot(x(i), x(sl)), 1));
+    assert.ok(Math.abs(d / Math.atan(s.particles.apothem[i]) - 1) < 1e-4, 'at its front face (one apothem along the tangent)');
+    assert.ok(dot(x(sl), m) < dot(x(i), m), 'toward B');
   }
 });
 
@@ -1125,15 +1137,28 @@ test('hinge: elastic, plastic and runaway branches of the torque balance', () =>
   // Dip: a pinned slab turns toward vertical, d dip / dt = (w / L) cos dip, and stops there.
   assert.ok(Math.abs(hinge.slabDipStep(0.5, 20, 200, 0.25) - (0.5 + 0.25 * 0.1 * Math.cos(0.5))) < 1e-12);
   assert.equal(hinge.slabDipStep(1.5, 1e6, 200, 1), Math.PI / 2);
-  // The trench column's pull: its slabs' down-dip weight; strength bounds the
-  // tension it transmits (pull - drag x speed), so a fast plate can pull more
-  // than its strength while the mantle holds the rest.
-  const C = hinge.slabDrag(W, w);
-  assert.equal(hinge.hingePull({ childPull: W, flapWeight: 0, beta: 0.3, cap: 0.2 * W, drag: C, speed: 0 }), 0.2 * W);
-  const v = 0.9 * w * 1000 / Myr;
-  assert.ok(Math.abs(hinge.hingePull({ childPull: W, flapWeight: 0, beta: 0.3, cap: 0.2 * W, drag: C, speed: v }) - W) < 1);
+  // The trench column's speed: its slabs' down-dip weight against its basal
+  // drag plus theirs; strength bounds the tension it transmits, gamma v.
+  const C = hinge.slabDrag(W, w), gamma = C / 400;
+  const vFree = hinge.hingeSpeed({ childPull: W, flapWeight: 0, beta: 0.3, cap: W, drag: C, gamma });
+  assert.ok(Math.abs(vFree / (W / (gamma + C)) - 1) < 1e-12 && gamma * vFree < W / 100, 'held by the mantle: little tension reaches the plate');
+  assert.ok(Math.abs(hinge.hingeSpeed({ childPull: W, flapWeight: 0, beta: 0.3, cap: 1e-4 * W, drag: 0, gamma }) - 1e-4 * W / gamma) < 1e-9 * W / gamma, 'no slab drag: the cap binds');
   // A plate whose only drag is its vertical slab's moves at the slab's free speed.
   assert.ok(Math.abs(W / C / (w * 1000 / Myr) - 1) < 1e-12);
+});
+
+test('hinge: continuous consumption hands the underthrust strip to the slab, conserving area and volume, the back face fixed', () => {
+  const a = 0.0175, area = 2 * Math.sqrt(3) * a * a, volume = 7 * area;
+  const r = hinge.consumeStep({ area, volume, apothem: a, over: 0.004 });
+  const f = 0.004 / (2 * a);
+  assert.ok(Math.abs(r.dArea - f * area) < 1e-15 && Math.abs(r.area + r.dArea - area) < 1e-15);
+  assert.ok(Math.abs(r.volume + r.dVolume - volume) < 1e-15 && Math.abs(r.volume / r.area - 7) < 1e-12, 'thickness unchanged');
+  assert.ok(Math.abs(2 * Math.sqrt(3) * r.apothem ** 2 - r.area) < 1e-15);
+  assert.ok(Math.abs((-a) - (-r.shift - r.apothem)) < 1e-15, 'back face (centre - apothem, after the shift away from the trench) stays put');
+  assert.equal(hinge.consumeStep({ area, volume, apothem: a, over: 0 }).dVolume, 0);
+  assert.ok(Math.abs(hinge.consumeStep({ area, volume, apothem: a, over: 1 }).dArea - area / 2) < 1e-15, 'at most half a column per step');
+  const s = hinge.feedSlab({ volume: 2, area: 1, compositionDensity: 3000, thermalAgeMyr: 40 }, 1, 2, { compositionDensity: 2900, thermalAgeMyr: 100 });
+  assert.deepEqual([s.volume, s.area, s.compositionDensity, s.thermalAgeMyr], [4, 2, 2950, 70]);
 });
 
 test('hinge: column strength in bending and in tension from its yield-strength envelope', () => {

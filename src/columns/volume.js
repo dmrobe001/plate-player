@@ -30,7 +30,9 @@ export function thermalAgeCapMyr(compositionDensity, p) {
  * One step of a surface column's volume. c = {volume, area, areaPrev,
  * thermalAgeMyr, compositionDensity, ageMyr}; areaPrev <= 0 means no
  * dilatation this step (just loaded or split). Returns the new state plus
- * {added, lithosphereKm, thicknessKm, breakup}.
+ * {added, lithosphereKm, thicknessKm, breakup}. (Slabs, columns under a
+ * trench hinge and columns whose cell is clipped skip it: their thickness is
+ * volume over the reference area; columns_volume in area.wgsl.)
  */
 export function volumeStep(c, p) {
   let { volume, thermalAgeMyr: t, compositionDensity: rho, ageMyr: age } = c;

@@ -177,11 +177,45 @@ export function hangSlab({ weight, dip, feed, freeRate, childLoad = 0, childPull
 }
 
 /**
- * The trench column's in-plane pull (columns_hinge in hinge.wgsl), N: the
- * down-dip weight of its slabs (childPull) and of its underthrust flap
- * (flapWeight sin beta), applied against its basal drag plus the slabs' and
- * flap's drag coefficient `drag`. What it transmits is the slabs' tension at
- * the trench, pull - drag x speed (speed toward the trench, m/s), and that is
- * what the column's and the plate's strength `cap` bound.
+ * The trench column's speed toward the trench under its slabs' pull
+ * (columns_hinge in hinge.wgsl), m/s: the down-dip weight of its slabs
+ * (childPull) and of its underthrust flap (flapWeight sin beta) against its
+ * basal drag gamma plus the slabs' and flap's drag coefficient `drag`. What it
+ * transmits is the slabs' tension at the trench, gamma v, and that is what
+ * the column's and the plate's strength `cap` bound: v = min(W_d / (gamma +
+ * drag), cap / gamma).
  */
-export const hingePull = ({ childPull, flapWeight, beta, cap, drag, speed }) => Math.min(childPull + flapWeight * Math.sin(beta), cap + drag * speed);
+export const hingeSpeed = ({ childPull, flapWeight, beta, cap, drag, gamma }) => Math.min((childPull + flapWeight * Math.sin(beta)) / (gamma + drag), cap / gamma);
+
+/**
+ * Continuous consumption through the hinge (columns_consume in hinge.wgsl),
+ * one step. A trench column whose front has gone `over` (unit sphere) past
+ * touching its overriding partner, with a slab hanging from it, hands that
+ * strip to the slab: the fraction c / 2a (c = over, at most a per step) of
+ * its area and crust volume. It stays round with the smaller area, and moves
+ * away from the trench by a - a' so that its back face stays put (the plate
+ * behind it is undisturbed). Returns the column's new area, volume and
+ * apothem, the shift (unit sphere, away from the trench) and what the slab
+ * gains (dArea, dVolume).
+ */
+export function consumeStep({ area, volume, apothem, over }) {
+  if (!(over > 0)) return { area, volume, apothem, shift: 0, dArea: 0, dVolume: 0 };
+  const c = Math.min(over, apothem);
+  const f = c / (2 * apothem);
+  const a2 = area * (1 - f);
+  const ap = Math.sqrt(a2 / (2 * Math.sqrt(3)));
+  return { area: a2, volume: volume * (1 - f), apothem: ap, shift: apothem - ap, dArea: area * f, dVolume: volume * f };
+}
+
+/** A slab gaining consumed material: volume-weighted composition, area-weighted thermal age. */
+export function feedSlab(slab, dArea, dVolume, column) {
+  const V = slab.volume + dVolume, A = slab.area + dArea;
+  return {
+    volume: V, area: A, apothem: Math.sqrt(A / (2 * Math.sqrt(3))),
+    compositionDensity: V > 0 ? (slab.compositionDensity * slab.volume + column.compositionDensity * dVolume) / V : slab.compositionDensity,
+    thermalAgeMyr: A > 0 ? (slab.thermalAgeMyr * slab.area + column.thermalAgeMyr * dArea) / A : slab.thermalAgeMyr,
+  };
+}
+
+/** Dip of the subducting sheet at a trench contact (trench_dip in hinge.wgsl): the column's bend or its hanging slab's dip, whichever is steeper. */
+export const trenchDip = (bend, slabDip = 0) => Math.max(bend, slabDip);
