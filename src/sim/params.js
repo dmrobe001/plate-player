@@ -189,9 +189,15 @@ export const SIM_PARAMS = [
   // strength of the weaker of the two (x this factor); then it breaks off and
   // sinks freely. 0 = slabs never hang (each sinks freely from the start).
   ['slab_attach_factor', 'f32', 1.0],
-  // The subduction interface is lubricated: compression caps of edges with
-  // exactly one slab end are scaled by this.
-  ['slab_interface_weakening', 'f32', 0.1],
+  // The subduction interface (megathrust) is lubricated: compression caps of
+  // edges with exactly one slab end, and of a trench contact once its dip
+  // reaches the optimal thrust angle, are scaled by this. Thrust strength on a
+  // fault of effective friction mu' over the intact face's Anderson thrust
+  // strength: 0.03 is mu' ~ 0.02, the weak end of megathrust estimates
+  // (0.02-0.13, heat flow and stress orientations; Wang & Hu 2006, Gao & Wang
+  // 2014). At 0.1 (mu' ~ 0.06) the contact pushed overriding plates along
+  // instead of yielding (design 9.2, megathrust calibration).
+  ['slab_interface_weakening', 'f32', 0.03],
   // Slabs sink under their own negative buoyancy B = -rho_m x freeboard
   // (kg/m^2) at the Stokes-like rate w = B g width / (4 eta), eta =
   // isostatic_viscosity_pa_s (upper mantle). Removed below this depth or once

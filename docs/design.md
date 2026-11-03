@@ -1443,14 +1443,24 @@ counter (`slabsLost`). Measured:
   at 1.4–2 cm/yr. But both plates move together (B as fast as A), so convergence is
   slow, the 1,900 km slabs (down-dip weight ~9×10¹³ N/m against a plate strength of
   1.5×10¹³) are not fed fast enough, neck off by 10 Myr, and the planet stops.
-- **Open: the overriding plate is carried, not overridden.** The lubricated trench
-  contact holds 0.1 × the face's thrust strength, ~3.9×10¹² N/m for old ocean
-  (since the Anderson caps; ~1×10¹² before). An overriding plate held only by basal
-  drag (η_a = 10¹⁹ Pa·s over its channel) resists ~7×10¹¹ N/m at 3 cm/yr, so the
-  contact pushes it along instead of yielding, in the strip and on the planet. Two
-  literature-bounded handles decide it: the megathrust's strength (effective friction
-  ~0.03–0.1 with high pore pressure; textbook interface forces ~10¹² N/m) and the
-  asthenosphere's viscosity (10¹⁹–10²¹ Pa·s). Not decided.
+- **Megathrust calibration (`slab_interface_weakening` 0.1 → 0.03).** The
+  lubricated trench contact held 0.1 × the face's thrust strength, ~3.9×10¹² N/m for
+  old ocean; an overriding plate held by basal drag alone (η_a = 10¹⁹ Pa·s) resists
+  ~7×10¹¹ N/m at 3 cm/yr, so the contact pushed it along instead of yielding. The
+  factor is a fault's thrust strength over the intact face's: (q(μ′) − 1)/((q(μ) −
+  1)(1 − λ)), μ′ the megathrust's effective friction; published μ′ ≈ 0.02–0.13 (heat
+  flow, stress orientations: Wang & Hu 2006, Gao & Wang 2014) map to ≈ 0.03–0.2.
+  Measured (strip, 30 Myr, 16-column continent): at 0.1 three columns are consumed
+  and the continent is then carried; at 0.03, 0.01 and 0.003 five columns are
+  consumed (plate ~4.2 cm/yr) and the continent drifts 128, 12 and ~0 km. 0.03
+  (μ′ ≈ 0.02, the weak end) is now the default.
+  Two-plate planet (30 Myr): subducted volume 0.24 at 0.03 and 0.29 at 0.01 (0.17 at
+  0.1); the plates now converge (~2 cm/yr relative), but all nine 1,900 km slabs
+  still neck off by 8 Myr and subduction stops: at this column size a seeded slab's
+  down-dip weight (~9×10¹³ N/m, more than a full upper-mantle slab, as its dip stays
+  ~33°) needs feeding at ~2–3 cm/yr to stay below the plate's strength. Not the
+  interface: the slabs (their size at this resolution, and no support from the
+  stiffer lower mantle at 660 km; the cutoff only drops their weight there).
 - **Two-plate planet (162 columns, 40 Myr; before the calibration):** all 9 seeded slabs hang at first, the
   hinges bend 4–23° and yield plastically; the slabs (1,600 km long, ~5× heavier than
   the plate can hold) neck, and five trench columns subduct within 8 Myr, but as free
